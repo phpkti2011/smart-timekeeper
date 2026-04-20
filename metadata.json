@@ -1,0 +1,7 @@
+{
+  "name": "Smart Timekeeper",
+  "description": "Ứng dụng chấm công thông minh sử dụng GPS và IP với giao diện mobile-first.",
+  "requestFramePermissions": [
+    "geolocation"
+  ]
+}

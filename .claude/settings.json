@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep \"\\\\.tsx$\")",
+      "Read(//c/Users/P1/Downloads/smart-timekeeper/**)",
+      "Bash(grep -r \"Admin\\\\|role\\\\|permission\" /c/Users/P1/Downloads/smart-timekeeper --include=\"*.tsx\" --include=\"*.ts\" ! -path \"*/node_modules/*\")"
+    ]
+  }
+}

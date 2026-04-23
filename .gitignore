@@ -42,3 +42,6 @@ Desktop.ini
 # Temp files
 *.tmp
 *.bak
+
+.vercel
+.env*.local

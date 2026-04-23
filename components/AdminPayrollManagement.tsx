@@ -20,8 +20,9 @@ interface Props {
     salaryChanges: SalaryChange[];
     leaveRequests: LeaveRequest[];
     onBulkSaveBonus: (items: Omit<BonusFine, 'id'>[]) => Promise<void>;
-    onDeleteBonusBatch: (ids: string[]) => Promise<void>; // New prop
-    lockedMonths: string[]; // New prop
+    onDeleteBonusBatch: (ids: string[]) => Promise<void>;
+    lockedMonths: string[];
+    onFetchMonthData?: (month: Date) => Promise<void>;
 }
 
 export const AdminPayrollManagement: React.FC<Props> = ({
@@ -37,7 +38,8 @@ export const AdminPayrollManagement: React.FC<Props> = ({
     leaveRequests,
     onBulkSaveBonus,
     onDeleteBonusBatch,
-    lockedMonths // Destructure
+    lockedMonths,
+    onFetchMonthData
 }) => {
     const [activeTab, setActiveTab] = useState<'CURRENT' | 'LATE_REPORT' | 'HISTORY'>('CURRENT');
     const [selectedMonth, setSelectedMonth] = useState<Date>(startOfMonth(new Date()));
@@ -70,7 +72,12 @@ export const AdminPayrollManagement: React.FC<Props> = ({
         fetchHistory();
     }, []);
 
-    // 2. Generate Live Report for Selected Month
+    // 2a. Lazy-load data for selected month if needed
+    useEffect(() => {
+        if (onFetchMonthData) onFetchMonthData(selectedMonth);
+    }, [selectedMonth, onFetchMonthData]);
+
+    // 2b. Generate Live Report for Selected Month
     useEffect(() => {
         const periodDetails: { empId: string; report: MonthlySalaryReport }[] = [];
         let total = 0;

@@ -333,11 +333,11 @@ export const calculateMonthlySalary = (
   console.log(` - Effective Base: ${baseSalary} | Allowance: ${allowance}`);
 
   // 1. Calculate Standard Days in Month (CongChuan)
-  // Nếu nhân viên đã nghỉ việc, chỉ tính ngày làm việc đến ngày nghỉ việc
+  // Công chuẩn tháng = đếm tất cả ngày làm việc trong tháng (T2-T7, trừ CN)
+  // Không trừ ngày sau nghỉ việc — lương/ngày luôn chia cho công chuẩn cả tháng
   const employeeResignDate = employee.resignationDate ? new Date(employee.resignationDate) : null;
   let standardDaysInMonth = 0;
   allDays.forEach(day => {
-    if (employeeResignDate && day > employeeResignDate) return;
     if (isWorkingDay(day, workDaysStr)) {
       standardDaysInMonth++;
     }
@@ -352,7 +352,31 @@ export const calculateMonthlySalary = (
   let totalConvertedOTDays = 0;
   let totalLateCount = 0;
 
-  // 2. Aggregate Daily Stats
+  // 2. Pre-group data by date for O(1) lookup instead of O(n) filter per day
+  const logsByDate = new Map<string, typeof logs>();
+  logs.forEach(l => {
+    const key = format(l.timestamp, 'yyyy-MM-dd');
+    if (!logsByDate.has(key)) logsByDate.set(key, []);
+    logsByDate.get(key)!.push(l);
+  });
+  const otReqsByDate = new Map<string, typeof otRequests>();
+  otRequests.forEach(r => {
+    const key = format(r.date, 'yyyy-MM-dd');
+    if (!otReqsByDate.has(key)) otReqsByDate.set(key, []);
+    otReqsByDate.get(key)!.push(r);
+  });
+  const lateReqsByDate = new Map<string, typeof lateRequests>();
+  lateRequests.forEach(r => {
+    const key = format(r.date, 'yyyy-MM-dd');
+    if (!lateReqsByDate.has(key)) lateReqsByDate.set(key, []);
+    lateReqsByDate.get(key)!.push(r);
+  });
+  const overridesByDate = new Map<string, (typeof overrides)[0]>();
+  overrides.forEach(o => {
+    overridesByDate.set(format(o.date, 'yyyy-MM-dd'), o);
+  });
+
+  // Aggregate Daily Stats
   allDays.forEach(day => {
     // If future, skip
     if (isFuture(day) && !isSameDay(day, new Date())) return;
@@ -360,11 +384,12 @@ export const calculateMonthlySalary = (
     // If employee resigned, skip all days AFTER resignation date
     if (employeeResignDate && day > employeeResignDate) return;
 
-    // Filter data for this day
-    const dayLogs = logs.filter(l => isSameDay(l.timestamp, day));
-    const dayOtReqs = otRequests.filter(r => isSameDay(r.date, day));
-    const dayLateReqs = lateRequests.filter(r => isSameDay(r.date, day));
-    const override = overrides.find(o => isSameDay(o.date, day));
+    // O(1) lookup instead of O(n) filter
+    const dayKey = format(day, 'yyyy-MM-dd');
+    const dayLogs = logsByDate.get(dayKey) || [];
+    const dayOtReqs = otReqsByDate.get(dayKey) || [];
+    const dayLateReqs = lateReqsByDate.get(dayKey) || [];
+    const override = overridesByDate.get(dayKey);
 
     // Calculate Stats
     const stats = calculateDailyStats(

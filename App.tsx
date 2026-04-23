@@ -61,6 +61,14 @@ import { checkAndIncrementLeaveBalance, getVirtualBirthdayBonus, calculateRemain
 import { supabase } from './utils/supabaseClient';
 import { sendPushToUser, sendPushToManagers } from './utils/pushNotifications';
 
+// Helper: NV nghỉ việc → ẩn sau khi hết tháng nghỉ việc
+const isResignedAndHidden = (emp: UserProfile): boolean => {
+  if (!emp.resignationDate) return false;
+  const resignDate = new Date(emp.resignationDate);
+  const endOfResignMonth = endOfMonth(resignDate);
+  return new Date() > endOfResignMonth;
+};
+
 // Helper: Kiểm tra tháng đã chốt lương chưa
 const isMonthLocked = (date: Date, lockedMonths: string[]): boolean => {
   return lockedMonths.includes(format(date, 'MM-yyyy'));
@@ -242,6 +250,18 @@ const App: React.FC = () => {
     }
   }, [employees, currentUser?.id]);
 
+  // === Nhân viên hiển thị (ẩn NV nghỉ việc đã hết tháng) ===
+  const visibleEmployees = useMemo(() => employees.filter(emp => !isResignedAndHidden(emp)), [employees]);
+
+  // === PERFORMANCE: Memoized filters for current user ===
+  const myLogs = useMemo(() => logs.filter(l => l.userId === currentUser?.id), [logs, currentUser?.id]);
+  const myOtRequests = useMemo(() => otRequests.filter(r => r.userId === currentUser?.id), [otRequests, currentUser?.id]);
+  const myLateRequests = useMemo(() => lateRequests.filter(r => r.userId === currentUser?.id), [lateRequests, currentUser?.id]);
+  const myLeaveRequests = useMemo(() => leaveRequests.filter(r => r.userId === currentUser?.id), [leaveRequests, currentUser?.id]);
+  const myAdvanceRequests = useMemo(() => advanceRequests.filter(r => r.userId === currentUser?.id), [advanceRequests, currentUser?.id]);
+  const myOverrides = useMemo(() => overrides.filter(o => o.userId === currentUser?.id), [overrides, currentUser?.id]);
+  const myBonuses = useMemo(() => bonuses.filter(b => b.userId === currentUser?.id), [bonuses, currentUser?.id]);
+
   // Calculate Salary for Advance Limit Check
   const advanceTargetSalaryReport = useMemo(() => {
     if (!isAdvanceModalOpen) return null;
@@ -289,8 +309,28 @@ const App: React.FC = () => {
   ]);
 
 
+  // === PERFORMANCE: Track which months have been loaded ===
+  const [loadedMonths, setLoadedMonths] = useState<Set<string>>(new Set());
+  const DEFAULT_MONTHS_TO_LOAD = 3;
+
   const fetchAllData = async () => {
     setLoadingLocation(true);
+
+    // Calculate cutoff: only load last 3 months by default
+    const cutoffDate = new Date();
+    cutoffDate.setMonth(cutoffDate.getMonth() - DEFAULT_MONTHS_TO_LOAD);
+    const cutoffISO = cutoffDate.toISOString();
+    const cutoffDateStr = format(cutoffDate, 'yyyy-MM-dd');
+
+    // Mark initial months as loaded
+    const initialMonths = new Set<string>();
+    for (let i = 0; i <= DEFAULT_MONTHS_TO_LOAD; i++) {
+      const m = new Date();
+      m.setMonth(m.getMonth() - i);
+      initialMonths.add(format(m, 'yyyy-MM'));
+    }
+    setLoadedMonths(initialMonths);
+
     try {
       // 1. Fetch Employees
       const { data: empData } = await supabase.from('profiles').select('*');
@@ -328,7 +368,8 @@ const App: React.FC = () => {
         const { data: chunk, error: chunkError } = await supabase
           .from('attendance_logs')
           .select('*')
-          .order('timestamp', { ascending: false }) // Newest first
+          .gte('timestamp', cutoffISO)
+          .order('timestamp', { ascending: false })
           .range(page * pageSize, (page + 1) * pageSize - 1);
 
         if (chunkError) {
@@ -384,8 +425,8 @@ const App: React.FC = () => {
         setLockedMonths(periodData.map((p: any) => format(new Date(p.month), 'MM-yyyy')));
       }
 
-      // 3. Fetch Requests
-      const { data: reqData } = await supabase.from('requests').select('*');
+      // 3. Fetch Requests (only recent)
+      const { data: reqData } = await supabase.from('requests').select('*').gte('created_at', cutoffISO);
       if (reqData) {
         // Filter into specific categories
         const ots = reqData.filter((r: any) => r.type === 'OT').map((r: any) => ({
@@ -458,8 +499,8 @@ const App: React.FC = () => {
         })));
       }
 
-      // 5. Fetch Bonuses
-      const { data: bonusData } = await supabase.from('bonuses').select('*');
+      // 5. Fetch Bonuses (only recent)
+      const { data: bonusData } = await supabase.from('bonuses').select('*').gte('date', cutoffDateStr);
       if (bonusData) {
         setBonuses(bonusData.map((b: any) => ({
           id: b.id,
@@ -472,8 +513,8 @@ const App: React.FC = () => {
         })));
       }
 
-      // 6. Fetch Overrides
-      const { data: overrideData } = await supabase.from('attendance_overrides').select('*');
+      // 6. Fetch Overrides (only recent)
+      const { data: overrideData } = await supabase.from('attendance_overrides').select('*').gte('date', cutoffDateStr);
       if (overrideData) {
         setOverrides(overrideData.map((o: any) => ({
           id: o.id,
@@ -515,6 +556,76 @@ const App: React.FC = () => {
     } finally {
       setLoadingLocation(false);
     }
+  };
+
+  // === LAZY-LOAD: Fetch data for a specific month (Admin xem tháng cũ) ===
+  const fetchMonthData = async (month: Date) => {
+    const monthKey = format(month, 'yyyy-MM');
+    if (loadedMonths.has(monthKey)) return;
+
+    const start = startOfMonth(month);
+    const end = endOfMonth(month);
+    const startISO = start.toISOString();
+    const endISO = end.toISOString();
+    const startDateStr = format(start, 'yyyy-MM-dd');
+    const endDateStr = format(end, 'yyyy-MM-dd');
+
+    const [logsRes, reqsRes, bonusRes, overrideRes] = await Promise.all([
+      supabase.from('attendance_logs').select('*')
+        .gte('timestamp', startISO).lte('timestamp', endISO),
+      supabase.from('requests').select('*')
+        .gte('created_at', startISO).lte('created_at', endISO),
+      supabase.from('bonuses').select('*')
+        .gte('date', startDateStr).lte('date', endDateStr),
+      supabase.from('attendance_overrides').select('*')
+        .gte('date', startDateStr).lte('date', endDateStr),
+    ]);
+
+    if (logsRes.data && logsRes.data.length > 0) {
+      const newLogs: AttendanceLog[] = logsRes.data.map((l: any) => ({
+        id: l.id, userId: l.user_id, type: l.type,
+        timestamp: new Date(l.timestamp),
+        location: { lat: l.location_lat, lng: l.location_lng },
+        ip: l.ip, isValidLocation: l.is_valid_location, note: l.note
+      }));
+      setLogs(prev => {
+        const existingIds = new Set(prev.map(l => l.id));
+        return [...prev, ...newLogs.filter(l => !existingIds.has(l.id))];
+      });
+    }
+
+    if (reqsRes.data && reqsRes.data.length > 0) {
+      const empData = employees;
+      const mapReq = (r: any) => {
+        const user = empData.find(p => p.id === r.user_id);
+        return { userId: r.user_id, userName: user?.name || 'Unknown', userAvatar: user?.avatar || '', userRole: user?.role || 'Employee', createdAt: r.created_at ? new Date(r.created_at) : undefined, processedAt: r.processed_at ? new Date(r.processed_at) : undefined };
+      };
+      const newOts = reqsRes.data.filter((r: any) => r.type === 'OT').map((r: any) => ({ ...mapReq(r), id: r.id, date: new Date(r.date), shift: r.shift, reason: r.reason, status: r.status }));
+      const newLates = reqsRes.data.filter((r: any) => r.type === 'LATE').map((r: any) => {
+        const dateStr = r.date;
+        let parsedDate = dateStr.length === 10 ? new Date(dateStr + 'T00:00:00') : (() => { const d = new Date(dateStr); return new Date(d.getFullYear(), d.getMonth(), d.getDate()); })();
+        return { ...mapReq(r), id: r.id, date: parsedDate, reason: r.reason, status: r.status, minutesLate: r.minutes_late };
+      });
+      const newLeaves = reqsRes.data.filter((r: any) => r.type === 'LEAVE').map((r: any) => ({ ...mapReq(r), id: r.id, startDate: new Date(r.start_date), endDate: new Date(r.end_date), leaveType: r.leave_type, duration: r.leave_duration, reason: r.reason, status: r.status }));
+      const newAdvances = reqsRes.data.filter((r: any) => r.type === 'ADVANCE').map((r: any) => ({ ...mapReq(r), id: r.id, date: new Date(r.created_at), amount: r.amount, reason: r.reason, status: r.status }));
+
+      if (newOts.length) setOtRequests(prev => { const ids = new Set(prev.map(r => r.id)); return [...prev, ...newOts.filter(r => !ids.has(r.id))]; });
+      if (newLates.length) setLateRequests(prev => { const ids = new Set(prev.map(r => r.id)); return [...prev, ...newLates.filter(r => !ids.has(r.id))]; });
+      if (newLeaves.length) setLeaveRequests(prev => { const ids = new Set(prev.map(r => r.id)); return [...prev, ...newLeaves.filter(r => !ids.has(r.id))]; });
+      if (newAdvances.length) setAdvanceRequests(prev => { const ids = new Set(prev.map(r => r.id)); return [...prev, ...newAdvances.filter(r => !ids.has(r.id))]; });
+    }
+
+    if (bonusRes.data && bonusRes.data.length > 0) {
+      const newBonuses = bonusRes.data.map((b: any) => ({ id: b.id, userId: b.user_id, date: new Date(b.date), amount: b.amount, type: b.type, reason: b.reason, createdAt: b.created_at ? new Date(b.created_at) : undefined }));
+      setBonuses(prev => { const ids = new Set(prev.map(b => b.id)); return [...prev, ...newBonuses.filter(b => !ids.has(b.id))]; });
+    }
+
+    if (overrideRes.data && overrideRes.data.length > 0) {
+      const newOverrides = overrideRes.data.map((o: any) => ({ id: o.id, userId: o.user_id, date: new Date(o.date), in1: o.in1, out1: o.out1, in2: o.in2, out2: o.out2, workDays: o.work_days, note: o.note }));
+      setOverrides(prev => { const ids = new Set(prev.map(o => o.id)); return [...prev, ...newOverrides.filter(o => !ids.has(o.id))]; });
+    }
+
+    setLoadedMonths(prev => new Set([...prev, monthKey]));
   };
 
   const mapBaseRequest = (req: any, allProfiles: any[]) => {
@@ -2152,21 +2263,21 @@ const App: React.FC = () => {
   const salaryReport = useMemo(() => {
     if (activeTab === 'salary' && currentUser) {
       return calculateMonthlySalary(
-        currentSalaryMonth, // Use the selected month
-        logs,
-        otRequests.filter(r => r.userId === currentUser.id), // Only my requests
-        lateRequests.filter(r => r.userId === currentUser.id), // Only my requests
-        advanceRequests.filter(r => r.userId === currentUser.id), // Only my advances
-        bonuses.filter(b => b.userId === currentUser.id), // Only my bonuses
+        currentSalaryMonth,
+        myLogs,
+        myOtRequests,
+        myLateRequests,
+        myAdvanceRequests,
+        myBonuses,
         currentUser,
-        overrides, // Pass global overrides
+        myOverrides,
         holidays,
         salaryChanges,
-        leaveRequests.filter(r => r.userId === currentUser.id)
+        myLeaveRequests
       );
     }
     return null;
-  }, [activeTab, logs, otRequests, lateRequests, advanceRequests, bonuses, currentSalaryMonth, currentUser, holidays, overrides, salaryChanges, leaveRequests]);
+  }, [activeTab, myLogs, myOtRequests, myLateRequests, myAdvanceRequests, myBonuses, currentSalaryMonth, currentUser, holidays, myOverrides, salaryChanges, myLeaveRequests]);
 
   // Check Auth Loading
   if (authLoading) {
@@ -2509,7 +2620,7 @@ const App: React.FC = () => {
               </div>
 
               {/* Today History */}
-              <AttendanceHistory logs={logs.filter(l => l.userId === currentUser.id)} />
+              <AttendanceHistory logs={myLogs} />
             </div>
           )}
 
@@ -2519,15 +2630,16 @@ const App: React.FC = () => {
                 viewingMonth={viewingMonth}
                 onPrevMonth={() => setViewingMonth(prev => new Date(prev.getFullYear(), prev.getMonth() - 1, 1))}
                 onNextMonth={() => setViewingMonth(prev => new Date(prev.getFullYear(), prev.getMonth() + 1, 1))}
-                currentMonthLogs={logs.filter(l => l.userId === currentUser.id)}
-                otRequests={otRequests.filter(r => r.userId === currentUser.id)}
-                lateRequests={lateRequests.filter(r => r.userId === currentUser.id)}
-                overrides={overrides.filter(o => o.userId === currentUser.id)}
+                currentMonthLogs={myLogs}
+                otRequests={myOtRequests}
+                lateRequests={myLateRequests}
+                overrides={myOverrides}
                 onExplainLate={handleExplainLate}
                 holidays={holidays}
                 userRole={currentUser.role}
-                leaveRequests={leaveRequests.filter(r => r.userId === currentUser.id)}
-                advanceRequests={advanceRequests.filter(r => r.userId === currentUser.id)}
+                leaveRequests={myLeaveRequests}
+                advanceRequests={myAdvanceRequests}
+                onFetchMonthData={fetchMonthData}
               />
             </div>
           )}
@@ -2613,7 +2725,7 @@ const App: React.FC = () => {
             <div className="animate-fade-in pt-4">
               <CompanyCalendar
                 leaveRequests={leaveRequests}
-                employees={employees}
+                employees={visibleEmployees}
                 holidays={holidays}
                 currentUser={currentUser}
               />
@@ -2623,7 +2735,7 @@ const App: React.FC = () => {
           {activeTab === 'payroll' && isAdmin && (
             <div className="animate-fade-in pt-4">
               <AdminPayrollManagement
-                employees={employees}
+                employees={visibleEmployees}
                 logs={logs}
                 otRequests={otRequests}
                 lateRequests={lateRequests}
@@ -2635,7 +2747,8 @@ const App: React.FC = () => {
                 leaveRequests={leaveRequests}
                 onBulkSaveBonus={handleBulkAddBonus}
                 onDeleteBonusBatch={handleDeleteBonusBatch}
-                lockedMonths={lockedMonths} // Pass prop
+                lockedMonths={lockedMonths}
+                onFetchMonthData={fetchMonthData}
               />
             </div>
           )}
@@ -2822,7 +2935,7 @@ const App: React.FC = () => {
 
         {/* Holiday Alert Utility */}
         <HolidayAlert holidays={holidays} />
-        <BirthdayAlert user={currentUser} employees={employees} />
+        <BirthdayAlert user={currentUser} employees={visibleEmployees} />
 
         {/* OT Request Modal */}
         <OTRequestModal
@@ -2950,7 +3063,7 @@ const App: React.FC = () => {
               onClose={() => setIsGeneralBonusModalOpen(false)}
               onSubmit={(data) => handleAddBonus(data)}
               onImportExcel={handleImportBonusesGeneral}
-              employees={employees}
+              employees={visibleEmployees}
               lateWarnings={lateWarnings}
             />
           );
@@ -2959,9 +3072,9 @@ const App: React.FC = () => {
         {/* AI Assistant Chatbot */}
         <AiAssistant
           user={currentUser}
-          personalLogs={logs.filter(l => l.userId === currentUser.id)}
+          personalLogs={myLogs}
           allLogs={logs}
-          employees={employees}
+          employees={visibleEmployees}
           requests={[...leaveRequests, ...otRequests, ...lateRequests]}
         />
 

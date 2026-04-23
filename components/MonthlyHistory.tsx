@@ -18,6 +18,7 @@ interface Props {
   onExplainLate: (date: Date, minutes: number) => void;
   holidays: Holiday[];
   userRole: any;
+  onFetchMonthData?: (month: Date) => Promise<void>;
 }
 
 const getVietnameseDay = (date: Date): string => {
@@ -45,10 +46,15 @@ const getTimeSlots = (logs: AttendanceLog[]) => {
 export const MonthlyHistory: React.FC<Props> = ({
   viewingMonth, onPrevMonth, onNextMonth,
   currentMonthLogs, otRequests = [], lateRequests = [], leaveRequests = [], advanceRequests = [], overrides = [],
-  onExplainLate, holidays, userRole
+  onExplainLate, holidays, userRole, onFetchMonthData
 }) => {
   const today = new Date();
   const [activeTab, setActiveTab] = useState<'attendance' | 'requests'>('attendance');
+
+  // Lazy-load data when viewing older months
+  React.useEffect(() => {
+    if (onFetchMonthData) onFetchMonthData(viewingMonth);
+  }, [viewingMonth, onFetchMonthData]);
 
   const monthStart = startOfMonth(viewingMonth);
   const monthEnd = endOfMonth(viewingMonth);

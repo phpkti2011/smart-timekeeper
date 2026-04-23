@@ -45,6 +45,7 @@ import { LeaveRequestModal } from './components/LeaveRequestModal';
 import { SalaryAdvanceModal } from './components/SalaryAdvanceModal'; // New Import
 import { CompanyCalendar } from './components/CompanyCalendar';
 import { HolidayAlert } from './components/HolidayAlert';
+import { LeaveAlert } from './components/LeaveAlert';
 import { BirthdayAlert } from './components/BirthdayAlert';
 import { AuthScreen } from './components/AuthScreen';
 import { PushNotificationToggle } from './components/PushNotificationToggle';
@@ -2933,8 +2934,9 @@ const App: React.FC = () => {
           </div>
         )}
 
-        {/* Holiday Alert Utility */}
+        {/* Holiday & Leave Alert */}
         <HolidayAlert holidays={holidays} />
+        <LeaveAlert leaveRequests={leaveRequests} employees={visibleEmployees} currentUser={currentUser} />
         <BirthdayAlert user={currentUser} employees={visibleEmployees} />
 
         {/* OT Request Modal */}

@@ -3,6 +3,7 @@ import { MessageCircle, Send, X, Sparkles, User, Bot } from 'lucide-react';
 import { chatWithAi, ChatMessage } from '../services/geminiService';
 import { UserProfile, AttendanceLog, LeaveRequest, AttendanceType } from '../types';
 import { isSameDay, format, differenceInDays, isSameMonth, startOfWeek, endOfWeek, isWithinInterval, getDate, getMonth, startOfDay, subMonths } from 'date-fns';
+import { isWorkingEmployee } from '../utils/employeeFilters';
 
 interface Props {
     user: UserProfile;
@@ -100,6 +101,7 @@ export const AiAssistant: React.FC<Props> = ({
 
         // 4. Birthday Announcements
         const birthdayEmployees = employees.filter(e => {
+            if (!isWorkingEmployee(e)) return false;
             if (!e.dateOfBirth) return false;
             const dob = new Date(e.dateOfBirth);
             return dob.getMonth() === today.getMonth(); // Same month
@@ -266,7 +268,7 @@ export const AiAssistant: React.FC<Props> = ({
 
                 // 2. Absent Analysis (No Check-in Morning)
                 const absentList = employees
-                    .filter(e => !userCheckIns.has(e.id) && e.status === 'ACTIVE' && e.role !== 'Admin')
+                    .filter(e => !userCheckIns.has(e.id) && isWorkingEmployee(e) && e.role !== 'Admin')
                     .map(e => e.name);
 
                 adminReport = `Tình hình nhân sự hôm nay (${format(today, 'dd/MM')}):\n`;

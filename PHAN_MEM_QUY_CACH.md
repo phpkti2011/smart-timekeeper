@@ -1,6 +1,6 @@
 # 📋 TÀI LIỆU QUY CÁCH, LOGIC & NGUYÊN TẮC PHẦN MỀM CHẤM CÔNG P&D
 
-> **Phiên bản:** 4.0 | **Cập nhật:** 22/03/2026  
+> **Phiên bản:** 4.1 | **Cập nhật:** 22/09/2026  
 > **Công nghệ:** React + TypeScript + Vite + Supabase (PostgreSQL) + Gemini AI  
 > **Tác giả:** Phạm Hồng Phúc
 
@@ -14,6 +14,7 @@
 4. [Quy tắc tăng ca (OT)](#4-quy-tắc-tăng-ca-ot)
 5. [Quy tắc đi trễ](#5-quy-tắc-đi-trễ)
 6. [Nghỉ phép](#6-nghỉ-phép)
+   - [6b. Đổi ngày nghỉ hàng tuần](#6b-đổi-ngày-nghỉ-hàng-tuần)
 7. [Ngày lễ](#7-ngày-lễ)
 8. [Tính lương](#8-tính-lương)
 9. [Thưởng / Phạt](#9-thưởng--phạt)
@@ -52,7 +53,7 @@
 | `profiles` | Thông tin nhân viên |
 | `attendance_logs` | Log chấm công |
 | `attendance_overrides` | Điều chỉnh công thủ công |
-| `requests` | Đơn OT / Trễ / Nghỉ phép / Ứng lương |
+| `requests` | Đơn OT / Trễ / Nghỉ phép / Ứng lương / Đổi ngày nghỉ (`SWAP`) |
 | `bonuses` | Thưởng / Phạt |
 | `holidays` | Ngày lễ |
 | `salary_changes` | Lịch sử thay đổi lương |
@@ -131,9 +132,15 @@ standardWorkDays = (morningMinutes + afternoonMinutes) / (240 × 2)
 ```
 - Giá trị: `0`, `0.5`, hoặc `1.0` (tối đa 1.0/ngày).
 
-### Ngày chủ nhật
-- Chủ nhật **KHÔNG** tính công chuẩn (`standardWorkDays = 0`).
-- Toàn bộ thời gian làm việc CN → Tự động chuyển sang **OT Chủ nhật** (hệ số ×2.0).
+### Ngày nghỉ tuần (mặc định Chủ Nhật)
+- Ngày nghỉ tuần **KHÔNG** tính công chuẩn (`standardWorkDays = 0`).
+- Toàn bộ thời gian làm việc ngày nghỉ tuần → Tự động chuyển sang **OT ngày nghỉ tuần** (hệ số ×2.0, hằng `OT_MULTIPLIERS.SUNDAY`).
+- Mặc định ngày nghỉ tuần là Chủ Nhật. Nhân viên có **đơn đổi ngày nghỉ** đã duyệt (mục 6b)
+  thì Thứ 7 tuần đó là ngày nghỉ tuần, còn Chủ Nhật là ngày làm việc thường.
+- Trong code: `DailyStats.isSunday` là Chủ Nhật **theo lịch** (chỉ để hiện nhãn/màu); mọi chỗ
+  tính tiền dùng `DailyStats.isRestDay` (ngày nghỉ tuần **thực tế**, từ `resolveRestDay` trong
+  `utils/restDay.ts`). Cố ý tách hai khái niệm để không còn chỗ nào hỏi thẳng `isSunday(date)`
+  rồi trả ×2 cho cả Thứ 7 lẫn Chủ Nhật.
 
 ### Chống double-tap
 - Biến `isProcessingAttendance` ngăn chặn gửi 2 request cùng lúc.
@@ -148,12 +155,31 @@ standardWorkDays = (morningMinutes + afternoonMinutes) / (240 × 2)
 | Ngày thường | ×1.5 | Trước 08:00, trưa 12:00–13:30, sau 17:30 |
 | Chủ nhật | ×2.0 | Toàn bộ thời gian làm việc CN |
 | Ngày lễ | ×4.0 | Toàn bộ thời gian làm việc ngày lễ |
+| **Khung đêm 22:00–06:00** | **×2.0** | Áp cho **mọi** loại OT — xem bên dưới |
+
+### Hệ số khung đêm (`NIGHT_OT_WINDOW`, `utils/otRules.ts`)
+Phút rơi vào khoảng **22:00–06:00** hưởng hệ số:
+```
+hệ số đêm = max(hệ số của ngày, 2.0)
+```
+Lấy `max` chứ **không** ghi đè và **không** nhân chồng:
+- Ghi đè cứng thì làm đêm ngày lễ sẽ **tụt** từ ×4.0 xuống ×2.0.
+- Nhân chồng thì lễ đêm thành ×8.0, tức 1 giờ làm lúc 23h bằng 1 ngày công.
+
+**Hệ quả:** Chủ Nhật (2.0) và ngày lễ (4.0) **không đổi một con số nào**. Luật đêm
+chỉ tác động lên OT ngày thường.
+
+Khung vắt qua biên bị **cắt đôi** tính hai hệ số. Ví dụ ở lại công ty tới 23:00:
+```
+(270 phút × 1.5 + 60 phút × 2.0) / 480 = 1.094 công
+```
 
 ### Công thức quy đổi OT sang ngày công
 ```
-convertedOTDays = (otMinutes × multiplier) / 480
+convertedOTDays = (phút ngày × hệ số ngày + phút đêm × hệ số đêm) / 480
 ```
-> 480 phút = 1 ngày công (8 tiếng).
+> 480 phút = 1 ngày công (8 tiếng). Không có phút đêm thì công thức rút gọn về
+> `(otMinutes × multiplier) / 480` như trước.
 
 ### Nhóm bị chặn OT tự động (`BLOCKED_OT_ROLES`)
 | Vai trò | OT tự động? |
@@ -190,6 +216,50 @@ convertedOTDays = (otMinutes × multiplier) / 480
 - Nếu có Admin Override cho ngày đó → **Bypass toàn bộ kiểm tra** nhóm bị chặn.
 - OT chỉ tính khi thời gian override > ngưỡng auto-trigger (15 phút).
 
+### Tăng ca khai theo khung giờ (`ot_start` / `ot_end` / `ot_location`)
+
+Dành cho tăng ca **không có giờ chấm công**: làm tiếp ở nhà buổi tối, hoặc ngày
+nhân viên quên chấm công ra và Admin khai bù.
+
+**Đâu là nguồn số phút — một câu:** có đủ `ot_start` **và** `ot_end` thì phút lấy
+theo khung giờ khai; thiếu thì đơn chỉ là **cờ mở khoá**, phút suy từ giờ chấm công.
+
+| Đơn | Có khung giờ? | Nguồn phút |
+|---|---|---|
+| Đơn cũ (trước tính năng này) | Không | Cờ mở khoá — *hành vi giữ nguyên* |
+| NV gửi, tại công ty | Không nhập | Cờ mở khoá |
+| NV gửi, tại nhà | Có | Khung giờ khai |
+| Admin tạo hộ (cả OFFICE lẫn HOME) | Có | Khung giờ Admin khai |
+
+- **Nhiều khung một ngày**: mỗi khung là **một dòng `requests`** riêng, duyệt lẻ được.
+- `ot_end <= ot_start` nghĩa là khung **vắt qua nửa đêm**; toàn bộ phút vẫn thuộc ngày `date`.
+- Phút khai báo vào bucket riêng `declaredMinutes`, **không** ảnh hưởng `standardWorkDays`
+  → tổng công thực tế và phụ cấp không đổi.
+- Cả **4 đường ra** của `calculateDailyStats` đều cộng OT khai báo: ngày lễ, ngày nghỉ
+  phép, ngày không có log nào, và ngày bình thường. Riêng **ngày tương lai** thì không.
+- Đơn do **Admin tạo hộ tự động duyệt**; đơn nhân viên tự gửi vẫn chờ duyệt.
+- Luồng tại nhà / Admin **không** đi qua kiểm tra GPS/IP và **không** yêu cầu chấm công.
+
+#### Ràng buộc (`validateOTRanges`)
+| Kiểm tra | Nhân viên | Admin |
+|---|---|---|
+| Giờ kết thúc khác giờ bắt đầu | Chặn | Chặn |
+| Chồng lấn với khung đã khai cùng ngày | Chặn | **Chặn** |
+| Chồng lấn với khoảng đã chấm công | Chặn | **Chặn** |
+| Tháng đã chốt lương (theo **ngày khai**) | Chặn | Chặn |
+| Ngày tương lai | Chặn | Chặn |
+| Một khung > 6 tiếng | Chặn | Miễn |
+| Tổng > 6 tiếng/ngày | Chặn | Miễn |
+| Khai bù quá 7 ngày | Chặn | Miễn |
+
+Hai dòng chồng lấn **giữ chặn cả với Admin** vì đó là **đếm trùng tiền**, không phải
+vấn đề chính sách. Khoảng đã chấm công = từ lần chấm đầu tới lần chấm cuối trong ngày:
+người đang ở công ty thì không thể đồng thời làm ở nhà. Ngày quên chấm công ra thì
+khoảng này hẹp lại nên khai bù buổi tối vẫn lọt — đúng ca cần khai bù nhất.
+
+> **Cần chạy `add_ot_time_range.sql` trên Supabase trước khi deploy**, nếu không mọi
+> lần gửi đơn tăng ca theo khung giờ sẽ lỗi.
+
 ---
 
 ## 5. Quy tắc đi trễ
@@ -223,39 +293,237 @@ convertedOTDays = (otMinutes × multiplier) / 480
 ## 6. Nghỉ phép
 
 ### Loại nghỉ phép (`LeaveType`)
-| Loại | Mô tả |
-|------|-------|
-| `PAID` | Nghỉ có lương |
-| `UNPAID` | Nghỉ không lương |
+| Loại | Mô tả | Công ty trả lương? | Trừ quỹ phép? |
+|------|-------|--------------------|---------------|
+| `PAID` | Phép năm | Có — 1.0 công | **Có** |
+| `SPECIAL` | Nghỉ chế độ công ty trả: cưới, tang (Điều 115.1) | Có — 1.0 công | Không |
+| `INSURANCE` | Nghỉ chế độ **BHXH chi trả**: thai sản, khám thai, vợ sinh con | **Không — 0 công** | Không |
+| `UNPAID` | Nghỉ không hưởng lương (Điều 115.2, việc riêng) | Không — 0 công | Không |
+
+> `isPaidLeaveType` viết theo **danh sách trắng** (`PAID` hoặc `SPECIAL`), cố ý không
+> viết `t !== 'UNPAID'`. Kiểu loại trừ khiến mỗi loại nghỉ thêm mới mặc định được trả
+> lương — chính là cái bẫy suýt làm công ty trả 6 tháng lương thai sản chồng lên tiền BHXH.
+
+`INSURANCE` trả 0 công nhưng trạng thái ngày vẫn là **nghỉ**, không phải **vắng**.
+
+### Danh mục lý do nghỉ chế độ (`SPECIAL_LEAVE_REASONS`)
+Loại nghỉ lưu vào đơn lấy từ **lý do đã chọn**, không phải từ tab người dùng bấm.
+
+| Nhóm | Lý do | Ngày | Loại |
+|---|---|---|---|
+| Hiếu hỉ | Cưới bản thân | 3 | `SPECIAL` |
+| Hiếu hỉ | Cưới con | 1 | `SPECIAL` |
+| Hiếu hỉ | Tang cha/mẹ (hai bên), vợ/chồng, con | 3 | `SPECIAL` |
+| Thai sản (BHXH) | Thai sản (sinh con) | tự nhập | `INSURANCE` |
+| Thai sản (BHXH) | Khám thai | 1 | `INSURANCE` |
+| Thai sản (BHXH) | Sẩy thai / nạo, hút thai | tự nhập | `INSURANCE` |
+| Thai sản (BHXH) | Vợ sinh con (lao động nam) | 5 | `INSURANCE` |
+| Không hưởng lương | Tang ông bà nội/ngoại, anh/chị/em ruột | 1 | `UNPAID` |
+| Không hưởng lương | Cưới của cha/mẹ | 1 | `UNPAID` |
+| Không hưởng lương | Cưới anh/chị/em ruột | 1 | `UNPAID` |
+| Khác | (nhập tay) | tự nhập | `SPECIAL` |
+
+> **Cần chạy `add_insurance_leave_type.sql` trên Supabase trước khi deploy** — cột
+> `leave_type` có thể đang có CHECK constraint chặn giá trị `INSURANCE`.
 
 ### Thời lượng nghỉ (`LeaveDuration`)
 | Giá trị | Mô tả | Tính công |
 |---------|-------|-----------|
-| `FULL` | Cả ngày | PAID → 1.0, UNPAID → 0.0 |
-| `MORNING` | Nửa sáng | PAID → 0.5, UNPAID → 0.0 |
-| `AFTERNOON` | Nửa chiều | PAID → 0.5, UNPAID → 0.0 |
+| `FULL` | Cả ngày | PAID/SPECIAL → 1.0, INSURANCE/UNPAID → 0.0 |
+| `MORNING` | Nửa sáng | PAID/SPECIAL → 0.5, INSURANCE/UNPAID → 0.0 |
+| `AFTERNOON` | Nửa chiều | PAID/SPECIAL → 0.5, INSURANCE/UNPAID → 0.0 |
 
-### Quota phép có lương
-- **1 ngày/tháng** (cho hợp đồng chính thức).
-- **Không cộng dồn** — Mỗi tháng reset về 1 ngày.
-- Quota kiểm tra cả đơn `APPROVED` + `PENDING` → Tránh gửi nhiều đơn bypass.
-- Nếu hết quota → Hệ thống **CHẶN** không cho gửi đơn PAID, yêu cầu chọn UNPAID.
+### Quỹ phép năm
+- Tích luỹ **1 ngày cho mỗi tháng làm việc**, tối đa **12 ngày/năm**.
+- **Cộng dồn trong năm**, tự **reset về 0 ngày 01/01** (không dồn qua năm).
+- Không cộng thêm theo thâm niên.
 
-### Tính phép còn lại (`calculateRemainingLeave`)
+### Trần sử dụng trong tháng
+- Tối đa **2 ngày phép năm (`PAID`) mỗi tháng** — chỉ áp cho **nhân viên tự xin nghỉ**.
+- **Admin tạo đơn hộ thì KHÔNG bị trần này**, chỉ bị giới hạn bởi quỹ phép năm còn lại.
+  Admin tự xin nghỉ cho chính mình vẫn chịu trần (phân biệt theo "tạo hộ", không theo vai trò).
+- Chỉ áp cho `PAID`. `SPECIAL`, `INSURANCE` và `UNPAID` đều được **miễn trừ**.
+- Đếm cả đơn `APPROVED` + `PENDING` → Tránh gửi nhiều đơn bypass.
+- Tính theo **tháng của ngày bắt đầu nghỉ**, không phải tháng hiện tại.
+- Vượt trần hoặc hết quỹ → Hệ thống **CHẶN** gửi đơn PAID, yêu cầu chọn UNPAID.
+- **Quỹ năm chặn cứng với mọi người**, kể cả Admin.
+
+### Chống đơn nghỉ trùng ngày
+
+Một ngày chỉ nghỉ được một lần. Ba lớp bảo vệ:
+
+**1. Chặn khi tạo** (`findOverlappingLeave`, `utils/leaveTypes.ts`)
+
+| Tình huống | Kết quả |
+|---|---|
+| Đè lên đơn `APPROVED` hoặc `PENDING` của cùng người | **Chặn** |
+| Đè lên đơn `REJECTED` | Cho qua — đơn bị từ chối không chiếm ngày |
+| Chỉ đè đúng ngày Chủ Nhật hoặc ngày lễ cả ngày | Cho qua — những ngày đó không trừ phép |
+| Người khác nghỉ cùng ngày | Cho qua |
+| **Admin tạo đơn hộ** | **Vẫn chặn** |
+
+Chặn cả Admin vì đây là **trùng dữ liệu**, không phải vấn đề chính sách — giống
+luật chồng lấn của đơn tăng ca. Muốn sửa một kỳ nghỉ thì **xoá đơn cũ rồi tạo lại**.
+
+Chốt chặn thật nằm ở `handleSubmitLeaveRequest` (`App.tsx`); `LeaveRequestModal`
+chỉ cảnh báo sớm và khoá nút gửi.
+
+**2. Đếm theo NGÀY, không theo ĐƠN**
+
+`getPaidLeaveUsedThisYear` và `getPaidLeaveUsedThisMonth` gộp các đơn thành một
+**bản đồ ngày** (`leaveDayMap` → `mergeLeaveDayMaps`) rồi mới cộng. Cộng theo đơn
+thì hai đơn phủ cùng một ngày sẽ ăn quỹ hai lần.
+
+Ngày bị nhiều đơn phủ lấy phần **lớn nhất**: nửa buổi rồi lại có đơn cả ngày thì
+ngày đó là 1.0, không phải 1.5.
+
+> Hạn chế đã biết: nửa buổi **sáng** + nửa buổi **chiều** cùng ngày ra 0.5 thay vì
+> 1.0. Chấp nhận được vì trừ thiếu an toàn hơn trừ thừa, và ca này rất hiếm.
+
+`LeaveUsageEntry` có hai trường số ngày:
+- `deductedDays` — đơn này **tự nó** trừ bao nhiêu (dùng cho từng dòng trong bảng)
+- `newDeductedDays` — phần **chưa bị đơn cũ hơn chiếm** (dùng cho con số **tổng**)
+- `overlapDays > 0` → đơn có ngày trùng, màn lịch sử tô cảnh báo
+
+**3. Khử trùng khi hiển thị**
+- `CompanyCalendar`: **một người một thẻ mỗi ngày**; nhiều đơn thì lấy đơn mạnh
+  nhất (`APPROVED` hơn `PENDING`, `FULL` hơn nửa buổi). **Không vẽ thẻ nghỉ vào
+  Chủ Nhật** để khớp bảng công.
+- `LeaveHistoryModal`: các con số tổng đếm theo ngày đã khử trùng; có băng cảnh
+  báo khi phát hiện đơn trùng.
+
+### Xoá đơn từ (Admin)
+
+Nút **"Xoá đơn"** ở màn Duyệt Đơn, trên đơn đã xử lý, áp dụng cho **mọi loại đơn**
+(nghỉ / tăng ca / đi trễ / ứng lương). Dùng cho đơn **nhập trùng hoặc nhập nhầm** —
+khác với "Từ chối" (đơn có thật nhưng không duyệt) và "Hoàn duyệt" (đưa về chờ duyệt).
+
+Ràng buộc: chỉ Admin thấy nút · hỏi xác nhận có tên và ngày cụ thể · chặn tháng đã
+chốt lương · **không hoàn tác được**.
+
+> **Cần chạy `add_delete_request_policy.sql` trên Supabase** — bảng `requests` trước
+> đây chưa bao giờ bị xoá dòng nào nên có thể chưa có policy DELETE. Thiếu policy
+> thì Postgres **không báo lỗi**, chỉ lặng lẽ xoá 0 dòng; phần mềm bắt được ca này
+> và sẽ nhắc đúng tên file.
+
+### Tính phép còn lại (`utils/leaveTypes.ts`)
 ```
-remainingLeave = monthsWorked - usedPaidDays - usedLegacy
+remainingLeave = getAccruedLeaveThisYear - getPaidLeaveUsedThisYear - usedLeaveLegacy
 ```
-- `monthsWorked`: Số tháng từ ngày ký HĐ (hoặc đầu năm, tùy chế độ).
-- `usedPaidDays`: Tổng ngày phép PAID đã dùng (APPROVED).
-- `usedLegacy`: Số ngày phép nhập tay (cho dữ liệu cũ).
+- **Không lưu số dư trong DB** — luôn tính lại từ đơn đã duyệt nên không bao giờ lệch,
+  kể cả đơn Admin tạo hộ (vào thẳng trạng thái `APPROVED`).
+- `getAccruedLeaveThisYear`: 1 ngày/tháng, từ tháng ký HĐ (nếu ký trong năm nay) đến
+  tháng hiện tại hoặc tháng nghỉ việc.
+- `getPaidLeaveUsedThisYear`: tổng ngày phép `PAID` đã duyệt trong năm, đếm bằng
+  `countLeaveDays` (**bỏ Chủ Nhật và ngày lễ** để khớp với cách tính công).
+- `usedLeaveLegacy`: số ngày nhập tay cho dữ liệu cũ. Cũng là **ô điều chỉnh tay duy
+  nhất** của Admin — nhập số âm để cộng thêm phép.
+- Kết quả **có thể âm** → Admin nhìn thấy nhân viên đã nghỉ vượt quỹ (hiển thị đỏ).
 
 ### Xử lý nghỉ phép trong ngày
 - **Nghỉ cả ngày**: Không tính chấm công, return sớm.
 - **Nghỉ nửa ngày**: Tính công cho nửa ngày còn lại + cộng 0.5 (nếu PAID) cho nửa ngày nghỉ.
 
 ### Duyệt nghỉ phép
-- Admin duyệt → Trừ `leaveBalance` của nhân viên.
-- Admin bác / chuyển trạng thái → Hoàn lại `leaveBalance`.
+- Không có bước trừ số dư: phép còn lại được tính lại từ danh sách đơn `APPROVED`,
+  nên duyệt / bác đơn là số phép tự cập nhật.
+- Nếu duyệt đơn sẽ vượt quỹ năm hoặc trần 2 ngày/tháng → hiện cảnh báo xác nhận
+  (cảnh báo, không chặn cứng).
+
+---
+
+## 6b. Đổi ngày nghỉ hàng tuần
+
+Nghỉ **Thứ 7**, đi làm bù **Chủ Nhật** ngay sau đó. Dùng khi công ty xếp lịch làm Chủ Nhật.
+Vì đây là **lịch do công ty xếp**, nhân viên chỉ gửi đơn để công ty xác nhận nên form
+**không có ô lý do**: chỉ chọn Thứ 7 rồi gửi. Cột `reason` được điền sẵn hằng
+`SWAP_DEFAULT_REASON` để các màn hình dùng chung không phải xử lý chuỗi rỗng.
+Đơn loại `SWAP` trong bảng `requests`: cột `date` = Thứ 7 nghỉ bù, cột `swap_work_date` =
+Chủ Nhật làm bù (= `date` + 1). Toàn bộ luật nằm ở `utils/restDay.ts` (module thuần, chạy
+được bằng node).
+
+> **Cần chạy `add_swap_request_type.sql` trên Supabase trước khi deploy** — thêm giá trị
+> `SWAP` vào CHECK constraint của cột `type`, thêm cột `swap_work_date`, và unique index
+> "mỗi nhân viên mỗi tuần một đơn còn hiệu lực". Thiếu thì insert bị từ chối và phần mềm
+> nhắc đúng tên file.
+
+### Hiệu lực khi đơn được duyệt (chỉ `APPROVED`)
+| Ngày | Tính công |
+|------|-----------|
+| Thứ 7 (`restDate`) | Y hệt Chủ Nhật: công chuẩn 0; **mọi phút** chấm công (cả ca chuẩn lẫn OT) dồn vào một rổ **×2.0**, không tách khung đêm; đơn nghỉ phép rơi vào ngày này **vô hiệu**, không trừ quỹ phép; OT khai báo tại nhà ×2.0. |
+| Chủ Nhật (`workDate`) | Y hệt ngày thường: công chuẩn tối đa 1.0; OT sáng sớm/trưa/chiều ×1.5, khung đêm ×2.0; đi trễ tính như thường; nghỉ phép **có hiệu lực và trừ quỹ**; không chấm công → **Vắng** ("Vắng — Ngày làm bù Chủ Nhật"). |
+
+Đơn `PENDING` / `REJECTED` không ảnh hưởng gì tới tính công.
+
+### Công chuẩn tháng
+Đếm ngày T2–T7 theo `workDays` như cũ, **trừ** Thứ 7 có đơn nghỉ bù, **cộng** Chủ Nhật có
+đơn làm bù. Trong cùng tháng thì bù trừ bằng 0. Đơn **vắt tháng** (T7 30/09 – CN 01/10):
+tháng 9 giảm 1, tháng 10 tăng 1 — nhân viên làm đủ vẫn **đủ công cả hai tháng**, và nếu bỏ
+làm Chủ Nhật thì phần thiếu rơi đúng vào tháng có Chủ Nhật.
+
+Ví dụ lương cơ bản 26.000.000, cả hai tháng đều có 26 ngày T2–T7 theo lịch, làm đủ:
+
+| | Tháng 9 (T7 30/09 nghỉ bù) | Tháng 10 (CN 01/10 làm bù) |
+|---|---|---|
+| Không có đơn | 26/26 → 26.000.000 | 26/26 → 26.000.000 |
+| Có đơn, mẫu số theo lịch (cách **không** dùng) | 25/26 → 25.000.000 | 27/26 → 27.000.000 |
+| Có đơn, mẫu số theo lịch của NV (**cách đang dùng**) | 25/25 → 26.000.000 | 27/27 → 26.000.000 |
+
+### Quy trình
+- Nhân viên tự tạo → `PENDING` → Admin duyệt ở màn Duyệt Đơn (tab "Đổi ngày nghỉ").
+- Admin tạo hộ (màn chi tiết nhân viên, nút "Đổi Ngày Nghỉ") → `APPROVED` ngay.
+- Khi Admin **duyệt** đơn `PENDING` → chạy lại toàn bộ luật validate: ngày lễ hoặc đơn nghỉ
+  mới xuất hiện trong lúc chờ có thể làm đơn không còn hợp lệ.
+- Duyệt rồi từ chối / hoàn duyệt → mọi màn hình tự tính lại từ state (không lưu số dư).
+- Thông báo đẩy: tạo → quản lý; duyệt/từ chối → nhân viên (giống đơn nghỉ phép).
+
+### Luật validate (`validateSwapRequest`, theo thứ tự kiểm tra)
+| # | Luật | Admin miễn? |
+|---|------|-------------|
+| 1 | Ngày nghỉ bù phải là **Thứ 7** (Chủ Nhật tự suy = T7 + 1) | Không |
+| 2 | Thứ 7 phải thuộc `workDays` của NV (lịch không có T7 thì "vốn đã nghỉ, không cần đổi") | Không |
+| 3 | Thứ 7 và Chủ Nhật không trùng ngày lễ | Không |
+| 4 | NV chỉ gửi trong vòng **7 ngày sau Chủ Nhật** làm bù (`MAX_SWAP_BACKDATE_DAYS`) | **Có** |
+| 5 | Thứ 7 không quá 1 năm kể từ hôm nay (bắt gõ nhầm năm) | Không |
+| 6 | **Mỗi tuần một đơn** còn hiệu lực (`APPROVED`/`PENDING`); đơn `REJECTED` không chiếm chỗ. DB có unique index làm lưới an toàn cuối. | Không — trùng dữ liệu |
+| 7 | Thứ 7 không nằm trong đơn nghỉ phép (`APPROVED`/`PENDING`) | Không |
+| 8 | Chủ Nhật không nằm trong đơn nghỉ phép | Không |
+
+Ngoài ra ở `App.tsx`: **tháng đã chốt lương** chặn tạo/duyệt/từ chối/xoá — kiểm tra **cả
+tháng của Thứ 7 lẫn tháng của Chủ Nhật**. Hệ quả: đơn vắt tháng phải tạo trước khi chốt
+lương tháng có Thứ 7.
+
+### Chéo với nghỉ phép (chặn cả Admin, hai chiều)
+- Đơn nghỉ phép mới phủ lên **Thứ 7 đã đổi** → chặn (ngày đó đã là ngày nghỉ tuần).
+- Đơn nghỉ phép mới phủ lên **Chủ Nhật đã đổi** → cho phép, trừ quỹ như ngày thường.
+- Mọi hàm đếm ngày phép trong `utils/leaveTypes.ts` nhận predicate `isRestDay` (mặc định
+  Chủ Nhật; có đơn đổi thì truyền `makeRestDayPredicate` từ `utils/restDay.ts`) để số phép
+  ở mọi màn hình khớp với calculator.
+
+### Ngày lễ thêm sau khi duyệt
+Ngày lễ rơi vào Thứ 7 hoặc Chủ Nhật của đơn đã duyệt → đơn **vô hiệu cả hai ngày**
+(`isSwapVoidedByHoliday`), hai ngày tính như không có đơn; màn Duyệt Đơn gắn nhãn
+"Vô hiệu — trùng ngày lễ". Lý do: nếu không vô hiệu, ngày lễ trên Thứ 7 đã đổi bị cổng
+`!isRestDay` ở `salaryCalculator` gạt mất 1.0 công lễ.
+
+### Hiển thị
+- Lịch sử tháng / Chi tiết NV: Thứ 7 đã đổi hiện "Nghỉ bù (đổi Chủ Nhật)" hoặc "Đi làm ngày
+  nghỉ bù" (×2); Chủ Nhật đã đổi hiện "Làm bù Chủ Nhật" hoặc "Vắng mặt — Ngày làm bù Chủ Nhật".
+- Lịch công ty: thẻ 🔁 "nghỉ bù" trên Thứ 7 và "làm CN" trên Chủ Nhật (mờ khi chờ duyệt);
+  thẻ nghỉ phép không vẽ vào ngày nghỉ tuần thực tế của từng người.
+- Báo cáo Telegram (`api/daily-report.ts`, chép tay luật vì không import được `utils/`):
+  Thứ 7 đã đổi không bị báo "nghỉ không phép"; sáng Thứ 2 báo thêm Chủ Nhật vừa qua cho
+  riêng NV làm bù; có mục "ĐỔI NGÀY NGHỈ TUẦN NÀY".
+
+### Ghi chú
+- Đi trễ trên ngày nghỉ tuần vẫn đếm trễ (Chủ Nhật hiện nay đã vậy; Thứ 7 đã đổi thừa hưởng
+  y nguyên).
+- Ba chỗ tính hạn mức ứng lương trong `App.tsx` trước đây thiếu tham số lịch sử lương và đơn
+  nghỉ phép; khi thêm tham số đơn đổi ngày nghỉ đã truyền đủ, nên hạn mức ứng giờ tính cả
+  phép có lương và lịch sử lương như màn Bảng Lương.
+- Kiểm thử module thuần: `npm run test:pure` (`scripts/pure.test.ts`, chạy bằng `node:test`
+  qua esbuild) — phủ phân loại ngày, luật validate, tính công ngày, lương tháng, vắt tháng
+  và đếm ngày phép.
 
 ---
 
@@ -293,6 +561,8 @@ Khấu trừ = Phạt trễ + BHXH + Ứng lương + Phạt khác
 #### Công chuẩn tháng (`standardDaysInMonth`)
 - Đếm số ngày trong tháng nằm trong `workDays` của nhân viên.
 - Mặc định: Thứ 2–Thứ 7 (6 ngày/tuần) → ~26 ngày.
+- Có đơn đổi ngày nghỉ đã duyệt (mục 6b): **trừ** Thứ 7 nghỉ bù, **cộng** Chủ Nhật làm bù
+  (đơn vắt tháng làm tháng có T7 giảm 1, tháng có CN tăng 1).
 - Nếu bằng 0 → Fallback = 26.
 
 #### Đơn giá ngày
@@ -456,7 +726,7 @@ Lắng nghe thay đổi realtime trên 6 bảng:
 | Bảng | Hành động |
 |------|-----------|
 | `attendance_logs` | Cập nhật logs khi có chấm công mới |
-| `requests` | Cập nhật đơn OT/Trễ/Phép/Ứng lương |
+| `requests` | Cập nhật đơn OT/Trễ/Phép/Ứng lương/Đổi ngày nghỉ |
 | `bonuses` | Cập nhật thưởng/phạt |
 | `attendance_overrides` | Cập nhật override |
 | `profiles` | Cập nhật khi có nhân viên mới đăng ký |
@@ -516,8 +786,7 @@ Lắng nghe thay đổi realtime trên 6 bảng:
 | `contractType` | string | Loại hợp đồng |
 | `contractDate` | string | Ngày ký HĐ |
 | `dateOfBirth` | string | Ngày sinh |
-| `leaveBalance` | number | Số ngày phép còn |
-| `usedLeaveLegacy` | number | Phép đã dùng (nhập tay) |
+| `usedLeaveLegacy` | number | Phép đã dùng trước khi dùng phần mềm / điều chỉnh tay |
 | `resignationDate` | string | Ngày nghỉ việc |
 
 ### Loại hợp đồng (`contractType`)
@@ -581,5 +850,8 @@ OT_MULTIPLIERS = {
 }
 
 INSURANCE_RATE = 10.5%  // Tỷ lệ đóng BHXH
-LEAVE_PER_MONTH = 1     // 1 ngày phép có lương/tháng
+LEAVE_DAYS_PER_MONTH = 1        // Tích luỹ 1 ngày phép/tháng làm việc
+LEAVE_MAX_DAYS_PER_YEAR = 12    // Trần quỹ phép 1 năm
+MONTHLY_PAID_LEAVE_QUOTA = 2    // Trần 2 ngày phép năm/tháng (chỉ áp cho NV tự xin nghỉ)
+MAX_SWAP_BACKDATE_DAYS = 7      // NV chỉ gửi đơn đổi ngày nghỉ trong 7 ngày sau CN làm bù (utils/restDay.ts)
 ```

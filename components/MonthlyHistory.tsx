@@ -1,9 +1,12 @@
 import React, { useMemo, useState } from 'react';
 import { format, eachDayOfInterval, startOfMonth, endOfMonth, isSameDay, isSunday, isFuture, isSameMonth, parse, addMinutes } from 'date-fns';
-import { AttendanceLog, AttendanceType, OTRequest, LateRequest, Holiday, OverrideLog, LeaveRequest, SalaryAdvanceRequest } from '../types';
+import { AttendanceLog, AttendanceType, OTRequest, LateRequest, Holiday, OverrideLog, LeaveRequest, SalaryAdvanceRequest, SwapRequest } from '../types';
 import { OT_MULTIPLIERS, TIME_RULES } from '../constants';
 import { calculateDailyStats } from '../utils/attendanceCalculator';
-import { Calendar, AlertTriangle, FileText, CheckCircle2, Clock, History, DollarSign, LogOut } from 'lucide-react';
+import { Calendar, AlertTriangle, FileText, CheckCircle2, Clock, History, DollarSign, LogOut, Home, Moon, Repeat } from 'lucide-react';
+import { LEAVE_TYPE_LABEL } from '../utils/leaveTypes';
+import { formatOTFormula, formatDeclaredRanges, totalOTMinutes, OT_LOCATION_LABEL } from '../utils/otDisplay';
+import { restDayStatusText, restDayMinutesLabel, describeSwapShort } from '../utils/restDay';
 
 interface Props {
   viewingMonth: Date;
@@ -14,8 +17,12 @@ interface Props {
   lateRequests?: LateRequest[];
   leaveRequests?: LeaveRequest[];
   advanceRequests?: SalaryAdvanceRequest[];
+  /** Đơn đổi ngày nghỉ CỦA NV này (App đã lọc) */
+  swapRequests?: SwapRequest[];
   overrides?: OverrideLog[];
   onExplainLate: (date: Date, minutes: number) => void;
+  /** Mở modal khai tăng ca theo khung giờ cho đúng ngày của dòng đó */
+  onDeclareOT?: (date: Date) => void;
   holidays: Holiday[];
   userRole: any;
   onFetchMonthData?: (month: Date) => Promise<void>;
@@ -45,8 +52,8 @@ const getTimeSlots = (logs: AttendanceLog[]) => {
 
 export const MonthlyHistory: React.FC<Props> = ({
   viewingMonth, onPrevMonth, onNextMonth,
-  currentMonthLogs, otRequests = [], lateRequests = [], leaveRequests = [], advanceRequests = [], overrides = [],
-  onExplainLate, holidays, userRole, onFetchMonthData
+  currentMonthLogs, otRequests = [], lateRequests = [], leaveRequests = [], advanceRequests = [], swapRequests = [], overrides = [],
+  onExplainLate, onDeclareOT, holidays, userRole, onFetchMonthData
 }) => {
   const today = new Date();
   const [activeTab, setActiveTab] = useState<'attendance' | 'requests'>('attendance');
@@ -64,24 +71,20 @@ export const MonthlyHistory: React.FC<Props> = ({
   // --- ATTENDANCE STATS ---
   const dailyStats = useMemo(() => {
     return daysReversed.map(day => {
-      let logsForDay: AttendanceLog[] = [];
-      let requestsForDay: OTRequest[] = [];
-      let lateReqsForDay: LateRequest[] = [];
       const overrideForDay = overrides.find(o => isSameDay(o.date, day));
 
-      if (isSameDay(day, today)) {
-        logsForDay = currentMonthLogs.filter(log => isSameDay(log.timestamp, day));
-        requestsForDay = otRequests.filter(r => isSameDay(r.date, today));
-        lateReqsForDay = lateRequests.filter(r => isSameDay(r.date, today));
-      } else if (isFuture(day)) {
-        logsForDay = [];
-      } else {
-        logsForDay = currentMonthLogs.filter(log => isSameDay(log.timestamp, day));
-      }
+      // Lọc đơn theo TỪNG ngày, không chỉ riêng hôm nay. Trước đây ngày quá khứ
+      // truyền mảng rỗng nên đơn OT/giải trình của ngày cũ không hiện ở màn này,
+      // dù salaryCalculator và AdminEmployeeDetail vẫn lọc đúng theo ngày.
+      const logsForDay: AttendanceLog[] = isFuture(day)
+        ? []
+        : currentMonthLogs.filter(log => isSameDay(log.timestamp, day));
+      const requestsForDay: OTRequest[] = otRequests.filter(r => isSameDay(r.date, day));
+      const lateReqsForDay: LateRequest[] = lateRequests.filter(r => isSameDay(r.date, day));
 
-      return calculateDailyStats(day, logsForDay, userRole, holidays, 0, requestsForDay, lateReqsForDay, leaveRequests, overrideForDay);
+      return calculateDailyStats(day, logsForDay, userRole, holidays, 0, requestsForDay, lateReqsForDay, leaveRequests, overrideForDay, swapRequests);
     });
-  }, [currentMonthLogs, otRequests, lateRequests, leaveRequests, overrides, today, holidays, viewingMonth]); // Added viewingMonth and leaveRequests dep
+  }, [currentMonthLogs, otRequests, lateRequests, leaveRequests, swapRequests, overrides, today, holidays, viewingMonth]); // Added viewingMonth and leaveRequests dep
 
   // --- REQUESTS LIST ---
   const monthlyRequests = useMemo(() => {
@@ -90,10 +93,12 @@ export const MonthlyHistory: React.FC<Props> = ({
       ...lateRequests.filter(r => isSameMonth(new Date(r.date), viewingMonth)).map(r => ({ ...r, typeLabel: 'Đi Trễ', sortDate: new Date(r.date), icon: Clock, color: 'text-orange-600', bg: 'bg-orange-50' })),
       ...leaveRequests.filter(r => isSameMonth(new Date(r.startDate), viewingMonth)).map(r => ({ ...r, typeLabel: 'Nghỉ Phép', sortDate: new Date(r.startDate), icon: LogOut, color: 'text-rose-600', bg: 'bg-rose-50' })),
       ...advanceRequests.filter(r => isSameMonth(new Date(r.date), viewingMonth)).map(r => ({ ...r, typeLabel: 'Ứng Lương', sortDate: new Date(r.date), icon: DollarSign, color: 'text-emerald-600', bg: 'bg-emerald-50' })),
+      // Đơn vắt tháng (T7 cuối tháng – CN đầu tháng sau) hiện ở cả hai tháng
+      ...swapRequests.filter(r => isSameMonth(r.restDate, viewingMonth) || isSameMonth(r.workDate, viewingMonth)).map(r => ({ ...r, typeLabel: 'Đổi Ngày Nghỉ', sortDate: r.restDate, icon: Repeat, color: 'text-violet-600', bg: 'bg-violet-50' })),
     ];
     // Sort descending
     return allRequests.sort((a, b) => b.sortDate.getTime() - a.sortDate.getTime());
-  }, [otRequests, lateRequests, leaveRequests, advanceRequests, viewingMonth]);
+  }, [otRequests, lateRequests, leaveRequests, advanceRequests, swapRequests, viewingMonth]);
 
 
   return (
@@ -183,22 +188,27 @@ export const MonthlyHistory: React.FC<Props> = ({
             // Copy logic from previous file content, but just reference it here to save tokens? No, I must replace entire block.
             // I will try to keep the diff minimal or rewrite the loop.
             if (stat.status === 'future') return null;
-            if (stat.status === 'absent' && !stat.isSunday) {
+            // Ngày làm việc (kể cả Chủ Nhật đã đổi thành ngày làm) không có dữ liệu → vắng
+            if (stat.status === 'absent' && !stat.isRestDay) {
               return (
                 <div key={stat.date.toISOString()} className="bg-slate-50 border border-slate-100 rounded-xl p-4 flex items-center justify-between opacity-70">
                   <div>
                     <div className="text-sm font-bold text-slate-500">{format(stat.date, 'dd/MM/yyyy')} - {getVietnameseDay(stat.date)}</div>
-                    <div className="text-xs text-slate-400 italic mt-1">Vắng mặt / Không có dữ liệu</div>
+                    <div className="text-xs text-slate-400 italic mt-1">
+                      Vắng mặt / Không có dữ liệu{stat.restDayKind === 'SWAP_WORK' ? ' — Ngày làm bù Chủ Nhật' : ''}
+                    </div>
                   </div>
                   <div className="text-xl font-bold text-slate-300">0 công</div>
                 </div>
               )
             }
-            if (stat.isSunday && stat.logs.length === 0) {
+            // Ngày nghỉ tuần (CN, hoặc T7 đã đổi) không chấm công vẫn phải mở ra nếu có
+            // tăng ca khai báo, nếu không thì đơn khai cho ngày đó sẽ vô hình ở màn này.
+            if (stat.isRestDay && stat.logs.length === 0 && stat.otBreakdown.totalConvertedDays === 0) {
               return (
                 <div key={stat.date.toISOString()} className="bg-purple-50/50 border border-purple-100 rounded-xl p-3 flex items-center gap-3">
                   <div className="text-purple-400 font-bold text-sm w-12 text-center">{format(stat.date, 'dd')}</div>
-                  <div className="text-purple-400 text-xs font-medium">Chủ Nhật - Nghỉ</div>
+                  <div className="text-purple-400 text-xs font-medium">{restDayStatusText(stat.restDayKind)}</div>
                 </div>
               )
             }
@@ -206,13 +216,13 @@ export const MonthlyHistory: React.FC<Props> = ({
             const slots = getTimeSlots(stat.logs);
             const totalWork = (stat.standardWorkDays + stat.otBreakdown.totalConvertedDays).toFixed(3);
             const hasOT = stat.otBreakdown.totalConvertedDays > 0;
-            const totalOtMin = stat.otBreakdown.lunchMinutes + stat.otBreakdown.eveningMinutes + stat.otBreakdown.earlyMorningMinutes + stat.otBreakdown.sundayMinutes;
-            const otMultiplier = stat.isSunday ? OT_MULTIPLIERS.SUNDAY : OT_MULTIPLIERS.WEEKDAY;
+            const totalOtMin = totalOTMinutes(stat.otBreakdown);
+            const otMultiplier = stat.isRestDay ? OT_MULTIPLIERS.SUNDAY : OT_MULTIPLIERS.WEEKDAY;
             const dayRequests = stat.otRequests || [];
 
             return (
               <div key={stat.date.toISOString()} className="rounded-2xl border border-gray-200 overflow-hidden shadow-sm transition-all hover:shadow-md bg-white">
-                <div className={`px-4 py-3 flex justify-between items-start ${stat.isSunday ? 'bg-purple-50' : 'bg-teal-50/50'}`}>
+                <div className={`px-4 py-3 flex justify-between items-start ${stat.isRestDay ? 'bg-purple-50' : 'bg-teal-50/50'}`}>
                   <div>
                     <div className="text-lg font-extrabold text-gray-800">{format(stat.date, 'dd/MM/yyyy')}</div>
                     <div className="text-xs font-bold text-gray-500 uppercase tracking-wider mt-0.5 flex items-center gap-2">
@@ -232,7 +242,7 @@ export const MonthlyHistory: React.FC<Props> = ({
                   <div className="text-right">
                     <div className="text-xs text-gray-500 font-medium">Công Chuẩn: {stat.standardWorkDays.toFixed(3)}</div>
                     <div className="text-xs text-gray-500 font-medium">Công Tăng Ca: {stat.otBreakdown.totalConvertedDays.toFixed(3)}</div>
-                    <div className={`text-xl font-bold mt-1 ${stat.isSunday ? 'text-purple-600' : 'text-teal-600'}`}>{totalWork} <span className="text-xs font-normal text-gray-400">công</span></div>
+                    <div className={`text-xl font-bold mt-1 ${stat.isRestDay ? 'text-purple-600' : 'text-teal-600'}`}>{totalWork} <span className="text-xs font-normal text-gray-400">công</span></div>
                   </div>
                 </div>
 
@@ -242,6 +252,17 @@ export const MonthlyHistory: React.FC<Props> = ({
                   <div className="flex justify-between"><span className="font-semibold text-gray-500">Vào 2:</span><span className={`font-mono font-bold ${stat.overrideForDay?.in2 ? 'text-red-500' : 'text-gray-800'}`}>{slots.in2}</span></div>
                   <div className="flex justify-between"><span className="font-semibold text-gray-500">Ra 2:</span><span className={`font-mono font-bold ${stat.overrideForDay?.out2 ? 'text-red-500' : 'text-gray-800'}`}>{slots.out2}</span></div>
                 </div>
+
+                {onDeclareOT && stat.status !== 'future' && (
+                  <div className="px-4 py-2 border-t border-gray-100 flex justify-end">
+                    <button
+                      onClick={() => onDeclareOT(stat.date)}
+                      className="text-[11px] bg-teal-50 text-teal-700 border border-teal-200 px-2.5 py-1 rounded-lg hover:bg-teal-100 transition font-bold active:scale-95 flex items-center gap-1"
+                    >
+                      <Home size={11} /> Khai tăng ca tại nhà
+                    </button>
+                  </div>
+                )}
 
                 {stat.isLate && (
                   <div className="px-4 py-2 border-t border-gray-100 bg-red-50/30 flex items-center justify-between">
@@ -265,10 +286,14 @@ export const MonthlyHistory: React.FC<Props> = ({
                   <div className="px-4 py-2 border-t border-gray-100 bg-indigo-50/50 space-y-2">
                     {dayRequests.map(req => (
                       <div key={req.id} className="flex items-center justify-between text-xs">
-                        <div className="flex items-center gap-2 text-indigo-700">
-                          <FileText size={12} />
-                          <span className="font-medium">Đơn OT ({req.shift === 'MORNING' ? 'Sáng' : 'Chiều'}):</span>
-                          <span className="truncate max-w-[150px] text-gray-600" title={req.reason}>{req.reason}</span>
+                        <div className="flex items-center gap-2 text-indigo-700 min-w-0">
+                          <FileText size={12} className="shrink-0" />
+                          <span className="font-medium shrink-0">
+                            {req.otStart && req.otEnd
+                              ? `Đơn OT ${req.otStart}–${req.otEnd} ${OT_LOCATION_LABEL[req.otLocation || 'OFFICE']}:`
+                              : `Đơn OT (${req.shift === 'MORNING' ? 'Sáng' : 'Chiều'}):`}
+                          </span>
+                          <span className="truncate text-gray-600" title={req.reason}>{req.reason}</span>
                         </div>
                       </div>
                     ))}
@@ -277,7 +302,7 @@ export const MonthlyHistory: React.FC<Props> = ({
 
                 {hasOT && (
                   <div className="bg-slate-800 text-slate-200 px-4 py-3 text-xs">
-                    <div className="font-bold text-white mb-2">Chi tiết Tăng Ca: {totalOtMin} phút / 60 / 8 x {otMultiplier} = {stat.otBreakdown.totalConvertedDays.toFixed(3)} công</div>
+                    <div className="font-bold text-white mb-2">Chi tiết Tăng Ca: {formatOTFormula(stat.otBreakdown, otMultiplier)}</div>
                     <ul className="space-y-1 opacity-90">
                       {stat.otBreakdown.earlyMorningMinutes > 0 && (
                         <li>
@@ -339,7 +364,17 @@ export const MonthlyHistory: React.FC<Props> = ({
                         </li>
                       )}
                       {stat.otBreakdown.sundayMinutes > 0 && (
-                        <li>• Làm việc Chủ Nhật: {stat.otBreakdown.sundayMinutes} phút</li>
+                        <li>• {restDayMinutesLabel(stat.restDayKind)}: {stat.otBreakdown.sundayMinutes} phút</li>
+                      )}
+                      {stat.otBreakdown.declaredMinutes > 0 && (
+                        <li>
+                          • Tăng ca khai báo ({formatDeclaredRanges(dayRequests)}): {stat.otBreakdown.declaredMinutes} phút
+                        </li>
+                      )}
+                      {stat.otBreakdown.nightMinutes > 0 && (
+                        <li className="text-indigo-300 flex items-center gap-1">
+                          <Moon size={11} /> Trong đó {stat.otBreakdown.nightMinutes} phút thuộc khung đêm 22:00–06:00, hưởng hệ số ×2
+                        </li>
                       )}
                     </ul>
                   </div>
@@ -406,7 +441,12 @@ export const MonthlyHistory: React.FC<Props> = ({
                       )}
                       {req.leaveType && (
                         <div className="flex items-center gap-1">
-                          <LogOut size={12} /> Loại: {req.leaveType} ({req.duration})
+                          <LogOut size={12} /> Loại: {LEAVE_TYPE_LABEL[req.leaveType] || req.leaveType} ({req.duration})
+                        </div>
+                      )}
+                      {req.restDate && req.workDate && (
+                        <div className="flex items-center gap-1">
+                          <Repeat size={12} /> {describeSwapShort(req)}
                         </div>
                       )}
                     </div>

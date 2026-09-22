@@ -25,9 +25,12 @@ import {
   Holiday,
   OverrideLog,
   SalaryChange,
-  LeaveRequest
+  LeaveRequest,
+  SwapRequest
 } from '../types';
 import { calculateDailyStats } from './attendanceCalculator';
+import { isPaidLeaveType } from './leaveTypes';
+import { resolveRestDay } from './restDay';
 
 // Helper to determine the effective salary attributes based on history
 // Returns the salary configuration that was active on the target date.
@@ -95,7 +98,8 @@ export const getLateCountForMonth = (
   overrides: OverrideLog[],
   holidays: Holiday[],
   employee: UserProfile,
-  leaveRequests: LeaveRequest[]
+  leaveRequests: LeaveRequest[],
+  swapRequests: SwapRequest[] = []
 ): number => {
   const start = startOfMonth(targetMonth);
   const end = endOfMonth(targetMonth);
@@ -120,7 +124,8 @@ export const getLateCountForMonth = (
       dayOtReqs,
       dayLateReqs,
       leaveRequests,
-      override
+      override,
+      swapRequests
     );
 
     if (stats.isLate && !stats.isExcused) {
@@ -131,118 +136,6 @@ export const getLateCountForMonth = (
   return lateCount;
 };
 
-
-export const calculateRemainingLeave = (
-  contractDateStr: string,
-  userId: string,
-  leaveRequests: LeaveRequest[] = [],
-  usedLegacy: number = 0,
-  isCumulative: boolean = false
-): number => {
-  if (!contractDateStr) return 0;
-
-  const contractDate = new Date(contractDateStr);
-  const now = new Date();
-
-  const currentYear = now.getFullYear();
-  const startOfYear = new Date(currentYear, 0, 1);
-
-  // Cumulative: Count from Contract Date. Yearly: Count from Start of Year (or Contract if later)
-  const effectiveStartDate = isCumulative
-    ? contractDate
-    : (contractDate < startOfYear ? startOfYear : contractDate);
-
-  const monthsWorked = Math.max(0, differenceInMonths(now, effectiveStartDate) + (contractDate < startOfYear && !isCumulative ? 0 : 0));
-  // Note: logic refined for monthly accrual. 
-  // If cumulative: diff(now, contract). 
-  // If yearly: diff(now, yearStart).
-
-  const usedDays = leaveRequests
-    .filter(req => {
-      const isUser = req.userId === userId;
-      const isApproved = req.status === 'APPROVED';
-      const isPaid = req.leaveType === 'PAID';
-      const isCurrentYear = req.startDate.getFullYear() === currentYear;
-
-      // Cumulative: Ignore year check
-      return isUser && isApproved && isPaid && (isCumulative || isCurrentYear);
-    })
-    .reduce((sum, req) => {
-      const days = req.duration === 'FULL' ? differenceInDays(req.endDate, req.startDate) + 1 : 0.5;
-      return sum + days;
-    }, 0);
-
-  const remaining = monthsWorked - usedDays - usedLegacy;
-  return Math.max(0, remaining);
-};
-
-export const checkAndIncrementLeaveBalance = (employee: UserProfile): UserProfile => {
-  const today = new Date();
-  // If lastLeaveIncrementDate is missing (mock data), we initialize it to today 
-  // without incrementing to prevent incrementing on every page reload.
-  // In a real app with persistence, this logic would check against the DB value.
-  const lastIncrement = employee.lastLeaveIncrementDate ? new Date(employee.lastLeaveIncrementDate) : undefined;
-
-  if (!lastIncrement) {
-    return {
-      ...employee,
-      lastLeaveIncrementDate: today
-    };
-  }
-
-  // Check if current month is different from last increment month
-  // This simple logic runs once per session load.
-  const isNewMonth =
-    today.getMonth() !== lastIncrement.getMonth() ||
-    today.getFullYear() !== lastIncrement.getFullYear();
-
-  if (isNewMonth) {
-    // Only reset for official contracts
-    // NEW POLICY: Reset to exactly 1 day per month (no accumulation)
-    if (employee.contractType === 'Hợp đồng chính thức') {
-      return {
-        ...employee,
-        leaveBalance: 1, // Reset to 1, not +1 (no accumulation)
-        lastLeaveIncrementDate: today
-      };
-    }
-    // Update date even if not eligible to avoid checking again
-    return {
-      ...employee,
-      lastLeaveIncrementDate: today
-    };
-  }
-
-  return employee;
-};
-
-/**
- * Calculate total PAID leave days used in a specific month (APPROVED + PENDING)
- * Used for the 1-day-per-month limit policy
- * Counts both APPROVED and PENDING to prevent quota bypass
- */
-export const getPaidLeaveUsedThisMonth = (
-  userId: string,
-  leaveRequests: LeaveRequest[],
-  targetMonth: Date = new Date()
-): number => {
-  return leaveRequests
-    .filter(req => {
-      const isUser = req.userId === userId;
-      const isActiveRequest = req.status === 'APPROVED' || req.status === 'PENDING';
-      const isPaid = req.leaveType === 'PAID';
-      // Check if leave falls within target month
-      const leaveDate = new Date(req.startDate);
-      const isInMonth = isSameMonth(leaveDate, targetMonth);
-
-      return isUser && isActiveRequest && isPaid && isInMonth;
-    })
-    .reduce((sum, req) => {
-      const dayDiff = differenceInDays(new Date(req.endDate), new Date(req.startDate)) + 1;
-      const days = dayDiff === 1 && req.duration !== 'FULL' ? 0.5 : dayDiff;
-      return sum + days;
-    }, 0);
-};
 
 // Helper to check for birthday bonus eligibility
 export const getVirtualBirthdayBonus = (
@@ -306,7 +199,8 @@ export const calculateMonthlySalary = (
   holidays: Holiday[] = [],
   salaryChanges: SalaryChange[] = [],
   leaveRequests: LeaveRequest[] = [], // NEW: Leave Requests
-  generateMockDataForPast: boolean = false
+  swapRequests: SwapRequest[] = [], // Đơn đổi ngày nghỉ (chỉ APPROVED có hiệu lực)
+  generateMockDataForPast: boolean = false // không dùng, giữ ở cuối để không phá thứ tự tham số
 ): MonthlySalaryReport => {
   const start = startOfMonth(targetDate);
   const end = endOfMonth(targetDate);
@@ -325,6 +219,8 @@ export const calculateMonthlySalary = (
   }
 
   const workDaysStr = employee.workDays || "1,2,3,4,5,6";
+  // Phòng thủ: đơn đổi của NV khác lọt vào sẽ biến Thứ 7 của NV này thành ×2.0
+  const mySwaps = swapRequests.filter(s => s.userId === employee.id);
 
   // 0. Get Effective Salary Attributes (Debugging)
   const { baseSalary, allowance } = getEffectiveSalaryAttributes(employee, targetDate, salaryChanges);
@@ -335,10 +231,18 @@ export const calculateMonthlySalary = (
   // 1. Calculate Standard Days in Month (CongChuan)
   // Công chuẩn tháng = đếm tất cả ngày làm việc trong tháng (T2-T7, trừ CN)
   // Không trừ ngày sau nghỉ việc — lương/ngày luôn chia cho công chuẩn cả tháng
+  //
+  // Đơn đổi ngày nghỉ ĐÃ DUYỆT sửa lịch của riêng NV này: Thứ 7 nghỉ bù không
+  // đếm, Chủ Nhật làm bù có đếm. Trong cùng tháng thì bù trừ bằng 0. Khi đơn
+  // vắt tháng (T7 30/09 – CN 01/10): tháng 9 giảm 1, tháng 10 tăng 1 — nhờ vậy
+  // NV làm đủ vẫn đủ công cả hai tháng, và nếu bỏ làm CN thì thiếu công rơi
+  // đúng vào tháng 10 chứ không đổ ngược về tháng 9.
   const employeeResignDate = employee.resignationDate ? new Date(employee.resignationDate) : null;
   let standardDaysInMonth = 0;
   allDays.forEach(day => {
-    if (isWorkingDay(day, workDaysStr)) {
+    const kind = mySwaps.length > 0 ? resolveRestDay(day, mySwaps, holidays).kind : 'WORKDAY';
+    if (kind === 'SWAP_REST') return;
+    if (kind === 'SWAP_WORK' || isWorkingDay(day, workDaysStr)) {
       standardDaysInMonth++;
     }
   });
@@ -376,6 +280,9 @@ export const calculateMonthlySalary = (
     overridesByDate.set(format(o.date, 'yyyy-MM-dd'), o);
   });
 
+  // Nếu nhân viên có ngày vào làm, không tính ngày trước đó (bao gồm cả ngày lễ)
+  const employeeContractDate = employee.contractDate ? new Date(employee.contractDate) : null;
+
   // Aggregate Daily Stats
   allDays.forEach(day => {
     // If future, skip
@@ -383,6 +290,9 @@ export const calculateMonthlySalary = (
 
     // If employee resigned, skip all days AFTER resignation date
     if (employeeResignDate && day > employeeResignDate) return;
+
+    // Nếu nhân viên vào làm sau ngày này → bỏ qua (không tính lương lễ, không tính công)
+    if (employeeContractDate && day < employeeContractDate && !isSameDay(day, employeeContractDate)) return;
 
     // O(1) lookup instead of O(n) filter
     const dayKey = format(day, 'yyyy-MM-dd');
@@ -401,15 +311,17 @@ export const calculateMonthlySalary = (
       dayOtReqs,
       dayLateReqs,
       leaveRequests, // Pass actual leave requests
-      override
+      override,
+      mySwaps
     );
 
-    // Aggregate
-    if (!stats.isSunday) {
+    // Aggregate — ngày nghỉ tuần (CN hoặc T7 đã đổi) không góp công chuẩn;
+    // Chủ Nhật đã đổi thành ngày làm thì isRestDay = false nên được cộng.
+    if (!stats.isRestDay) {
       totalActualWorkDays += stats.standardWorkDays;
 
       // Split Real vs Leave
-      if (stats.status === 'leave' && stats.leaveRequest?.leaveType === 'PAID') {
+      if (stats.status === 'leave' && stats.leaveRequest && isPaidLeaveType(stats.leaveRequest.leaveType)) {
         // Chỉ cộng đúng phần nghỉ phép (0.5 nếu nửa ngày, 1.0 nếu cả ngày)
         // KHÔNG cộng cả standardWorkDays vì có thể bao gồm phần đi làm thực tế (vd: nghỉ chiều, sáng đi làm)
         const leavePortion = stats.leaveRequest.duration === 'FULL' ? 1.0 : 0.5;
@@ -507,7 +419,7 @@ export const calculateMonthlySalary = (
   // 6 tháng liên tiếp có trễ (≥2 lần/tháng) → họp BGĐ (admin handles manually)
   const prevMonths = Array.from({ length: 5 }, (_, i) => subMonths(targetDate, i + 1));
   const prevMonthLateCounts = prevMonths.map(m =>
-    getLateCountForMonth(m, logs, lateRequests, overrides, holidays, employee, leaveRequests)
+    getLateCountForMonth(m, logs, lateRequests, overrides, holidays, employee, leaveRequests, mySwaps)
   );
 
   const currentHasLate = totalLateCount >= 2;

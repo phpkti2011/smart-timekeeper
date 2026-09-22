@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { isSameDay, isSameMonth } from 'date-fns';
 import { UserProfile } from '../types';
 import { Gift, X, PartyPopper } from 'lucide-react';
+import { isWorkingEmployee } from '../utils/employeeFilters';
 
 interface Props {
     user: UserProfile | null;
@@ -27,6 +28,7 @@ export const BirthdayAlert: React.FC<Props> = ({ user, employees = [] }) => {
         // 2. Check Colleagues Birthdays
         if (employees.length > 0) {
             const others = employees.filter(e => {
+                if (!isWorkingEmployee(e)) return false;
                 if (!e.dateOfBirth) return false;
                 // Exclude myself
                 if (user && e.id === user.id) return false;

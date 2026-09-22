@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { X, Send, PlusCircle, MinusCircle, Upload, User, Calendar, Loader2, FileSpreadsheet, AlertTriangle } from 'lucide-react';
 import { BonusFine, UserProfile } from '../types';
+import { isWorkingEmployee } from '../utils/employeeFilters';
 
 interface Props {
   isOpen: boolean;
@@ -224,7 +225,7 @@ export const BonusPenaltyModal: React.FC<Props> = ({
                   className="w-full px-4 py-3 bg-white text-gray-900 border border-gray-300 rounded-xl focus:ring-2 focus:ring-slate-500 outline-none text-sm"
                 >
                   <option value="">-- Chọn nhân viên --</option>
-                  {employees.map(emp => (
+                  {employees.filter(isWorkingEmployee).map(emp => (
                     <option key={emp.id} value={emp.id}>{emp.name} ({emp.id})</option>
                   ))}
                 </select>

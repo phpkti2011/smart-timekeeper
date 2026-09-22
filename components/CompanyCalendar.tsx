@@ -1,5 +1,5 @@
 
-import React, { useState } from 'react';
+import React, { useState, useMemo } from 'react';
 import {
   format,
   startOfMonth,
@@ -16,16 +16,21 @@ import {
   startOfDay
 } from 'date-fns';
 import { ChevronLeft, ChevronRight, Calendar as CalendarIcon, Cake } from 'lucide-react';
-import { LeaveRequest, UserProfile, Holiday } from '../types';
+import { LeaveRequest, UserProfile, Holiday, SwapRequest } from '../types';
+import { LEAVE_TYPE_LABEL } from '../utils/leaveTypes';
+import { isWorkingEmployee } from '../utils/employeeFilters';
+import { buildShortNameMap, shortName } from '../utils/nameFormat';
+import { resolveRestDay } from '../utils/restDay';
 
 interface Props {
   leaveRequests: LeaveRequest[];
+  swapRequests?: SwapRequest[];
   employees: UserProfile[];
   holidays: Holiday[];
   currentUser?: UserProfile | null;
 }
 
-export const CompanyCalendar: React.FC<Props> = ({ leaveRequests, employees, holidays, currentUser }) => {
+export const CompanyCalendar: React.FC<Props> = ({ leaveRequests, swapRequests = [], employees, holidays, currentUser }) => {
   const [currentMonth, setCurrentMonth] = useState(new Date());
 
   const handlePrevMonth = () => setCurrentMonth(subMonths(currentMonth, 1));
@@ -43,6 +48,7 @@ export const CompanyCalendar: React.FC<Props> = ({ leaveRequests, employees, hol
   // Helper: Get birthdays
   const getBirthdaysForDay = (date: Date) => {
     return employees.filter(emp => {
+      if (!isWorkingEmployee(emp)) return false;
       if (!emp.dateOfBirth) return false;
       const dob = new Date(emp.dateOfBirth);
       return dob.getDate() === date.getDate() && dob.getMonth() === date.getMonth();
@@ -51,6 +57,7 @@ export const CompanyCalendar: React.FC<Props> = ({ leaveRequests, employees, hol
 
   // Monthly Birthdays Summary
   const monthlyBirthdays = employees.filter(emp => {
+    if (!isWorkingEmployee(emp)) return false;
     if (!emp.dateOfBirth) return false;
     const dob = new Date(emp.dateOfBirth);
     return dob.getMonth() === currentMonth.getMonth();
@@ -66,13 +73,60 @@ export const CompanyCalendar: React.FC<Props> = ({ leaveRequests, employees, hol
   // Helper to get leaves for a specific day
   const isAdminOrManager = currentUser?.role === 'Admin' || currentUser?.role === 'Quản Lý Sản Xuất';
 
+  // Ô lịch rất chật nên chỉ hiện tên gọi. Dựng một lần cho cả danh sách để hai
+  // người trùng tên gọi được tự nới thêm chữ đệm, tránh ô lịch chỉ ra sai người.
+  const shortNames = useMemo(
+    () => buildShortNameMap(employees.map(e => e.name)),
+    [employees]
+  );
+
+  // Ưu tiên khi một người có nhiều đơn phủ cùng một ngày: đã duyệt hơn chờ duyệt,
+  // cả ngày hơn nửa buổi. Thẻ hiện ra phải nói đúng điều thực sự xảy ra hôm đó.
+  const leaveRank = (l: { status: string; duration: string }): number =>
+    (l.status === 'APPROVED' ? 2 : 0) + (l.duration === 'FULL' ? 1 : 0);
+
+  // Đơn đổi ngày nghỉ gom theo NV để tra ngày nghỉ tuần THỰC TẾ của từng người
+  const swapsByUser = useMemo(() => {
+    const m = new Map<string, SwapRequest[]>();
+    swapRequests.forEach(s => {
+      if (!m.has(s.userId)) m.set(s.userId, []);
+      m.get(s.userId)!.push(s);
+    });
+    return m;
+  }, [swapRequests]);
+
+  // Thẻ đổi ngày nghỉ: trên Thứ 7 nghỉ bù và trên Chủ Nhật làm bù
+  const getSwapsForDay = (date: Date) => {
+    const targetDate = startOfDay(date);
+    return swapRequests
+      .filter(s => s.status === 'APPROVED' || s.status === 'PENDING')
+      .filter(s => isAdminOrManager || s.userId === currentUser?.id)
+      .filter(s => isSameDay(s.restDate, targetDate) || isSameDay(s.workDate, targetDate))
+      .map(s => {
+        const fullName = employees.find(e => e.id === s.userId)?.name || s.userName || 'Unknown';
+        return {
+          id: s.id,
+          name: fullName,
+          shortName: shortNames.get(fullName) || shortName(fullName),
+          role: isSameDay(s.restDate, targetDate) ? 'REST' as const : 'WORK' as const,
+          status: s.status
+        };
+      });
+  };
+
   const getLeavesForDay = (date: Date) => {
     const targetDate = startOfDay(date);
-    return leaveRequests
+
+    const tatCa = leaveRequests
       .filter(req => req.status === 'APPROVED' || req.status === 'PENDING')
       .filter(req => {
         // Phân quyền: Admin/Quản lý thấy tất cả, NV chỉ thấy của mình
         if (!isAdminOrManager && req.userId !== currentUser?.id) return false;
+
+        // Ngày nghỉ tuần THỰC TẾ của người đó (CN, hoặc T7 đã đổi) không trừ phép —
+        // attendanceCalculator bỏ đơn nghỉ rơi vào ngày này, lịch vẽ thẻ thì mâu
+        // thuẫn bảng công. Chủ Nhật đã đổi thành ngày làm thì vẫn vẽ.
+        if (resolveRestDay(targetDate, swapsByUser.get(req.userId) || [], holidays).isRestDay) return false;
 
         // Normalize to start of day to ensure day-level comparison works regardless of time
         const start = startOfDay(new Date(req.startDate));
@@ -88,13 +142,25 @@ export const CompanyCalendar: React.FC<Props> = ({ leaveRequests, employees, hol
           effectiveDuration = 'FULL'; // Multi-day leaves are always full days
         }
 
+        const fullName = emp?.name || req.userName || 'Unknown';
         return {
-          name: emp?.name || req.userName || 'Unknown',
+          userId: req.userId,
+          name: fullName,
+          shortName: shortNames.get(fullName) || shortName(fullName),
           type: req.leaveType,
           duration: effectiveDuration,
           status: req.status
         };
       });
+
+    // MỘT NGƯỜI MỘT THẺ mỗi ngày. Đơn nhập trùng (cùng người, cùng ngày) trước
+    // đây hiện thành hai ba thẻ chồng nhau, trong khi bảng công chỉ tính một lần.
+    const theoNguoi = new Map<string, typeof tatCa[number]>();
+    tatCa.forEach(l => {
+      const cu = theoNguoi.get(l.userId);
+      if (!cu || leaveRank(l) > leaveRank(cu)) theoNguoi.set(l.userId, l);
+    });
+    return Array.from(theoNguoi.values());
   };
 
   const weekDays = ['T2', 'T3', 'T4', 'T5', 'T6', 'T7', 'CN'];
@@ -144,6 +210,7 @@ export const CompanyCalendar: React.FC<Props> = ({ leaveRequests, employees, hol
             const leaves = getLeavesForDay(day);
             const birthdays = getBirthdaysForDay(day);
             const dailyHolidays = getHolidaysForDay(day);
+            const swaps = getSwapsForDay(day);
             const isSun = isSunday(day);
             const isToday = isSameDay(day, new Date());
 
@@ -165,7 +232,7 @@ export const CompanyCalendar: React.FC<Props> = ({ leaveRequests, employees, hol
                   {/* Birthdays */}
                   {birthdays.map(emp => (
                     <div key={emp.id} className="bg-pink-100 text-pink-600 text-[10px] px-1 py-0.5 rounded shadow-sm text-center leading-tight font-bold flex items-center justify-center gap-1" title={`Sinh nhật ${emp.name}`}>
-                      🎂 {emp.name}
+                      🎂 {shortNames.get(emp.name) || shortName(emp.name)}
                     </div>
                   ))}
 
@@ -173,6 +240,17 @@ export const CompanyCalendar: React.FC<Props> = ({ leaveRequests, employees, hol
                   {dailyHolidays.map(h => (
                     <div key={h.id} className="bg-purple-500 text-white text-[10px] px-1 py-1 rounded shadow-sm text-center leading-tight break-words font-bold">
                       🎉 {h.name}
+                    </div>
+                  ))}
+
+                  {/* Đổi ngày nghỉ (nghỉ T7 / làm bù CN) */}
+                  {swaps.map(s => (
+                    <div
+                      key={`swap-${s.id}`}
+                      className={`bg-violet-500 text-white text-[10px] px-1 py-0.5 rounded shadow-sm text-center leading-tight break-words ${s.status === 'PENDING' ? 'opacity-40' : ''}`}
+                      title={`${s.name} - ${s.role === 'REST' ? 'Nghỉ bù (đổi Chủ Nhật)' : 'Làm bù Chủ Nhật'}${s.status === 'PENDING' ? ' (Chờ duyệt)' : ''}`}
+                    >
+                      🔁 {s.shortName} · {s.role === 'REST' ? 'nghỉ bù' : 'làm CN'}
                     </div>
                   ))}
 
@@ -189,9 +267,9 @@ export const CompanyCalendar: React.FC<Props> = ({ leaveRequests, employees, hol
                       <div
                         key={lIdx}
                         className={`${bgClass} text-white text-[10px] px-1 py-1 rounded shadow-sm text-center leading-tight break-words ${isPending ? 'opacity-40' : ''}`}
-                        title={`${leave.name} - ${leave.type === 'PAID' ? 'Phép năm' : 'Không lương'} (${leave.duration === 'MORNING' ? 'Sáng' : leave.duration === 'AFTERNOON' ? 'Chiều' : 'Cả ngày'})${statusLabel}`}
+                        title={`${leave.name} - ${LEAVE_TYPE_LABEL[leave.type] || leave.type} (${leave.duration === 'MORNING' ? 'Sáng' : leave.duration === 'AFTERNOON' ? 'Chiều' : 'Cả ngày'})${statusLabel}`}
                       >
-                        {leave.name}
+                        {leave.shortName}
                       </div>
                     );
                   })}
@@ -225,6 +303,10 @@ export const CompanyCalendar: React.FC<Props> = ({ leaveRequests, employees, hol
           <div className="flex items-center gap-1">
             <div className="w-3 h-3 bg-purple-500 rounded"></div>
             <span>Ngày Lễ</span>
+          </div>
+          <div className="flex items-center gap-1">
+            <div className="w-3 h-3 bg-violet-500 rounded"></div>
+            <span>Đổi ngày nghỉ (nghỉ T7 / làm CN)</span>
           </div>
         </div>
       </div>

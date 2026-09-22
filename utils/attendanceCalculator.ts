@@ -9,10 +9,18 @@ import {
   isSameDay,
   isWithinInterval,
   startOfDay,
-  endOfDay
+  endOfDay,
+  format
 } from 'date-fns';
-import { AttendanceLog, AttendanceType, DailyStats, UserRole, OTBreakdown, OTRequest, LateRequest, LeaveRequest, OverrideLog, Holiday } from '../types';
+import { splitOTRange, splitOTRanges, convertOTToDays, nightMultiplier } from './otRules';
+import { AttendanceLog, AttendanceType, DailyStats, UserRole, OTBreakdown, OTRequest, LateRequest, LeaveRequest, OverrideLog, Holiday, SwapRequest } from '../types';
 import { TIME_RULES, BLOCKED_OT_ROLES, OT_MULTIPLIERS } from '../constants';
+import { isPaidLeaveType } from './leaveTypes';
+import { resolveRestDay, restDayStatusText } from './restDay';
+
+// Nhãn trạng thái nghỉ theo loại (dùng cho statusText)
+const leavePaidLabel = (t: LeaveRequest['leaveType']): string =>
+  t === 'PAID' ? 'Có lương' : t === 'SPECIAL' ? 'Chế độ (có lương)' : 'Không lương';
 
 // --- Helper: Convert "HH:mm" string to Date object for a specific day ---
 const getTimeOnDate = (date: Date, timeStr: string): Date => {
@@ -41,20 +49,63 @@ export const calculateDailyStats = (
   otRequests: OTRequest[] = [],
   lateRequests: LateRequest[] = [],
   leaveRequests: LeaveRequest[] = [],
-  override?: OverrideLog // NEW PARAM
+  override?: OverrideLog, // NEW PARAM
+  swapRequests: SwapRequest[] = [] // Đơn đổi ngày nghỉ CỦA CHÍNH nhân viên này (caller lọc, như leaveRequests)
 ): DailyStats => {
-  const isSun = isSunday(date);
+  // Chủ Nhật THEO LỊCH chỉ dùng cho nhãn. Ngày nghỉ tuần THỰC TẾ (sau khi áp đơn
+  // đổi ngày nghỉ đã duyệt) mới quyết định tiền: reset công chuẩn, hệ số ×2.0,
+  // vô hiệu đơn nghỉ phép. Thứ 7 có đơn đổi → isRest = true; Chủ Nhật có đơn
+  // đổi → isRest = false và rơi vào nhánh ngày thường bên dưới. Đơn trùng ngày
+  // lễ (thêm sau khi duyệt) bị vô hiệu cả hai ngày — xem isSwapVoidedByHoliday.
+  const literalSunday = isSunday(date);
+  const restDay = resolveRestDay(date, swapRequests, holidays);
+  const isRest = restDay.isRestDay;
+  const restFields = {
+    isSunday: literalSunday,
+    isRestDay: isRest,
+    restDayKind: restDay.kind,
+    swapRequest: restDay.swap
+  };
 
   const emptyOT: OTBreakdown = {
     earlyMorningMinutes: 0,
     lunchMinutes: 0,
     eveningMinutes: 0,
     sundayMinutes: 0,
+    declaredMinutes: 0,
+    nightMinutes: 0,
     totalConvertedDays: 0
   };
 
   // 1. PRIORITY: Holiday
   const holiday = holidays.find(h => isSameDay(h.date, date));
+
+  // === TĂNG CA KHAI THEO KHUNG GIỜ ===
+  // Tính MỘT LẦN ở đây rồi dùng chung cho cả 4 đường ra của hàm, vì tăng ca khai
+  // báo không phụ thuộc chấm công: nghỉ lễ, nghỉ phép, hay ngày không có log nào
+  // (Thứ 7, hôm quên chấm công) thì tối vẫn có thể làm ở nhà.
+  const declaredSplit = splitOTRanges(
+    otRequests
+      .filter(r => isSameDay(r.date, date) && r.status === 'APPROVED' && !!r.otStart && !!r.otEnd)
+      .map(r => ({ start: r.otStart, end: r.otEnd }))
+  );
+  const declaredMinutes = declaredSplit.dayMinutes + declaredSplit.nightMinutes;
+
+  /**
+   * Gộp phần tăng ca khai báo vào một breakdown đã dựng sẵn.
+   * Không có đơn khai nào thì trả về nguyên bản — ngày bình thường ra số y hệt
+   * trước khi có tính năng này.
+   */
+  const withDeclaredOT = (bd: OTBreakdown, dayMultiplier: number): OTBreakdown => {
+    if (declaredMinutes === 0) return bd;
+    const extra = convertOTToDays(declaredSplit, dayMultiplier);
+    return {
+      ...bd,
+      declaredMinutes: bd.declaredMinutes + declaredMinutes,
+      nightMinutes: bd.nightMinutes + declaredSplit.nightMinutes,
+      totalConvertedDays: parseFloat((bd.totalConvertedDays + extra).toFixed(3))
+    };
+  };
 
   let partialHolidayOTDays = 0;
   let partialHolidayOTMinutes = 0;
@@ -90,12 +141,12 @@ export const calculateDailyStats = (
       return {
         date,
         standardWorkDays: 1.0,
-        otBreakdown: {
+        otBreakdown: withDeclaredOT({
           ...emptyOT,
           sundayMinutes: otHolidayMinutes,
           totalConvertedDays: parseFloat(convertedOT.toFixed(3))
-        },
-        isLate: false, isExcused: false, lateMinutes: 0, isSunday: isSun,
+        }, OT_MULTIPLIERS.HOLIDAY),
+        isLate: false, isExcused: false, lateMinutes: 0, ...restFields,
         logs: logs, status: 'holiday', statusText: `${holiday.name}`,
         otRequests: [], lateRequest: undefined, leaveRequest: undefined
       };
@@ -113,7 +164,7 @@ export const calculateDailyStats = (
   }
 
   // 2. PRIORITY: Approved Leave Request (Partial Support)
-  const activeLeave = leaveRequests.find(req => {
+  let activeLeave = leaveRequests.find(req => {
     if (req.status !== 'APPROVED') return false;
     const checkDate = startOfDay(date);
     const start = startOfDay(req.startDate);
@@ -121,15 +172,21 @@ export const calculateDailyStats = (
     return checkDate >= start && checkDate <= end;
   });
 
+  // Ngày nghỉ tuần (Chủ Nhật, hoặc Thứ 7 đã đổi) → không tính ngày nghỉ phép vào
+  // ngày đó (hiển thị như ngày nghỉ tuần bình thường, 0 công, không trừ quỹ)
+  if (activeLeave && isRest) {
+    activeLeave = undefined;
+  }
+
   // If Full Day Leave -> Return Early
   if (activeLeave && (activeLeave.duration === 'FULL' || !isSameDay(activeLeave.startDate, activeLeave.endDate))) {
     return {
       date,
-      standardWorkDays: activeLeave.leaveType === 'PAID' ? 1.0 : 0.0,
-      otBreakdown: emptyOT,
-      isLate: false, isExcused: false, lateMinutes: 0, isSunday: isSun, logs: [],
+      standardWorkDays: isPaidLeaveType(activeLeave.leaveType) ? 1.0 : 0.0,
+      otBreakdown: withDeclaredOT(emptyOT, isRest ? OT_MULTIPLIERS.SUNDAY : OT_MULTIPLIERS.WEEKDAY),
+      isLate: false, isExcused: false, lateMinutes: 0, ...restFields, logs: [],
       status: 'leave',
-      statusText: activeLeave.leaveType === 'PAID' ? 'Nghỉ có lương' : 'Nghỉ không lương',
+      statusText: `Nghỉ ${leavePaidLabel(activeLeave.leaveType)}`,
       otRequests: [], lateRequest: undefined, leaveRequest: activeLeave
     };
   }
@@ -228,7 +285,7 @@ export const calculateDailyStats = (
         isLate: false,
         isExcused: false,
         lateMinutes: 0,
-        isSunday: isSun,
+        ...restFields,
         logs: [],
         status: 'future'
       };
@@ -237,14 +294,18 @@ export const calculateDailyStats = (
     return {
       date,
       standardWorkDays: 0,
-      otBreakdown: emptyOT,
+      // Ngày không có log nào vẫn phải cõng tăng ca khai báo: Thứ 7, hoặc hôm
+      // quên chấm công mà tối vẫn làm ở nhà. Giữ status 'absent' để không phá
+      // thống kê vắng — các màn hình nhìn totalConvertedDays là đủ.
+      otBreakdown: withDeclaredOT(emptyOT, isRest ? OT_MULTIPLIERS.SUNDAY : OT_MULTIPLIERS.WEEKDAY),
       isLate: false,
       isExcused: false,
       lateMinutes: 0,
-      isSunday: isSun,
+      ...restFields,
       logs: [],
       status: 'absent',
-      statusText: 'Vắng',
+      // Ngày nghỉ tuần không chấm công thì là "nghỉ", không phải "vắng"
+      statusText: isRest ? restDayStatusText(restDay.kind) : 'Vắng',
       otRequests: [],
       lateRequest: undefined
     };
@@ -285,6 +346,7 @@ export const calculateDailyStats = (
   let otLunch = 0;
   let otEvening = 0;
 
+  let otEveningEndAt: Date | null = null;
   let isLate = false;
   let totalLateMinutes = 0;
 
@@ -385,6 +447,9 @@ export const calculateDailyStats = (
 
       // Evening OT Logic
       if (effectiveOut > afternoonOtThresh) {
+        // Giữ lại giờ ra thật để tách phần sau 22:00 — nếu chỉ có số phút thì
+        // phải suy ngược, dễ sai khi có nhiều nguồn cộng vào otEvening.
+        otEveningEndAt = effectiveOut;
         if (isAutoOTAllowed) {
           // Automatic OT for Allowed Roles
           otEvening += differenceInMinutes(effectiveOut, afternoonEnd);
@@ -433,7 +498,7 @@ export const calculateDailyStats = (
 
   // --- MERGE WITH PARTIAL LEAVE ---
   if (activeLeave) {
-    const isPaid = activeLeave.leaveType === 'PAID';
+    const isPaid = isPaidLeaveType(activeLeave.leaveType);
     const leaveValue = isPaid ? 0.5 : 0.0;
 
     if (activeLeave.duration === 'MORNING') {
@@ -460,8 +525,9 @@ export const calculateDailyStats = (
 
   if (finalStandardDays > 1.0) finalStandardDays = 1.0;
 
+  // Ngày nghỉ tuần (CN, hoặc T7 đã đổi): công chuẩn = 0, mọi phút dồn vào một rổ ×2.0
   let otSunday = 0;
-  if (isSun) {
+  if (isRest) {
     const sundayWorkMinutes = morningStandard + afternoonStandard;
     otSunday = sundayWorkMinutes + otEarly + otLunch + otEvening;
     otEarly = 0; otLunch = 0; otEvening = 0;
@@ -474,24 +540,50 @@ export const calculateDailyStats = (
   const sundayMultiplier = OT_MULTIPLIERS.SUNDAY;
 
   let convertedOT = 0;
-  if (isSun) {
+  let autoNightMinutes = 0;
+
+  if (isRest) {
+    // Ngày nghỉ tuần KHÔNG cần tách ngày/đêm: hệ số ngày (2.0) đã bằng hệ số đêm,
+    // nên công thức cũ cho ra đúng con số. Giữ nguyên để không hồi quy.
     convertedOT += (otSunday * sundayMultiplier) / DAY_MINUTES;
   } else {
-    const totalRegularOT = otEarly + otLunch + otEvening;
-    convertedOT += (totalRegularOT * regularOTMultiplier) / DAY_MINUTES;
+    // Chỉ OT chiều mới có thể chạm 22:00. OT sáng sớm (trước 08:00) và OT trưa
+    // (12:00–13:30) thì không bao giờ.
+    const eveningSplit = (otEvening > 0 && otEveningEndAt)
+      ? splitOTRange(
+          format(afternoonEnd, 'HH:mm'),
+          format(otEveningEndAt, 'HH:mm')
+        )
+      : { dayMinutes: otEvening, nightMinutes: 0 };
+
+    autoNightMinutes = eveningSplit.nightMinutes;
+    const daytimeMinutes = otEarly + otLunch + eveningSplit.dayMinutes;
+
+    convertedOT += (
+      daytimeMinutes * regularOTMultiplier +
+      eveningSplit.nightMinutes * nightMultiplier(regularOTMultiplier)
+    ) / DAY_MINUTES;
   }
 
   // Add Partial Holiday OT
   convertedOT += partialHolidayOTDays;
 
-  const finalOTBreakdown: OTBreakdown = {
+  const baseOTBreakdown: OTBreakdown = {
     earlyMorningMinutes: otEarly,
     lunchMinutes: otLunch,
     eveningMinutes: otEvening + partialHolidayOTMinutes, // Display in Evening or separate? Adding to Evening for now or Sunday?
     // Let's add to SundayMinutes for distinct visibility as "Special/Holiday OT"
     sundayMinutes: otSunday + partialHolidayOTMinutes,
+    declaredMinutes: 0,
+    nightMinutes: autoNightMinutes,
     totalConvertedDays: parseFloat(convertedOT.toFixed(3))
   };
+
+  // Cộng tăng ca khai báo SAU bước reset Chủ Nhật ở trên, nếu không sẽ bị nuốt.
+  const finalOTBreakdown = withDeclaredOT(
+    baseOTBreakdown,
+    isRest ? OT_MULTIPLIERS.SUNDAY : OT_MULTIPLIERS.WEEKDAY
+  );
 
   const relevantLateRequest = lateRequests.find(r => isSameDay(r.date, date));
   const isExcused = isLate && relevantLateRequest?.status === 'APPROVED';
@@ -503,7 +595,7 @@ export const calculateDailyStats = (
     isLate,
     isExcused,
     lateMinutes: totalLateMinutes,
-    isSunday: isSun,
+    ...restFields,
     logs,
     otRequests,
     leaveRequest: activeLeave, // Include the partial leave
@@ -512,9 +604,13 @@ export const calculateDailyStats = (
     overrideForDay: isOverride ? override : undefined,
     status: activeLeave ? 'leave' : (holiday ? 'holiday' : 'present'),
     statusText: activeLeave
-      ? `Nghỉ ${activeLeave.duration === 'MORNING' ? 'Sáng' : 'Chiều'} (${activeLeave.leaveType === 'PAID' ? 'Có lương' : 'Không lương'})`
+      ? `Nghỉ ${activeLeave.duration === 'MORNING' ? 'Sáng' : 'Chiều'} (${leavePaidLabel(activeLeave.leaveType)})`
       : (holiday
         ? `${holiday.name} (${holiday.duration === 'MORNING' ? 'Sáng' : (holiday.duration === 'AFTERNOON' ? 'Chiều' : 'Cả ngày')})`
-        : 'Đi làm')
+        // UI tự hiện badge khi statusText khác 'Đi làm', nên hai ngày của đơn
+        // đổi tự có nhãn mà không cần sửa từng màn hình.
+        : restDay.kind === 'SWAP_WORK' ? 'Làm bù Chủ Nhật'
+          : restDay.kind === 'SWAP_REST' ? 'Đi làm ngày nghỉ bù'
+            : 'Đi làm')
   };
 };

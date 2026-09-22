@@ -1,10 +1,13 @@
 import React, { useState } from 'react';
 import { createPortal } from 'react-dom';
-import { UserProfile, UserRole, UserStatus, LeaveRequest } from '../types';
-import { Users, Search, Plus, Edit2, Trash2, X, Calendar, Eye, DollarSign, Calculator, CheckCircle2, Lock, Undo, UserMinus } from 'lucide-react';
-import { calculateRemainingLeave } from '../utils/salaryCalculator';
-import { differenceInYears, format, parse, isValid } from 'date-fns';
+import { UserProfile, UserRole, UserStatus, LeaveRequest, Holiday, SwapRequest } from '../types';
+import { Users, Search, Plus, Edit2, Trash2, X, Calendar, Eye, DollarSign, CheckCircle2, Lock, Undo, UserMinus } from 'lucide-react';
+import { accruesAnnualLeave, getAccruedLeaveThisYear, getPaidLeaveUsedThisYear, getRemainingLeave } from '../utils/leaveTypes';
+import { differenceInYears, format } from 'date-fns';
+import { parseVNDate, formatVNDate } from '../utils/dateInput';
 import { AdminLeaveManagement } from './AdminLeaveManagement';
+import { isWorkingEmployee } from '../utils/employeeFilters';
+import { makeRestDayPredicate } from '../utils/restDay';
 
 interface Props {
   employees: UserProfile[];
@@ -16,6 +19,8 @@ interface Props {
   onView: (emp: UserProfile) => void;
   onQuickBonus: () => void;
   leaveRequests: LeaveRequest[];
+  swapRequests?: SwapRequest[];
+  holidays?: Holiday[];
 }
 
 const ROLES: UserRole[] = [
@@ -29,7 +34,7 @@ const ROLES: UserRole[] = [
   'Quản Lý Sản Xuất'
 ];
 
-export const EmployeeManagement: React.FC<Props> = ({ employees, onAdd, onEdit, onDelete, onRestore, onPermanentDelete, onView, onQuickBonus, leaveRequests }) => {
+export const EmployeeManagement: React.FC<Props> = ({ employees, onAdd, onEdit, onDelete, onRestore, onPermanentDelete, onView, onQuickBonus, leaveRequests, swapRequests = [], holidays = [] }) => {
   const [searchTerm, setSearchTerm] = useState('');
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -49,7 +54,7 @@ export const EmployeeManagement: React.FC<Props> = ({ employees, onAdd, onEdit, 
     workDays: '1,2,3,4,5,6',
     contractType: 'Hợp đồng chính thức',
     contractDate: '',
-    leaveBalance: 0,
+    officialContractDate: null,
     insuranceSalary: 0,
     usedLeaveLegacy: 0,
     status: 'ACTIVE',
@@ -59,45 +64,29 @@ export const EmployeeManagement: React.FC<Props> = ({ employees, onAdd, onEdit, 
   // Date Input Refs
   const dobInputRef = React.useRef<HTMLInputElement>(null);
   const contractInputRef = React.useRef<HTMLInputElement>(null);
+  const officialInputRef = React.useRef<HTMLInputElement>(null);
   const resignInputRef = React.useRef<HTMLInputElement>(null);
 
   // Local Text State for Dates
   const [dobText, setDobText] = useState('');
   const [contractText, setContractText] = useState('');
+  const [officialText, setOfficialText] = useState('');
   const [resignText, setResignText] = useState('');
 
-  // Sync Text on FormData Change
+  // Sync Text on FormData Change — dùng chung helper với bảng nhập liệu hàng loạt
   React.useEffect(() => {
-    if (formData.dateOfBirth) {
-      const date = new Date(formData.dateOfBirth);
-      if (isValid(date)) setDobText(format(date, 'dd/MM/yyyy'));
-    } else {
-      setDobText('');
-    }
+    setDobText(formatVNDate(formData.dateOfBirth));
+    setContractText(formatVNDate(formData.contractDate));
+    setOfficialText(formatVNDate(formData.officialContractDate));
+    setResignText(formatVNDate(formData.resignationDate));
+  }, [formData.dateOfBirth, formData.contractDate, formData.officialContractDate, formData.resignationDate]);
 
-    if (formData.contractDate) {
-      const date = new Date(formData.contractDate);
-      if (isValid(date)) setContractText(format(date, 'dd/MM/yyyy'));
-    } else {
-      setContractText('');
-    }
-
-    if (formData.resignationDate) {
-      const date = new Date(formData.resignationDate);
-      if (isValid(date)) setResignText(format(date, 'dd/MM/yyyy'));
-    } else {
-      setResignText('');
-    }
-  }, [formData.dateOfBirth, formData.contractDate, formData.resignationDate]);
-
-  const handleDateTextChange = (text: string, field: 'dateOfBirth' | 'contractDate', setText: (s: string) => void) => {
+  type DateField = 'dateOfBirth' | 'contractDate' | 'officialContractDate' | 'resignationDate';
+  const handleDateTextChange = (text: string, field: DateField, setText: (s: string) => void) => {
     setText(text);
-    // Try parse dd/MM/yyyy
-    const parsed = parse(text, 'dd/MM/yyyy', new Date());
-    if (isValid(parsed) && text.length === 10) {
-      // Must yield yyyy-MM-dd standard string
-      setFormData(prev => ({ ...prev, [field]: format(parsed, 'yyyy-MM-dd') }));
-    }
+    const iso = parseVNDate(text);
+    if (iso) setFormData(prev => ({ ...prev, [field]: iso }));
+    else if (!text.trim()) setFormData(prev => ({ ...prev, [field]: null }));
   };
 
   // Handle direct update from Leave Management
@@ -112,7 +101,7 @@ export const EmployeeManagement: React.FC<Props> = ({ employees, onAdd, onEdit, 
   );
 
   const pendingEmployees = filteredEmployees.filter(e => e.status === 'PENDING');
-  const activeEmployees = filteredEmployees.filter(e => (e.status === 'ACTIVE' || !e.status) && !e.resignationDate);
+  const activeEmployees = filteredEmployees.filter(isWorkingEmployee);
   const lockedEmployees = filteredEmployees.filter(e => e.status === 'LOCKED');
   const resignedEmployees = filteredEmployees.filter(e => !!e.resignationDate && e.status !== 'LOCKED');
 
@@ -123,6 +112,8 @@ export const EmployeeManagement: React.FC<Props> = ({ employees, onAdd, onEdit, 
         onBack={() => setShowLeaveMgmt(false)}
         onUpdateEmployee={handleUpdateFromLeaveMgmt}
         leaveRequests={leaveRequests}
+        swapRequests={swapRequests}
+        holidays={holidays}
       />
     );
   }
@@ -142,7 +133,7 @@ export const EmployeeManagement: React.FC<Props> = ({ employees, onAdd, onEdit, 
       workDays: '1,2,3,4,5,6',
       contractType: 'Hợp đồng chính thức',
       contractDate: '',
-      leaveBalance: 0,
+      officialContractDate: null,
       insuranceSalary: 0,
       usedLeaveLegacy: 0,
       status: 'ACTIVE',
@@ -159,7 +150,6 @@ export const EmployeeManagement: React.FC<Props> = ({ employees, onAdd, onEdit, 
       baseSalary: emp.baseSalary || 0,
       allowance: emp.allowance || 0,
       workDays: emp.workDays || '1,2,3,4,5,6',
-      leaveBalance: emp.leaveBalance || 0,
       insuranceSalary: emp.insuranceSalary || 0,
       usedLeaveLegacy: emp.usedLeaveLegacy || 0,
       status: emp.status || 'ACTIVE',
@@ -170,23 +160,6 @@ export const EmployeeManagement: React.FC<Props> = ({ employees, onAdd, onEdit, 
 
   const handleApproveUser = (emp: UserProfile) => {
     onEdit({ ...emp, status: 'ACTIVE' });
-  };
-
-  const handleAutoCalcLeave = () => {
-    if (!formData.contractDate) {
-      alert("Vui lòng chọn ngày ký hợp đồng trước");
-      return;
-    }
-    if (!formData.contractDate) {
-      alert("Vui lòng chọn ngày ký hợp đồng trước");
-      return;
-    }
-    // New Logic: Accrued - Used
-    // Must handle the case where ID might not exist yet (new user) - assume 0 used
-    const tempId = formData.id || 'new-user';
-    const usedLegacy = formData.usedLeaveLegacy || 0;
-    const remaining = calculateRemainingLeave(formData.contractDate, tempId, leaveRequests, usedLegacy);
-    setFormData({ ...formData, leaveBalance: remaining });
   };
 
   const handleSubmit = (e: React.FormEvent) => {
@@ -200,10 +173,11 @@ export const EmployeeManagement: React.FC<Props> = ({ employees, onAdd, onEdit, 
       ...(formData as UserProfile),
       baseSalary: Number(formData.baseSalary),
       allowance: Number(formData.allowance),
-      leaveBalance: Number(formData.leaveBalance),
       insuranceSalary: Number(formData.insuranceSalary),
       usedLeaveLegacy: Number(formData.usedLeaveLegacy),
-      dateOfBirth: formData.dateOfBirth || null
+      dateOfBirth: formData.dateOfBirth || null,
+      officialContractDate: formData.officialContractDate || null,
+      resignationDate: formData.resignationDate || null
     };
 
     if (editingId) {
@@ -227,8 +201,7 @@ export const EmployeeManagement: React.FC<Props> = ({ employees, onAdd, onEdit, 
   const getSeniorityText = () => {
     if (!formData.contractDate) return '';
     const years = differenceInYears(new Date(), new Date(formData.contractDate));
-    const bonus = Math.floor(years / 5);
-    return `${years} năm (+${bonus} ngày phép)`;
+    return `${years} năm`;
   };
 
   const renderEmployeeRow = (emp: UserProfile) => (
@@ -335,7 +308,7 @@ export const EmployeeManagement: React.FC<Props> = ({ employees, onAdd, onEdit, 
             </div>
             <div>
               <h2 className="text-xl font-bold text-gray-800 leading-none">Nhân sự</h2>
-              <span className="text-sm text-gray-500">{employees.length} nhân viên</span>
+              <span className="text-sm text-gray-500">{employees.filter(isWorkingEmployee).length} nhân viên đang làm</span>
             </div>
           </div>
           <div className="flex gap-2">
@@ -582,7 +555,7 @@ export const EmployeeManagement: React.FC<Props> = ({ employees, onAdd, onEdit, 
                   placeholder="1,2,3,4,5,6"
                 />
               </div>
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-4 border-t border-gray-100 pt-4">
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4 border-t border-gray-100 pt-4">
                 <div>
                   <label className="block text-sm text-gray-600 mb-1.5">Loại Hợp đồng</label>
                   <select
@@ -597,7 +570,9 @@ export const EmployeeManagement: React.FC<Props> = ({ employees, onAdd, onEdit, 
                   </select>
                 </div>
                 <div>
-                  <label className="block text-sm text-gray-600 mb-1.5">Ngày Ký HĐ</label>
+                  <label className="block text-sm text-gray-600 mb-1.5">
+                    Ngày vào làm <span className="text-[10px] text-gray-400">(mốc tính công và thâm niên)</span>
+                  </label>
                   <div className="relative">
                     <input
                       type="text"
@@ -627,22 +602,77 @@ export const EmployeeManagement: React.FC<Props> = ({ employees, onAdd, onEdit, 
                   )}
                 </div>
                 <div>
-                  <label className="block text-sm text-gray-600 mb-1.5">Số Phép Còn</label>
-                  <div className="flex gap-2">
+                  <label className="block text-sm text-gray-600 mb-1.5">
+                    Ngày ký HĐ chính thức <span className="text-[10px] text-gray-400">(mốc tính phép năm)</span>
+                  </label>
+                  <div className="relative">
                     <input
-                      type="number"
-                      value={formData.leaveBalance}
-                      onChange={(e) => setFormData({ ...formData, leaveBalance: Number(e.target.value) })}
-                      className="w-full px-4 py-2.5 bg-white text-gray-900 border border-gray-200 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm"
+                      type="text"
+                      className="w-full px-4 py-2.5 bg-white text-gray-900 border border-gray-200 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm pr-10"
+                      placeholder="dd/mm/yyyy"
+                      value={officialText}
+                      onChange={(e) => handleDateTextChange(e.target.value, 'officialContractDate', setOfficialText)}
                     />
                     <button
                       type="button"
-                      onClick={handleAutoCalcLeave}
-                      className="bg-blue-50 text-blue-600 p-2.5 rounded-lg border border-blue-200 hover:bg-blue-100 transition-colors"
+                      onClick={() => officialInputRef.current?.showPicker()}
+                      className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-blue-600 transition-colors"
                     >
-                      <Calculator size={18} />
+                      <Calendar size={18} />
                     </button>
+                    <input
+                      ref={officialInputRef}
+                      type="date"
+                      className="absolute opacity-0 w-0 h-0 bottom-0 left-0 -z-10"
+                      onChange={(e) => {
+                        if (e.target.value) setFormData(prev => ({ ...prev, officialContractDate: e.target.value }));
+                      }}
+                    />
                   </div>
+                  <p className="text-[10px] text-gray-400 mt-1">
+                    {formData.officialContractDate
+                      ? 'Đủ tròn 1 tháng kể từ ngày này mới được 1 ngày phép.'
+                      : 'Để trống nếu chưa lên chính thức — khi đó tạm tính theo ngày vào làm.'}
+                  </p>
+                </div>
+                <div>
+                  <label className="block text-sm text-gray-600 mb-1.5">Phép Năm</label>
+                  {(() => {
+                    const previewUser = {
+                      id: formData.id || 'new-user',
+                      contractDate: formData.contractDate,
+                      officialContractDate: formData.officialContractDate,
+                      contractType: formData.contractType,
+                      usedLeaveLegacy: formData.usedLeaveLegacy,
+                      resignationDate: formData.resignationDate
+                    };
+                    const hasLeaveQuota = accruesAnnualLeave(previewUser);
+                    const accrued = getAccruedLeaveThisYear(previewUser);
+                    const isRestDay = makeRestDayPredicate(swapRequests.filter(s => s.userId === previewUser.id), holidays);
+                    const used = getPaidLeaveUsedThisYear(previewUser.id, leaveRequests, { holidays, isRestDay });
+                    const remaining = getRemainingLeave(previewUser, leaveRequests, { holidays, isRestDay });
+                    return (
+                      <div className="w-full px-4 py-2.5 bg-gray-50 border border-gray-200 rounded-lg text-sm">
+                        {!hasLeaveQuota ? (
+                          <span className="text-gray-500 italic">Không áp dụng — chưa ký HĐ chính thức</span>
+                        ) : formData.contractDate ? (
+                          <>
+                            <span className="text-gray-600">Quỹ {accrued} • Đã dùng {used}</span>
+                            <span className={`font-bold ml-2 ${remaining < 0 ? 'text-red-500' : 'text-blue-600'}`}>
+                              Còn {remaining} ngày
+                            </span>
+                          </>
+                        ) : (
+                          <span className="text-gray-400 italic">Chọn ngày ký HĐ để tính phép</span>
+                        )}
+                      </div>
+                    );
+                  })()}
+                  <p className="text-[10px] text-gray-400 mt-1">
+                    {accruesAnnualLeave(formData)
+                      ? 'Tính tự động. Điều chỉnh tại Quản Lý Phép Năm.'
+                      : 'Khi lên chính thức, nhớ đổi cả Loại Hợp đồng và Ngày Ký HĐ.'}
+                  </p>
                 </div>
               </div>
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">

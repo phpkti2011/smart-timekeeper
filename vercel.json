@@ -9,5 +9,11 @@
         { "key": "Service-Worker-Allowed", "value": "/" }
       ]
     }
+  ],
+  "crons": [
+    {
+      "path": "/api/daily-report",
+      "schedule": "40 0 * * 1-6"
+    }
   ]
 }

@@ -180,7 +180,9 @@ export const BulkBonusModal: React.FC<Props> = ({ isOpen, onClose, employees, on
                     avatar: emp.avatar,
                     amount: found.amount,
                     reason: found.reason,
-                    isSelected: true
+                    // Giữ nguyên quy tắc bỏ tick NV đã nghỉ việc như lúc khởi tạo,
+                    // nếu không nạp lại mẫu cũ sẽ tick lại đúng người vừa bị bỏ
+                    isSelected: !emp.resignationDate
                 };
             } else {
                 return {

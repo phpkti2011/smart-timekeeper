@@ -1,37 +1,52 @@
 
 import React, { useState } from 'react';
 import { format, isSameMonth, startOfMonth, subMonths, addMonths } from 'date-fns';
-import { OTRequest, LateRequest, SalaryAdvanceRequest, RequestStatus, LeaveRequest } from '../types';
-import { FileCheck, Check, XCircle, Clock, Filter, CheckCircle2, XCircle as XIcon, AlertTriangle, RotateCcw, DollarSign, Calendar, ChevronLeft, ChevronRight, CheckSquare, Square, Layers } from 'lucide-react';
+import { OTRequest, LateRequest, SalaryAdvanceRequest, RequestStatus, LeaveRequest, SwapRequest, Holiday } from '../types';
+import { FileCheck, Check, XCircle, Clock, Filter, CheckCircle2, XCircle as XIcon, AlertTriangle, RotateCcw, DollarSign, Calendar, ChevronLeft, ChevronRight, CheckSquare, Square, Layers, Moon, Trash2, Repeat } from 'lucide-react';
+import { splitOTRange } from '../utils/otRules';
+import { OT_LOCATION_LABEL } from '../utils/otDisplay';
+import { LEAVE_TYPE_LABEL, getLeaveBadgeClass } from '../utils/leaveTypes';
+import { isSwapVoidedByHoliday } from '../utils/restDay';
 
 interface Props {
   otRequests: OTRequest[];
   lateRequests: LateRequest[];
   advanceRequests?: SalaryAdvanceRequest[];
   leaveRequests?: LeaveRequest[];
-  onUpdateOtStatus: (id: string, status: RequestStatus) => void;
-  onUpdateLateStatus: (id: string, status: RequestStatus) => void;
-  onUpdateAdvanceStatus?: (id: string, status: RequestStatus) => void;
-  onUpdateLeaveStatus?: (id: string, status: RequestStatus) => void;
+  swapRequests?: SwapRequest[];
+  /** Để gắn nhãn "vô hiệu" cho đơn đổi ngày nghỉ trùng ngày lễ thêm sau khi duyệt */
+  holidays?: Holiday[];
+  onUpdateOtStatus: (id: string, status: RequestStatus, reason?: string) => void;
+  onUpdateLateStatus: (id: string, status: RequestStatus, reason?: string) => void;
+  onUpdateAdvanceStatus?: (id: string, status: RequestStatus, reason?: string) => void;
+  onUpdateLeaveStatus?: (id: string, status: RequestStatus, reason?: string) => void;
+  onUpdateSwapStatus?: (id: string, status: RequestStatus, reason?: string) => void;
+  /** Xoá hẳn đơn — dùng cho đơn nhập trùng / nhập nhầm. Chỉ truyền vào khi là Admin. */
+  onDeleteRequest?: (id: string, type: 'LEAVE' | 'OT' | 'LATE' | 'ADVANCE' | 'SWAP') => void;
 }
 
 type CombinedRequest =
   | ({ type: 'OT' } & OTRequest)
   | ({ type: 'LATE' } & LateRequest)
   | ({ type: 'ADVANCE' } & SalaryAdvanceRequest)
-  | ({ type: 'LEAVE'; date: Date } & LeaveRequest);
+  | ({ type: 'LEAVE'; date: Date } & LeaveRequest)
+  | ({ type: 'SWAP'; date: Date } & SwapRequest);
 
-type RequestTypeFilter = 'ALL' | 'LEAVE' | 'OT' | 'LATE' | 'ADVANCE';
+type RequestTypeFilter = 'ALL' | 'LEAVE' | 'OT' | 'LATE' | 'ADVANCE' | 'SWAP';
 
 export const RequestApproval: React.FC<Props> = ({
   otRequests,
   lateRequests,
   advanceRequests = [],
   leaveRequests = [],
+  swapRequests = [],
+  holidays = [],
   onUpdateOtStatus,
   onUpdateLateStatus,
   onUpdateAdvanceStatus,
-  onUpdateLeaveStatus
+  onUpdateLeaveStatus,
+  onUpdateSwapStatus,
+  onDeleteRequest
 }) => {
   const [filter, setFilter] = useState<'PENDING' | 'PROCESSED'>('PENDING');
   const [activeTypeTab, setActiveTypeTab] = useState<RequestTypeFilter>('ALL');
@@ -40,12 +55,18 @@ export const RequestApproval: React.FC<Props> = ({
   // Batch Selection State
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
 
+  // Reject Modal State
+  const [rejectingRequest, setRejectingRequest] = useState<CombinedRequest | null>(null);
+  const [rejectReason, setRejectReason] = useState('');
+
   // Merge and Sort
   const combinedList: CombinedRequest[] = [
     ...otRequests.map(r => ({ ...r, type: 'OT' as const })),
     ...lateRequests.map(r => ({ ...r, type: 'LATE' as const })),
     ...advanceRequests.map(r => ({ ...r, type: 'ADVANCE' as const })),
-    ...leaveRequests.map(r => ({ ...r, type: 'LEAVE' as const, date: r.startDate }))
+    ...leaveRequests.map(r => ({ ...r, type: 'LEAVE' as const, date: r.startDate })),
+    // Sắp xếp / lọc theo tháng bằng Thứ 7 nghỉ bù
+    ...swapRequests.map(r => ({ ...r, type: 'SWAP' as const, date: r.restDate }))
   ];
 
   const pendingRequests = combinedList.filter(r => r.status === 'PENDING').sort((a, b) => b.date.getTime() - a.date.getTime());
@@ -73,11 +94,25 @@ export const RequestApproval: React.FC<Props> = ({
   const pList = filter === 'PENDING' ? pendingRequests : processedRequests;
 
   // Actions
-  const handleUpdateStatus = (req: CombinedRequest, status: RequestStatus) => {
-    if (req.type === 'OT') onUpdateOtStatus(req.id, status);
-    else if (req.type === 'LATE') onUpdateLateStatus(req.id, status);
-    else if (req.type === 'ADVANCE' && onUpdateAdvanceStatus) onUpdateAdvanceStatus(req.id, status);
-    else if (req.type === 'LEAVE' && onUpdateLeaveStatus) onUpdateLeaveStatus(req.id, status);
+  const handleUpdateStatus = (req: CombinedRequest, status: RequestStatus, reason?: string) => {
+    if (req.type === 'OT') onUpdateOtStatus(req.id, status, reason);
+    else if (req.type === 'LATE') onUpdateLateStatus(req.id, status, reason);
+    else if (req.type === 'ADVANCE' && onUpdateAdvanceStatus) onUpdateAdvanceStatus(req.id, status, reason);
+    else if (req.type === 'LEAVE' && onUpdateLeaveStatus) onUpdateLeaveStatus(req.id, status, reason);
+    else if (req.type === 'SWAP' && onUpdateSwapStatus) onUpdateSwapStatus(req.id, status, reason);
+  };
+
+  // Reject with reason
+  const handleRejectClick = (req: CombinedRequest) => {
+    setRejectingRequest(req);
+    setRejectReason('');
+  };
+
+  const handleConfirmReject = () => {
+    if (!rejectingRequest) return;
+    handleUpdateStatus(rejectingRequest, 'REJECTED', rejectReason.trim() || undefined);
+    setRejectingRequest(null);
+    setRejectReason('');
   };
 
   // Batch Actions
@@ -160,6 +195,7 @@ export const RequestApproval: React.FC<Props> = ({
             { id: 'OT', label: 'Tăng ca' },
             { id: 'LATE', label: 'Đi trễ' },
             { id: 'ADVANCE', label: 'Ứng lương' },
+            { id: 'SWAP', label: 'Đổi ngày nghỉ' },
           ].map((tab) => {
             const count = getCount(pList, tab.id as RequestTypeFilter);
             return (
@@ -244,7 +280,8 @@ export const RequestApproval: React.FC<Props> = ({
               {/* Left Color Bar */}
               <div className={`absolute left-0 top-0 bottom-0 w-1 ${req.type === 'OT' ? 'bg-indigo-500' :
                 req.type === 'LATE' ? 'bg-red-500' :
-                  req.type === 'LEAVE' ? 'bg-green-500' : 'bg-teal-500'
+                  req.type === 'LEAVE' ? 'bg-green-500' :
+                    req.type === 'SWAP' ? 'bg-violet-500' : 'bg-teal-500'
                 }`}></div>
 
               {/* User Info Header */}
@@ -271,8 +308,12 @@ export const RequestApproval: React.FC<Props> = ({
                       <AlertTriangle size={10} /> Trễ ({req.minutesLate}p)
                     </span>
                   ) : req.type === 'LEAVE' ? (
-                    <span className={`text-[10px] font-bold px-2 py-1 rounded-md uppercase tracking-wide flex items-center gap-1 ${req.leaveType === 'PAID' ? 'bg-green-50 text-green-600' : 'bg-gray-100 text-gray-600'}`}>
-                      <Calendar size={10} /> {req.leaveType === 'PAID' ? 'Phép năm' : 'Không lương'}
+                    <span className={`text-[10px] font-bold px-2 py-1 rounded-md uppercase tracking-wide flex items-center gap-1 ${getLeaveBadgeClass(req.leaveType)}`}>
+                      <Calendar size={10} /> {LEAVE_TYPE_LABEL[req.leaveType]}
+                    </span>
+                  ) : req.type === 'SWAP' ? (
+                    <span className="text-[10px] font-bold px-2 py-1 rounded-md uppercase tracking-wide bg-violet-50 text-violet-600 border border-violet-200 flex items-center gap-1">
+                      <Repeat size={10} /> Đổi ngày nghỉ
                     </span>
                   ) : (
                     <span className="text-[10px] font-bold px-2 py-1 rounded-md uppercase tracking-wide bg-teal-50 text-teal-600 flex items-center gap-1">
@@ -293,9 +334,14 @@ export const RequestApproval: React.FC<Props> = ({
                   </span>
                 )}
                 {req.status === 'REJECTED' && (
-                  <span className="flex items-center gap-1 text-xs font-bold text-red-600 bg-red-50 px-2 py-1 rounded-full">
-                    <XIcon size={12} /> Từ chối
-                  </span>
+                  <div className="flex flex-col items-end gap-1">
+                    <span className="flex items-center gap-1 text-xs font-bold text-red-600 bg-red-50 px-2 py-1 rounded-full">
+                      <XIcon size={12} /> Từ chối
+                    </span>
+                    {(req as any).rejectionReason && (
+                      <span className="text-[10px] text-red-400 italic max-w-[150px] text-right">"{(req as any).rejectionReason}"</span>
+                    )}
+                  </div>
                 )}
               </div>
 
@@ -306,6 +352,40 @@ export const RequestApproval: React.FC<Props> = ({
                 </div>
               )}
 
+              {req.type === 'OT' && req.otStart && req.otEnd && (() => {
+                // Chỉ đơn khai theo khung giờ mới có khối này. Đơn kiểu cũ không
+                // có giờ nên không hiện gì, giữ nguyên giao diện hiện tại.
+                const split = splitOTRange(req.otStart, req.otEnd);
+                const mins = split.dayMinutes + split.nightMinutes;
+                const vatNuaDem = req.otEnd <= req.otStart;
+                return (
+                  <div className="mb-3 relative z-10 text-xs text-gray-600 bg-indigo-50/60 border border-indigo-100 p-2.5 rounded-lg space-y-1">
+                    <div className="flex items-center justify-between">
+                      <span>Khung giờ:</span>
+                      <span className="font-bold font-mono text-indigo-700">{req.otStart} – {req.otEnd}</span>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <span>Nơi làm:</span>
+                      <span className="font-bold">{OT_LOCATION_LABEL[req.otLocation || 'OFFICE']}</span>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <span>Tổng:</span>
+                      <span className="font-bold">{mins} phút</span>
+                    </div>
+                    {split.nightMinutes > 0 && (
+                      <div className="flex items-center gap-1 text-indigo-700 font-semibold pt-1 border-t border-indigo-100">
+                        <Moon size={11} /> {split.nightMinutes} phút trong khung đêm 22:00–06:00, hưởng ×2
+                      </div>
+                    )}
+                    {vatNuaDem && (
+                      <div className="flex items-center gap-1 text-amber-700 font-semibold">
+                        <AlertTriangle size={11} /> Khung vắt qua nửa đêm, kết thúc vào ngày hôm sau
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
+
               {req.type === 'LEAVE' && (
                 <div className="mb-3 relative z-10 text-xs text-gray-600 grid grid-cols-2 gap-2 bg-gray-50/50 p-2 rounded-lg">
                   <div>Từ: <span className="font-bold">{format(new Date(req.startDate), 'dd/MM/yyyy')}</span></div>
@@ -314,11 +394,36 @@ export const RequestApproval: React.FC<Props> = ({
                 </div>
               )}
 
-              <div className="mb-4 relative z-10">
-                <p className="text-sm text-gray-800 font-medium leading-relaxed bg-gray-50 p-3 rounded-xl border border-gray-100 italic">
-                  "{req.reason}"
-                </p>
-              </div>
+              {req.type === 'SWAP' && (
+                <div className="mb-3 relative z-10 text-xs text-gray-600 bg-violet-50/60 border border-violet-100 p-2.5 rounded-lg space-y-1">
+                  <div className="flex items-center justify-between">
+                    <span>Nghỉ bù:</span>
+                    <span className="font-bold">Thứ 7 {format(req.restDate, 'dd/MM/yyyy')}</span>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span>Làm bù:</span>
+                    <span className="font-bold text-violet-700">Chủ Nhật {format(req.workDate, 'dd/MM/yyyy')}</span>
+                  </div>
+                  <div className="text-[10px] text-gray-500 pt-1 border-t border-violet-100">
+                    Sau khi duyệt: T7 tính như ngày nghỉ tuần (chấm công thì ×2), CN tính công như ngày thường.
+                  </div>
+                  {req.status === 'APPROVED' && isSwapVoidedByHoliday(req, holidays) && (
+                    <div className="flex items-center gap-1 text-amber-700 font-semibold">
+                      <AlertTriangle size={11} /> Vô hiệu — trùng ngày lễ thêm sau khi duyệt. Hai ngày tính như không có đơn.
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* Đơn đổi ngày nghỉ không có ô lý do (công ty xếp lịch) nên khối
+                  chi tiết bên trên đã nói đủ, không hiện dòng trích dẫn nữa. */}
+              {req.type !== 'SWAP' && (
+                <div className="mb-4 relative z-10">
+                  <p className="text-sm text-gray-800 font-medium leading-relaxed bg-gray-50 p-3 rounded-xl border border-gray-100 italic">
+                    "{req.reason}"
+                  </p>
+                </div>
+              )}
 
               {/* Timestamps */}
               <div className="mb-3 text-[10px] text-gray-400 flex flex-col gap-1 relative z-10 px-1 opacity-80">
@@ -344,7 +449,7 @@ export const RequestApproval: React.FC<Props> = ({
                     <Check size={16} /> Duyệt
                   </button>
                   <button
-                    onClick={(e) => { e.stopPropagation(); handleUpdateStatus(req, 'REJECTED'); }}
+                    onClick={(e) => { e.stopPropagation(); handleRejectClick(req); }}
                     className="flex-1 bg-white border border-red-100 text-red-500 hover:bg-red-50 py-2 rounded-lg text-xs font-bold flex items-center justify-center gap-1.5 transition-all active:scale-95"
                   >
                     <XCircle size={16} /> Từ chối
@@ -354,7 +459,18 @@ export const RequestApproval: React.FC<Props> = ({
 
               {/* Actions (Processed - Revert) */}
               {req.status !== 'PENDING' && (
-                <div className="flex justify-end pt-2 border-t border-gray-100 mt-2 relative z-20">
+                <div className="flex justify-end gap-2 pt-2 border-t border-gray-100 mt-2 relative z-20">
+                  {onDeleteRequest && (
+                    <button
+                      type="button"
+                      onMouseDown={(e) => e.stopPropagation()}
+                      onClick={(e) => { e.stopPropagation(); onDeleteRequest(req.id, req.type); }}
+                      className="text-xs font-bold text-red-600 hover:text-white bg-red-50 hover:bg-red-600 px-3 py-2 rounded-lg transition-colors flex items-center gap-1.5 active:scale-95 cursor-pointer shadow-sm border border-red-200"
+                      title="Xoá hẳn đơn khỏi cơ sở dữ liệu — dùng cho đơn nhập trùng"
+                    >
+                      <Trash2 size={14} /> Xoá đơn
+                    </button>
+                  )}
                   <button
                     type="button"
                     onMouseDown={(e) => e.stopPropagation()}
@@ -364,6 +480,7 @@ export const RequestApproval: React.FC<Props> = ({
                       else if (req.type === 'LATE') onUpdateLateStatus(req.id, 'PENDING');
                       else if (req.type === 'ADVANCE' && onUpdateAdvanceStatus) onUpdateAdvanceStatus(req.id, 'PENDING');
                       else if (req.type === 'LEAVE' && onUpdateLeaveStatus) onUpdateLeaveStatus(req.id, 'PENDING');
+                      else if (req.type === 'SWAP' && onUpdateSwapStatus) onUpdateSwapStatus(req.id, 'PENDING');
                     }}
                     className="text-xs font-bold text-gray-500 hover:text-gray-800 bg-gray-100 hover:bg-gray-200 px-3 py-2 rounded-lg transition-colors flex items-center gap-1.5 active:scale-95 cursor-pointer shadow-sm border border-gray-200"
                   >
@@ -399,6 +516,42 @@ export const RequestApproval: React.FC<Props> = ({
               <Check size={16} />
               Duyệt tất cả
             </button>
+          </div>
+        </div>
+      )}
+      {/* Reject Reason Modal */}
+      {rejectingRequest && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/40 backdrop-blur-sm" onClick={() => setRejectingRequest(null)}>
+          <div className="bg-white rounded-2xl shadow-2xl p-5 w-80 mx-4 animate-bounce-in" onClick={e => e.stopPropagation()}>
+            <div className="flex items-center gap-2 mb-3">
+              <div className="p-2 bg-red-100 rounded-lg">
+                <XCircle size={20} className="text-red-500" />
+              </div>
+              <div>
+                <h3 className="font-bold text-gray-800 text-sm">{`T\u1EEB ch\u1ED1i \u0111\u01A1n`}</h3>
+                <p className="text-[10px] text-gray-400">{rejectingRequest.userName}</p>
+              </div>
+            </div>
+            <textarea
+              value={rejectReason}
+              onChange={e => setRejectReason(e.target.value)}
+              placeholder={`L\u00FD do t\u1EEB ch\u1ED1i (kh\u00F4ng b\u1EAFt bu\u1ED9c)...`}
+              className="w-full border border-gray-200 rounded-xl p-3 text-sm resize-none h-20 focus:ring-2 focus:ring-red-300 outline-none mb-3"
+            />
+            <div className="flex gap-2">
+              <button
+                onClick={() => setRejectingRequest(null)}
+                className="flex-1 py-2.5 border border-gray-200 rounded-xl text-xs font-bold text-gray-500 hover:bg-gray-50 transition-colors"
+              >
+                {`H\u1EE7y`}
+              </button>
+              <button
+                onClick={handleConfirmReject}
+                className="flex-1 py-2.5 bg-red-500 text-white rounded-xl text-xs font-bold hover:bg-red-600 transition-colors flex items-center justify-center gap-1"
+              >
+                <XCircle size={14} /> {`X\u00E1c nh\u1EADn t\u1EEB ch\u1ED1i`}
+              </button>
+            </div>
           </div>
         </div>
       )}

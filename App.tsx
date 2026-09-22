@@ -25,7 +25,8 @@ import {
   Lock,
   CheckCircle,
   Bell, // Added
-  Info // Added
+  Info, // Added
+  Repeat
 } from 'lucide-react';
 import { DigitalClock } from './components/DigitalClock';
 import { TimeButton } from './components/TimeButton';
@@ -35,13 +36,14 @@ import { AiAssistant } from './components/AiAssistant'; // Added
 import { AdminPanel } from './components/AdminPanel';
 import { RequestApproval } from './components/RequestApproval';
 import { AdminPayrollManagement } from './components/AdminPayrollManagement';
-import { OTRequestModal } from './components/OTRequestModal';
+import { OTRequestModal, OTModalMode, OTSubmitPayload } from './components/OTRequestModal';
 import { LateExplanationModal } from './components/LateExplanationModal';
 import { EmployeeManagement } from './components/EmployeeManagement';
 import { AdminEmployeeDetail } from './components/AdminEmployeeDetail';
 import { SalaryView } from './components/SalaryView';
 import { BonusPenaltyModal } from './components/BonusPenaltyModal';
 import { LeaveRequestModal } from './components/LeaveRequestModal';
+import { SwapRequestModal, SwapSubmitPayload } from './components/SwapRequestModal';
 import { SalaryAdvanceModal } from './components/SalaryAdvanceModal'; // New Import
 import { CompanyCalendar } from './components/CompanyCalendar';
 import { HolidayAlert } from './components/HolidayAlert';
@@ -51,23 +53,31 @@ import { AuthScreen } from './components/AuthScreen';
 import { PushNotificationToggle } from './components/PushNotificationToggle';
 import { InstallPrompt } from './components/InstallPrompt';
 import { SalaryConfirmationModal } from './components/SalaryConfirmationModal';
-import { AttendanceLog, AttendanceType, Coordinates, OTRequest, LateRequest, SalaryAdvanceRequest, RequestStatus, UserProfile, BonusFine, LeaveRequest, LeaveType, LeaveDuration, OverrideLog, Holiday, SalaryChange } from './types';
+import { AttendanceLog, AttendanceType, Coordinates, OTRequest, LateRequest, SalaryAdvanceRequest, RequestStatus, UserProfile, BonusFine, LeaveRequest, LeaveType, LeaveDuration, OverrideLog, Holiday, SalaryChange, SwapRequest } from './types';
 
 import { COMPANY_SETTINGS, MOCK_USER, MOCK_EMPLOYEES, MOCK_BONUSES, MOCK_ADVANCES, MOCK_HOLIDAYS } from './constants';
 import { calculateDistance, getCurrentPosition, getPublicIP } from './utils/geo';
 import { generateAttendanceReport } from './services/geminiService';
 import { calculateMonthlySalary } from './utils/salaryCalculator';
-import { startOfMonth, eachDayOfInterval, endOfMonth, isFuture, isSameDay, differenceInDays, format, isSameMonth } from 'date-fns';
-import { checkAndIncrementLeaveBalance, getVirtualBirthdayBonus, calculateRemainingLeave, getPaidLeaveUsedThisMonth } from './utils/salaryCalculator';
+import { startOfMonth, eachDayOfInterval, endOfMonth, isFuture, isSameDay, differenceInDays, format, isSameMonth, subDays } from 'date-fns';
+import { getVirtualBirthdayBonus } from './utils/salaryCalculator';
+import { accruesAnnualLeave, countLeaveDays, getPaidLeaveUsedThisMonth, getRemainingLeave, findOverlappingLeave, LEAVE_TYPE_LABEL, getRequestStatusText, MONTHLY_PAID_LEAVE_QUOTA } from './utils/leaveTypes';
+import { validateOTRanges, toMinuteOfDay } from './utils/otRules';
+import { parseRequestDate } from './utils/dateInput';
+import { mapLeaveRow } from './utils/leaveQueries';
+import { mapSwapRow, toSwapRow, validateSwapRequest, describeSwap, describeSwapShort, findSwapBlockingLeave, makeRestDayPredicate, pairedSunday, SWAP_DEFAULT_REASON } from './utils/restDay';
+import { isResignedAndHidden, isWorkingEmployee } from './utils/employeeFilters';
 import { supabase } from './utils/supabaseClient';
 import { sendPushToUser, sendPushToManagers } from './utils/pushNotifications';
 
-// Helper: NV nghỉ việc → ẩn sau khi hết tháng nghỉ việc
-const isResignedAndHidden = (emp: UserProfile): boolean => {
-  if (!emp.resignationDate) return false;
-  const resignDate = new Date(emp.resignationDate);
-  const endOfResignMonth = endOfMonth(resignDate);
-  return new Date() > endOfResignMonth;
+// Helper: Lấy tên gọi (từ cuối) và so sánh theo bảng chữ cái tiếng Việt
+const getGivenName = (fullName: string): string => {
+  const parts = (fullName || '').trim().split(/\s+/);
+  return parts.length ? parts[parts.length - 1] : '';
+};
+const compareByGivenName = (a: UserProfile, b: UserProfile): number => {
+  const cmp = getGivenName(a.name).localeCompare(getGivenName(b.name), 'vi', { sensitivity: 'base' });
+  return cmp !== 0 ? cmp : (a.name || '').localeCompare(b.name || '', 'vi');
 };
 
 // Helper: Kiểm tra tháng đã chốt lương chưa
@@ -93,6 +103,7 @@ const App: React.FC = () => {
   const [lateRequests, setLateRequests] = useState<LateRequest[]>([]);
   const [advanceRequests, setAdvanceRequests] = useState<SalaryAdvanceRequest[]>(MOCK_ADVANCES);
   const [leaveRequests, setLeaveRequests] = useState<LeaveRequest[]>([]);
+  const [swapRequests, setSwapRequests] = useState<SwapRequest[]>([]); // Đơn đổi ngày nghỉ tuần
   const [overrides, setOverrides] = useState<OverrideLog[]>([]); // New State
   const [holidays, setHolidays] = useState<Holiday[]>(MOCK_HOLIDAYS); // New State
   const [salaryChanges, setSalaryChanges] = useState<SalaryChange[]>([]); // New State: Salary History
@@ -127,6 +138,11 @@ const App: React.FC = () => {
   // Modals State
   const [isOtModalOpen, setIsOtModalOpen] = useState(false);
   const [pendingOtType, setPendingOtType] = useState<AttendanceType | null>(null);
+  // Chế độ modal tăng ca. OFFICE giữ nguyên luồng cũ (chấm công trước);
+  // HOME/ADMIN đi đường khai theo khung giờ, KHÔNG qua guard GPS/IP.
+  const [otModalMode, setOtModalMode] = useState<OTModalMode>('OFFICE');
+  const [otRequestTargetUser, setOtRequestTargetUser] = useState<UserProfile | null>(null);
+  const [otDefaultDate, setOtDefaultDate] = useState<string | undefined>(undefined);
 
   const [isLateModalOpen, setIsLateModalOpen] = useState(false);
   const [pendingLateDate, setPendingLateDate] = useState<Date | null>(null);
@@ -134,6 +150,7 @@ const App: React.FC = () => {
 
   const [isGeneralBonusModalOpen, setIsGeneralBonusModalOpen] = useState(false);
   const [isLeaveModalOpen, setIsLeaveModalOpen] = useState(false);
+  const [isSwapModalOpen, setIsSwapModalOpen] = useState(false); // Đổi ngày nghỉ tuần
   const [isAdvanceModalOpen, setIsAdvanceModalOpen] = useState(false); // New State
   const [currentAdvanceLimit, setCurrentAdvanceLimit] = useState(0); // Store limit when opening prompt
 
@@ -141,6 +158,7 @@ const App: React.FC = () => {
   const [currentSalaryMonth, setCurrentSalaryMonth] = useState(new Date());
   const [requestTargetUser, setRequestTargetUser] = useState<UserProfile | null>(null); // State for Admin creating request for others
   const [leaveRequestTargetUser, setLeaveRequestTargetUser] = useState<UserProfile | null>(null); // NEW: Target for Leave Requests
+  const [swapRequestTargetUser, setSwapRequestTargetUser] = useState<UserProfile | null>(null); // Admin tạo hộ đơn đổi ngày nghỉ
 
   // Failure Modal State
   const [isFailureModalOpen, setIsFailureModalOpen] = useState(false);
@@ -206,10 +224,12 @@ const App: React.FC = () => {
           baseSalary: data.base_salary,
           allowance: data.allowance || 0,
           insuranceSalary: data.insurance_salary || 0,
-          leaveBalance: data.leave_balance,
           workDays: data.work_days || "1,2,3,4,5,6",
           contractType: data.contract_type || 'Hợp đồng chính thức',
           contractDate: data.contract_date,
+          officialContractDate: data.official_contract_date || null,
+          usedLeaveLegacy: data.used_leave_legacy || 0,
+          resignationDate: data.resignation_date || null,
           status: data.status // Don't override DB value
         };
         setCurrentUser(user);
@@ -240,9 +260,10 @@ const App: React.FC = () => {
       if (freshUser) {
         // Check simple integrity or specific fields
         const hasChanges =
-          freshUser.leaveBalance !== currentUser.leaveBalance ||
           freshUser.usedLeaveLegacy !== currentUser.usedLeaveLegacy ||
-          freshUser.contractDate !== currentUser.contractDate;
+          freshUser.contractDate !== currentUser.contractDate ||
+          freshUser.officialContractDate !== currentUser.officialContractDate ||
+          freshUser.resignationDate !== currentUser.resignationDate;
 
         if (hasChanges) {
           setCurrentUser(prev => ({ ...prev!, ...freshUser }));
@@ -251,14 +272,24 @@ const App: React.FC = () => {
     }
   }, [employees, currentUser?.id]);
 
+  // === Nhân viên đã sắp xếp theo bảng chữ cái (tên gọi, chuẩn VN) ===
+  const sortedEmployees = useMemo(() => [...employees].sort(compareByGivenName), [employees]);
+
   // === Nhân viên hiển thị (ẩn NV nghỉ việc đã hết tháng) ===
-  const visibleEmployees = useMemo(() => employees.filter(emp => !isResignedAndHidden(emp)), [employees]);
+  const visibleEmployees = useMemo(() => sortedEmployees.filter(emp => !isResignedAndHidden(emp)), [sortedEmployees]);
+
+  // === NV có thể chuyển đổi trong cửa sổ chi tiết (khớp tab "Danh sách nhân viên") ===
+  const switchableEmployees = useMemo(
+    () => sortedEmployees.filter(isWorkingEmployee),
+    [sortedEmployees]
+  );
 
   // === PERFORMANCE: Memoized filters for current user ===
   const myLogs = useMemo(() => logs.filter(l => l.userId === currentUser?.id), [logs, currentUser?.id]);
   const myOtRequests = useMemo(() => otRequests.filter(r => r.userId === currentUser?.id), [otRequests, currentUser?.id]);
   const myLateRequests = useMemo(() => lateRequests.filter(r => r.userId === currentUser?.id), [lateRequests, currentUser?.id]);
   const myLeaveRequests = useMemo(() => leaveRequests.filter(r => r.userId === currentUser?.id), [leaveRequests, currentUser?.id]);
+  const mySwapRequests = useMemo(() => swapRequests.filter(r => r.userId === currentUser?.id), [swapRequests, currentUser?.id]);
   const myAdvanceRequests = useMemo(() => advanceRequests.filter(r => r.userId === currentUser?.id), [advanceRequests, currentUser?.id]);
   const myOverrides = useMemo(() => overrides.filter(o => o.userId === currentUser?.id), [overrides, currentUser?.id]);
   const myBonuses = useMemo(() => bonuses.filter(b => b.userId === currentUser?.id), [bonuses, currentUser?.id]);
@@ -291,7 +322,9 @@ const App: React.FC = () => {
       target,
       targetOverrides,
       holidays,
-      salaryChanges
+      salaryChanges,
+      leaveRequests.filter(r => r.userId === target.id),
+      swapRequests.filter(r => r.userId === target.id)
     );
 
   }, [
@@ -304,9 +337,10 @@ const App: React.FC = () => {
     advanceRequests,
     bonuses,
     overrides,
-    overrides,
     holidays,
-    salaryChanges
+    salaryChanges,
+    leaveRequests,
+    swapRequests
   ]);
 
 
@@ -345,10 +379,10 @@ const App: React.FC = () => {
           baseSalary: e.base_salary,
           allowance: e.allowance || 0,
           insuranceSalary: e.insurance_salary || 0,
-          leaveBalance: e.leave_balance,
           workDays: e.work_days || "1,2,3,4,5,6",
           contractType: e.contract_type || 'Hợp đồng chính thức',
           contractDate: e.contract_date,
+          officialContractDate: e.official_contract_date || null,
 
           employeeCode: e.employee_code, // Map from DB
           status: e.status, // Fix: Map status from DB
@@ -433,10 +467,14 @@ const App: React.FC = () => {
         const ots = reqData.filter((r: any) => r.type === 'OT').map((r: any) => ({
           ...mapBaseRequest(r, empData),
           id: r.id,
-          date: new Date(r.date),
+          date: parseRequestDate(r.date),
           shift: r.shift,
           reason: r.reason,
-          status: r.status
+          status: r.status,
+          otStart: r.ot_start || null,
+          otEnd: r.ot_end || null,
+          otLocation: r.ot_location || 'OFFICE',
+          rejectionReason: r.rejection_reason || null
         }));
         setOtRequests(ots);
 
@@ -461,22 +499,49 @@ const App: React.FC = () => {
             date: parsedDate,
             reason: r.reason,
             status: r.status,
-            minutesLate: r.minutes_late
+            minutesLate: r.minutes_late,
+            rejectionReason: r.rejection_reason || null
           };
         });
         setLateRequests(lates);
 
-        const leaves = reqData.filter((r: any) => r.type === 'LEAVE').map((r: any) => ({
-          ...mapBaseRequest(r, empData),
-          id: r.id,
-          startDate: new Date(r.start_date),
-          endDate: new Date(r.end_date),
-          leaveType: r.leave_type,
-          duration: r.leave_duration,
-          reason: r.reason,
-          status: r.status
-        }));
-        setLeaveRequests(leaves);
+        const mapLeave = (r: any): LeaveRequest => mapLeaveRow(r, empData);
+
+        const leaves = reqData.filter((r: any) => r.type === 'LEAVE').map(mapLeave);
+
+        // Quỹ phép được tính lại từ đơn đã duyệt của CẢ NĂM, nhưng truy vấn ở trên chỉ
+        // lấy 3 tháng gần nhất → phải nạp thêm đơn nghỉ từ đầu năm, nếu không phép
+        // đã dùng đầu năm sẽ biến mất và số phép còn lại bị thổi phồng.
+        const yearStartISO = new Date(new Date().getFullYear(), 0, 1).toISOString();
+        const { data: yearLeaveData } = await supabase
+          .from('requests')
+          .select('*')
+          .eq('type', 'LEAVE')
+          .gte('start_date', yearStartISO);
+
+        const seenLeaveIds = new Set(leaves.map((l: LeaveRequest) => l.id));
+        const extraLeaves = (yearLeaveData || [])
+          .filter((r: any) => !seenLeaveIds.has(r.id))
+          .map(mapLeave);
+
+        setLeaveRequests([...leaves, ...extraLeaves]);
+
+        // Đơn đổi ngày nghỉ: nạp thêm cả năm theo cột date (Thứ 7 nghỉ bù) vì
+        // (1) predicate đếm ngày phép cần thấy đơn cũ, (2) đơn tạo sớm cho tuần
+        // sắp tới có created_at cũ hơn cửa sổ 3 tháng vẫn phải có mặt.
+        const mapSwap = (r: any): SwapRequest => mapSwapRow(r, empData);
+        const swaps = reqData.filter((r: any) => r.type === 'SWAP').map(mapSwap);
+        const yearStartDateStr = format(new Date(new Date().getFullYear(), 0, 1), 'yyyy-MM-dd');
+        const { data: yearSwapData } = await supabase
+          .from('requests')
+          .select('*')
+          .eq('type', 'SWAP')
+          .gte('date', yearStartDateStr);
+        const seenSwapIds = new Set(swaps.map((s: SwapRequest) => s.id));
+        const extraSwaps = (yearSwapData || [])
+          .filter((r: any) => !seenSwapIds.has(String(r.id)))
+          .map(mapSwap);
+        setSwapRequests([...swaps, ...extraSwaps]);
 
         const advances = reqData.filter((r: any) => r.type === 'ADVANCE').map((r: any) => ({
           ...mapBaseRequest(r, empData),
@@ -484,7 +549,8 @@ const App: React.FC = () => {
           date: new Date(r.created_at),
           amount: r.amount,
           reason: r.reason,
-          status: r.status
+          status: r.status,
+          rejectionReason: r.rejection_reason || null
         }));
         setAdvanceRequests(advances);
       }
@@ -571,7 +637,7 @@ const App: React.FC = () => {
     const startDateStr = format(start, 'yyyy-MM-dd');
     const endDateStr = format(end, 'yyyy-MM-dd');
 
-    const [logsRes, reqsRes, bonusRes, overrideRes] = await Promise.all([
+    const [logsRes, reqsRes, bonusRes, overrideRes, swapRes] = await Promise.all([
       supabase.from('attendance_logs').select('*')
         .gte('timestamp', startISO).lte('timestamp', endISO),
       supabase.from('requests').select('*')
@@ -580,6 +646,10 @@ const App: React.FC = () => {
         .gte('date', startDateStr).lte('date', endDateStr),
       supabase.from('attendance_overrides').select('*')
         .gte('date', startDateStr).lte('date', endDateStr),
+      // Đơn đổi ngày nghỉ lọc theo NGÀY chứ không theo created_at (đơn tạo trước
+      // cả tháng). Lấy từ ngày cuối tháng trước vì T7 cuối tháng ghép CN đầu tháng này.
+      supabase.from('requests').select('*').eq('type', 'SWAP')
+        .gte('date', format(subDays(start, 1), 'yyyy-MM-dd')).lte('date', endDateStr),
     ]);
 
     if (logsRes.data && logsRes.data.length > 0) {
@@ -601,19 +671,24 @@ const App: React.FC = () => {
         const user = empData.find(p => p.id === r.user_id);
         return { userId: r.user_id, userName: user?.name || 'Unknown', userAvatar: user?.avatar || '', userRole: user?.role || 'Employee', createdAt: r.created_at ? new Date(r.created_at) : undefined, processedAt: r.processed_at ? new Date(r.processed_at) : undefined };
       };
-      const newOts = reqsRes.data.filter((r: any) => r.type === 'OT').map((r: any) => ({ ...mapReq(r), id: r.id, date: new Date(r.date), shift: r.shift, reason: r.reason, status: r.status }));
+      const newOts = reqsRes.data.filter((r: any) => r.type === 'OT').map((r: any) => ({ ...mapReq(r), id: r.id, date: parseRequestDate(r.date), shift: r.shift, reason: r.reason, status: r.status, otStart: r.ot_start || null, otEnd: r.ot_end || null, otLocation: r.ot_location || 'OFFICE' }));
       const newLates = reqsRes.data.filter((r: any) => r.type === 'LATE').map((r: any) => {
         const dateStr = r.date;
         let parsedDate = dateStr.length === 10 ? new Date(dateStr + 'T00:00:00') : (() => { const d = new Date(dateStr); return new Date(d.getFullYear(), d.getMonth(), d.getDate()); })();
         return { ...mapReq(r), id: r.id, date: parsedDate, reason: r.reason, status: r.status, minutesLate: r.minutes_late };
       });
-      const newLeaves = reqsRes.data.filter((r: any) => r.type === 'LEAVE').map((r: any) => ({ ...mapReq(r), id: r.id, startDate: new Date(r.start_date), endDate: new Date(r.end_date), leaveType: r.leave_type, duration: r.leave_duration, reason: r.reason, status: r.status }));
+      const newLeaves = reqsRes.data.filter((r: any) => r.type === 'LEAVE').map((r: any) => mapLeaveRow(r, empData));
       const newAdvances = reqsRes.data.filter((r: any) => r.type === 'ADVANCE').map((r: any) => ({ ...mapReq(r), id: r.id, date: new Date(r.created_at), amount: r.amount, reason: r.reason, status: r.status }));
 
       if (newOts.length) setOtRequests(prev => { const ids = new Set(prev.map(r => r.id)); return [...prev, ...newOts.filter(r => !ids.has(r.id))]; });
       if (newLates.length) setLateRequests(prev => { const ids = new Set(prev.map(r => r.id)); return [...prev, ...newLates.filter(r => !ids.has(r.id))]; });
       if (newLeaves.length) setLeaveRequests(prev => { const ids = new Set(prev.map(r => r.id)); return [...prev, ...newLeaves.filter(r => !ids.has(r.id))]; });
       if (newAdvances.length) setAdvanceRequests(prev => { const ids = new Set(prev.map(r => r.id)); return [...prev, ...newAdvances.filter(r => !ids.has(r.id))]; });
+    }
+
+    if (swapRes.data && swapRes.data.length > 0) {
+      const newSwaps = swapRes.data.map((r: any) => mapSwapRow(r, employees));
+      setSwapRequests(prev => { const ids = new Set(prev.map(r => r.id)); return [...prev, ...newSwaps.filter(r => !ids.has(r.id))]; });
     }
 
     if (bonusRes.data && bonusRes.data.length > 0) {
@@ -640,22 +715,6 @@ const App: React.FC = () => {
       processedAt: req.processed_at ? new Date(req.processed_at) : undefined
     };
   };
-
-  // Check Monthly Leave Increment on Load
-  useEffect(() => {
-    // In a real app, this runs on backend. Here we simulate it on app load.
-    const updatedEmployees = employees.map(checkAndIncrementLeaveBalance);
-    // Check if any changes occurred to avoid infinite loop
-    const hasChanged = JSON.stringify(updatedEmployees) !== JSON.stringify(employees);
-    if (hasChanged) {
-      setEmployees(updatedEmployees);
-      // Also update current user if needed
-      if (currentUser) {
-        const updatedUser = updatedEmployees.find(e => e.id === currentUser.id);
-        if (updatedUser) setCurrentUser(updatedUser);
-      }
-    }
-  }, []);
 
   const fetchRealLocationData = async () => {
     if (isManualMode) return; // Don't fetch if in manual mode
@@ -785,6 +844,7 @@ const App: React.FC = () => {
           setLateRequests(prev => prev.filter(r => r.id !== oldRec.id));
           setLeaveRequests(prev => prev.filter(r => r.id !== oldRec.id));
           setAdvanceRequests(prev => prev.filter(r => r.id !== oldRec.id));
+          setSwapRequests(prev => prev.filter(r => r.id !== String(oldRec.id)));
           return;
         }
 
@@ -798,7 +858,7 @@ const App: React.FC = () => {
         };
 
         if (newRec.type === 'OT') {
-          const req = { ...baseReq, id: newRec.id, date: new Date(newRec.date), shift: newRec.shift, reason: newRec.reason } as OTRequest;
+          const req = { ...baseReq, id: newRec.id, date: parseRequestDate(newRec.date), shift: newRec.shift, reason: newRec.reason, otStart: newRec.ot_start || null, otEnd: newRec.ot_end || null, otLocation: newRec.ot_location || 'OFFICE' } as OTRequest;
           setOtRequests(prev => eventType === 'UPDATE' ? prev.map(r => r.id === req.id ? req : r) : [...prev, req]);
         } else if (newRec.type === 'LATE') {
           const req = { ...baseReq, id: newRec.id, date: new Date(newRec.date), minutesLate: newRec.minutes_late, reason: newRec.reason } as LateRequest;
@@ -809,6 +869,12 @@ const App: React.FC = () => {
         } else if (newRec.type === 'ADVANCE') {
           const req = { ...baseReq, id: newRec.id, date: new Date(newRec.created_at), amount: newRec.amount, reason: newRec.reason } as SalaryAdvanceRequest;
           setAdvanceRequests(prev => eventType === 'UPDATE' ? prev.map(r => r.id === req.id ? req : r) : [...prev, req]);
+        } else if (newRec.type === 'SWAP') {
+          const req = mapSwapRow(newRec, employees);
+          // Insert của chính mình đã được thêm qua .select() → khử trùng theo id
+          setSwapRequests(prev => eventType === 'UPDATE'
+            ? prev.map(r => r.id === req.id ? req : r)
+            : (prev.some(r => r.id === req.id) ? prev : [...prev, req]));
         }
 
         if (eventType === 'INSERT' && currentUser.role === 'Admin' && newRec.user_id !== currentUser.id) {
@@ -859,10 +925,12 @@ const App: React.FC = () => {
           baseSalary: newRec.base_salary,
           allowance: newRec.allowance || 0,
           insuranceSalary: newRec.insurance_salary || 0,
-          leaveBalance: newRec.leave_balance,
           workDays: newRec.work_days || "1,2,3,4,5,6",
           contractType: newRec.contract_type || 'Hợp đồng chính thức',
           contractDate: newRec.contract_date,
+          officialContractDate: newRec.official_contract_date || null,
+          usedLeaveLegacy: newRec.used_leave_legacy || 0,
+          resignationDate: newRec.resignation_date || null,
           employeeCode: newRec.employee_code,
           status: newRec.status // Important!
         };
@@ -1049,7 +1117,8 @@ const App: React.FC = () => {
         ot: otRequests,
         late: lateRequests,
         leave: leaveRequests,
-        advance: advanceRequests
+        advance: advanceRequests,
+        swap: swapRequests
       },
       bonuses,
       holidays,
@@ -1093,7 +1162,10 @@ const App: React.FC = () => {
         bonuses.filter(b => b.userId === userToCheck.id),
         userToCheck,
         overrides.filter(o => o.userId === userToCheck.id),
-        holidays
+        holidays,
+        salaryChanges,
+        leaveRequests.filter(r => r.userId === userToCheck.id),
+        swapRequests.filter(r => r.userId === userToCheck.id)
       );
       limit = Math.max(0, tempReport.netSalary);
     }
@@ -1104,19 +1176,12 @@ const App: React.FC = () => {
     setIsAdvanceModalOpen(true);
   };
 
-  // Helper Wrappers for specific components
-  const handleRequestAdvanceFromSalaryView = () => {
-    handleOpenAdvanceModal(null); // Current User
-  };
-
-  const handleRequestAdvanceFromAdmin = (type: string, target: UserProfile) => {
-    if (type === 'ADVANCE') {
-      handleOpenAdvanceModal(target);
-    } else if (type === 'LEAVE') {
-      setRequestTargetUser(target);
-      setIsLeaveModalOpen(true);
-    }
-  };
+  // Đã xoá handleRequestAdvanceFromSalaryView và handleRequestAdvanceFromAdmin:
+  // cả hai đều không được component nào gọi. Riêng nhánh 'LEAVE' của hàm thứ hai
+  // còn set nhầm setRequestTargetUser (state của đơn ứng lương) thay vì
+  // setLeaveRequestTargetUser — nếu đấu dây lại thì đơn sẽ tạo cho người đang
+  // đăng nhập và không được hưởng luật bỏ trần tháng của Admin.
+  // Đường Admin tạo đơn nghỉ đang chạy thật là handleAdminCreateRequest.
 
   const handleAttendanceClick = (type: AttendanceType) => {
     // Guard: Tháng đã chốt lương
@@ -1161,7 +1226,50 @@ const App: React.FC = () => {
     processAttendance(type);
   };
 
-  const handleSubmitOtRequest = async (reason: string) => {
+  /** Mở modal khai tăng ca theo khung giờ. KHÔNG đi qua handleAttendanceClick nên
+   *  không dính guard GPS/IP — đây chính là mục đích của tính năng. */
+  const handleOpenDeclaredOT = (mode: 'HOME' | 'ADMIN', target?: UserProfile, date?: Date) => {
+    setOtModalMode(mode);
+    setOtRequestTargetUser(mode === 'ADMIN' ? (target || null) : null);
+    setOtDefaultDate(date ? format(date, 'yyyy-MM-dd') : undefined);
+    setPendingOtType(null);
+    setIsOtModalOpen(true);
+  };
+
+  /** Nhân viên mà modal đang thao tác lên: Admin tạo hộ thì là người được chọn. */
+  const otSubjectUser = otRequestTargetUser || currentUser;
+
+  /** Khung giờ đã khai của nhân viên đó trong một ngày — để chặn chồng lấn.
+   *  Bỏ đơn đã từ chối vì đơn đó không tính công, không gây đếm trùng. */
+  const getExistingOtRanges = (dateStr: string) => {
+    if (!otSubjectUser) return [];
+    return otRequests
+      .filter(r => r.userId === otSubjectUser.id
+        && r.status !== 'REJECTED'
+        && !!r.otStart && !!r.otEnd
+        && format(r.date, 'yyyy-MM-dd') === dateStr)
+      .map(r => ({ start: r.otStart, end: r.otEnd }));
+  };
+
+  /** Giờ chấm công 'HH:mm' của nhân viên đó trong một ngày — để chặn đếm trùng. */
+  const getOtAttendanceTimes = (dateStr: string) => {
+    if (!otSubjectUser) return [];
+    return logs
+      .filter(l => l.userId === otSubjectUser.id && format(l.timestamp, 'yyyy-MM-dd') === dateStr)
+      .map(l => format(l.timestamp, 'HH:mm'));
+  };
+
+  const handleSubmitOtRequest = async (payload: OTSubmitPayload) => {
+    // ranges rỗng = đơn kiểu cũ tại công ty: vẫn phải chấm công trước.
+    if (payload.ranges.length === 0) {
+      await submitOfficeOtRequest(payload.reason);
+      return;
+    }
+    await submitDeclaredOtRequest(payload);
+  };
+
+  /** Luồng CŨ, không đổi một dòng logic nào: chấm công rồi mới tạo đơn. */
+  const submitOfficeOtRequest = async (reason: string) => {
     if (pendingOtType && currentUser) {
       // Guard: Tháng đã chốt lương
       if (isMonthLocked(new Date(), lockedMonths)) {
@@ -1222,6 +1330,94 @@ const App: React.FC = () => {
     }
   };
 
+  /** Luồng MỚI: khai theo khung giờ, không chấm công, không kiểm tra vị trí. */
+  const submitDeclaredOtRequest = async (payload: OTSubmitPayload) => {
+    const target = otRequestTargetUser || currentUser;
+    const isAdminAction = !!otRequestTargetUser;
+    if (!target) return;
+
+    // Kiểm theo NGÀY KHAI chứ không phải hôm nay: khai bù cho 30/09 vào ngày
+    // 01/10 sau khi đã chốt lương tháng 9 phải bị chặn.
+    const declaredDate = new Date(`${payload.date}T00:00:00`);
+    if (isMonthLocked(declaredDate, lockedMonths)) {
+      alert(LOCKED_MONTH_MSG);
+      return;
+    }
+
+    // Chạy lại toàn bộ ràng buộc ở phía cha — modal có thể bị bỏ qua, và dữ liệu
+    // trong state có thể đã đổi từ lúc mở modal tới lúc bấm gửi.
+    const validationError = validateOTRanges({
+      date: payload.date,
+      ranges: payload.ranges,
+      existingRanges: getExistingOtRanges(payload.date),
+      attendanceTimes: getOtAttendanceTimes(payload.date),
+      today: format(new Date(), 'yyyy-MM-dd'),
+      isAdmin: isAdminAction
+    });
+    if (validationError) {
+      alert(validationError);
+      return;
+    }
+
+    const status: RequestStatus = isAdminAction ? 'APPROVED' : 'PENDING';
+
+    // Mỗi khung giờ là MỘT dòng requests: duyệt lẻ được từng khung và giữ
+    // nguyên hình dạng bảng hiện có.
+    const rows = payload.ranges.map(r => ({
+      user_id: target.id,
+      type: 'OT',
+      date: payload.date,
+      shift: (toMinuteOfDay(r.start) ?? 0) < 12 * 60 ? 'MORNING' : 'AFTERNOON',
+      reason: payload.reason,
+      status,
+      ot_start: r.start,
+      ot_end: r.end,
+      ot_location: payload.location
+    }));
+
+    setIsOtModalOpen(false);
+    setOtRequestTargetUser(null);
+    setOtDefaultDate(undefined);
+    setOtModalMode('OFFICE');
+
+    const { data, error } = await supabase.from('requests').insert(rows).select();
+    if (error) {
+      console.error('Error inserting declared OT requests:', error);
+      alert('⚠️ Không lưu được đơn tăng ca.\n\nNếu lỗi nhắc tới cột ot_start / ot_end / ot_location thì cần chạy file add_ot_time_range.sql trên Supabase trước.');
+      return;
+    }
+    if (!data || data.length === 0) {
+      // RLS chặn im lặng: insert không báo lỗi nhưng không trả dòng nào.
+      alert('⚠️ Đơn không được lưu (quyền truy cập từ chối). Vui lòng báo Admin kiểm tra quyền trên bảng requests.');
+      return;
+    }
+
+    const created: OTRequest[] = data.map((row: any, i: number) => ({
+      id: row.id.toString(),
+      date: declaredDate,
+      shift: rows[i].shift as 'MORNING' | 'AFTERNOON',
+      reason: payload.reason,
+      status,
+      otStart: payload.ranges[i].start,
+      otEnd: payload.ranges[i].end,
+      otLocation: payload.location,
+      userId: target.id,
+      userName: target.name,
+      userAvatar: target.avatar,
+      userRole: target.role
+    }));
+    setOtRequests(prev => [...prev, ...created]);
+
+    const moTa = payload.ranges.map(r => `${r.start}–${r.end}`).join(', ');
+    if (isAdminAction) {
+      triggerNotification('Đã tạo đơn', `Đã tạo và duyệt đơn tăng ca ${moTa} cho ${target.name}.`);
+      sendPushToUser(target.id, '⏰ Đơn tăng ca đã được tạo', `Admin đã tạo và duyệt đơn tăng ca ${moTa} ngày ${format(declaredDate, 'dd/MM')} cho bạn.`);
+    } else {
+      triggerNotification('Đã gửi đơn', `Đã gửi đơn tăng ca ${moTa}.`);
+      sendPushToManagers('⏰ Đơn tăng ca mới', `${target.name} đã gửi đơn tăng ca ${moTa} ngày ${format(declaredDate, 'dd/MM')}.`);
+    }
+  };
+
   const handleExplainLate = (date: Date, minutes: number) => {
     setPendingLateDate(date);
     setPendingLateMinutes(minutes);
@@ -1266,13 +1462,18 @@ const App: React.FC = () => {
     }
   };
 
-  const handleAdminCreateRequest = (type: 'LEAVE' | 'ADVANCE', target: UserProfile) => {
+  const handleAdminCreateRequest = (type: 'LEAVE' | 'ADVANCE' | 'OT' | 'SWAP', target: UserProfile) => {
     if (type === 'LEAVE') {
       setLeaveRequestTargetUser(target);
       setIsLeaveModalOpen(true);
     } else if (type === 'ADVANCE') {
       setRequestTargetUser(target);
       setIsAdvanceModalOpen(true);
+    } else if (type === 'OT') {
+      handleOpenDeclaredOT('ADMIN', target);
+    } else if (type === 'SWAP') {
+      setSwapRequestTargetUser(target);
+      setIsSwapModalOpen(true);
     }
   };
 
@@ -1306,7 +1507,10 @@ const App: React.FC = () => {
           bonuses.filter(b => b.userId === target.id),
           target,
           overrides.filter(o => o.userId === target.id),
-          holidays
+          holidays,
+          salaryChanges,
+          leaveRequests.filter(r => r.userId === target.id),
+          swapRequests.filter(r => r.userId === target.id)
         );
         netSalary = tempSalary.netSalary;
       }
@@ -1376,23 +1580,74 @@ const App: React.FC = () => {
 
       const status = isAdminAction ? 'APPROVED' : 'PENDING';
 
-      // NEW: Check monthly quota for PAID leave (1 day per month policy)
-      let finalLeaveType = data.type;
-      const paidUsedThisMonth = getPaidLeaveUsedThisMonth(target.id, leaveRequests, new Date(data.startDate));
+      // Ngày nghỉ tuần của NV này (CN, hoặc T7 đã đổi) — dùng chung cho mọi phép
+      // đếm ngày phép bên dưới để khớp với calculator.
+      const restDayOf = makeRestDayPredicate(swapRequests.filter(s => s.userId === target.id), holidays);
 
-      // Calculate requested days
-      const dayDiff = differenceInDays(new Date(data.endDate), new Date(data.startDate)) + 1;
-      const requestedDays = data.startDate === data.endDate && data.duration !== 'FULL' ? 0.5 : dayDiff;
+      // Guard: chồng ngày với đơn nghỉ đã có. Chặn CẢ Admin — đây là trùng dữ
+      // liệu, không phải vấn đề chính sách: một ngày chỉ nghỉ được một lần.
+      // Muốn sửa một kỳ nghỉ thì huỷ đơn cũ rồi tạo lại.
+      const clash = findOverlappingLeave(
+        target.id,
+        { startDate: new Date(data.startDate), endDate: new Date(data.endDate), duration: data.duration },
+        leaveRequests,
+        { holidays, isRestDay: restDayOf }
+      );
+      if (clash) {
+        const khoang = format(new Date(clash.startDate), 'dd/MM/yyyy') === format(new Date(clash.endDate), 'dd/MM/yyyy')
+          ? format(new Date(clash.startDate), 'dd/MM/yyyy')
+          : `${format(new Date(clash.startDate), 'dd/MM/yyyy')} – ${format(new Date(clash.endDate), 'dd/MM/yyyy')}`;
+        alert(`🚫 KHÔNG THỂ GỬI ĐƠN!\n\n${target.name} đã có đơn nghỉ trùng ngày:\n• ${LEAVE_TYPE_LABEL[clash.leaveType]} — ${khoang} (${getRequestStatusText(clash.status)})\n\nMột ngày chỉ nghỉ được một lần. Nếu đơn cũ nhập sai, hãy huỷ đơn đó trong mục Duyệt Đơn rồi tạo lại.`);
+        return;
+      }
 
-      // BLOCK if PAID leave quota exceeded
+      // Guard: đè lên Thứ 7 đã đổi thành ngày nghỉ bù. Chặn cả Admin — ngày đó
+      // đã là ngày nghỉ tuần, không có gì để xin nghỉ; muốn đổi thì huỷ đơn đổi trước.
+      const swapClash = findSwapBlockingLeave(
+        target.id,
+        { startDate: new Date(data.startDate), endDate: new Date(data.endDate) },
+        swapRequests
+      );
+      if (swapClash) {
+        alert(`🚫 KHÔNG THỂ GỬI ĐƠN!\n\n${target.name} đã có đơn đổi ngày nghỉ (${getRequestStatusText(swapClash.status)}):\n• ${describeSwap(swapClash)}\n\nNgày ${format(swapClash.restDate, 'dd/MM')} đã là ngày nghỉ bù nên không cần xin nghỉ phép — chọn ngày khác, hoặc huỷ đơn đổi ngày nghỉ trước.`);
+        return;
+      }
+
+      const finalLeaveType = data.type;
+      const paidUsedThisMonth = getPaidLeaveUsedThisMonth(target.id, leaveRequests, new Date(data.startDate), holidays, restDayOf);
+
+      // Số ngày thực bị trừ (bỏ ngày nghỉ tuần và ngày lễ)
+      const requestedDays = countLeaveDays({
+        startDate: new Date(data.startDate),
+        endDate: new Date(data.endDate),
+        duration: data.duration
+      }, holidays, restDayOf);
+
+      // Chưa ký HĐ chính thức thì không có phép năm. Chặn trước 2 guard bên dưới
+      // để thông báo nói đúng nguyên nhân, thay vì "quỹ chỉ còn 0 ngày".
+      if (data.type === 'PAID' && !accruesAnnualLeave(target)) {
+        alert(`🚫 KHÔNG THỂ GỬI ĐƠN!\n\n${target.name} đang là "${target.contractType}" nên chưa có phép năm.\nChỉ nhân viên đã ký hợp đồng chính thức mới được nghỉ phép năm.\n\nVui lòng chọn "Không lương" nếu vẫn muốn xin nghỉ.`);
+        return;
+      }
+
       if (data.type === 'PAID') {
-        const remainingQuota = Math.max(0, 1 - paidUsedThisMonth);
+        // Trần 2 ngày/tháng chỉ áp cho nhân viên tự xin nghỉ. Admin tạo đơn hộ
+        // thì đã là người quyết định, chỉ còn bị giới hạn bởi quỹ phép năm.
+        if (!isAdminAction) {
+          const remainingQuota = Math.max(0, MONTHLY_PAID_LEAVE_QUOTA - paidUsedThisMonth);
 
-        if (remainingQuota <= 0 || requestedDays > remainingQuota) {
-          alert(`🚫 KHÔNG THỂ GỬI ĐƠN!\n\nBạn đã sử dụng hết ${paidUsedThisMonth}/1 ngày phép có lương tháng này.\nMỗi tháng chỉ được nghỉ 1 ngày phép có lương, không cộng dồn.\n\nVui lòng chọn "Không lương" nếu vẫn muốn xin nghỉ.`);
+          if (remainingQuota <= 0 || requestedDays > remainingQuota) {
+            alert(`🚫 KHÔNG THỂ GỬI ĐƠN!\n\nĐã dùng ${paidUsedThisMonth}/${MONTHLY_PAID_LEAVE_QUOTA} ngày phép năm trong tháng này.\nMỗi tháng chỉ được nghỉ tối đa ${MONTHLY_PAID_LEAVE_QUOTA} ngày phép năm.\n\nVui lòng chọn "Không lương" nếu vẫn muốn xin nghỉ.`);
+            return;
+          }
+        }
+
+        // Quỹ năm chặn cứng với mọi người, kể cả Admin
+        const remainingLeave = getRemainingLeave(target, leaveRequests, { holidays, isRestDay: restDayOf });
+        if (requestedDays > remainingLeave) {
+          alert(`🚫 KHÔNG THỂ GỬI ĐƠN!\n\nQuỹ phép năm chỉ còn ${remainingLeave} ngày, đơn này cần ${requestedDays} ngày.\n\nVui lòng chọn "Không lương" nếu vẫn muốn xin nghỉ.`);
           return;
         }
-        // else: quota is sufficient, keep as PAID
       }
 
       const payload = {
@@ -1570,6 +1825,78 @@ const App: React.FC = () => {
     await supabase.from('bonuses').delete().eq('id', id);
   };
 
+  /**
+   * Xoá hẳn một đơn từ. Dùng khi đơn bị nhập trùng hoặc nhập nhầm — khác với
+   * "Từ chối" (đơn có thật nhưng không duyệt) và "Hoàn duyệt" (đưa về chờ duyệt).
+   * Chỉ Admin. Không hoàn tác được nên phải hỏi xác nhận.
+   */
+  const handleDeleteRequest = async (id: string, type: 'LEAVE' | 'OT' | 'LATE' | 'ADVANCE' | 'SWAP') => {
+    if (currentUser?.role !== 'Admin') {
+      alert('Chỉ Admin mới được xoá đơn.');
+      return;
+    }
+
+    const nguon: Record<string, any[]> = {
+      LEAVE: leaveRequests, OT: otRequests, LATE: lateRequests, ADVANCE: advanceRequests, SWAP: swapRequests
+    };
+    const req: any = nguon[type].find(r => r.id === id);
+    if (!req) return;
+
+    const ngayDon: Date = type === 'LEAVE' ? new Date(req.startDate)
+      : type === 'SWAP' ? new Date(req.restDate)
+        : new Date(req.date);
+    if (isMonthLocked(ngayDon, lockedMonths)) {
+      alert(LOCKED_MONTH_MSG);
+      return;
+    }
+    // Đơn đổi ngày nghỉ chạm cả tháng của Chủ Nhật làm bù
+    if (type === 'SWAP' && isMonthLocked(new Date(req.workDate), lockedMonths)) {
+      alert(LOCKED_MONTH_MSG);
+      return;
+    }
+
+    const nhan: Record<string, string> = {
+      LEAVE: 'đơn nghỉ phép', OT: 'đơn tăng ca', LATE: 'đơn giải trình đi trễ', ADVANCE: 'đơn ứng lương', SWAP: 'đơn đổi ngày nghỉ'
+    };
+    const khoang = type === 'SWAP'
+      ? describeSwapShort(req)
+      : type === 'LEAVE' && format(new Date(req.startDate), 'yyyy-MM-dd') !== format(new Date(req.endDate), 'yyyy-MM-dd')
+        ? `${format(new Date(req.startDate), 'dd/MM/yyyy')} – ${format(new Date(req.endDate), 'dd/MM/yyyy')}`
+        : format(ngayDon, 'dd/MM/yyyy');
+
+    if (!window.confirm(
+      `XOÁ VĨNH VIỄN ${nhan[type].toUpperCase()}?\n\n` +
+      `Nhân viên: ${req.userName}\nNgày: ${khoang}\nLý do: ${req.reason || '—'}\n\n` +
+      `Đơn sẽ bị xoá khỏi cơ sở dữ liệu và KHÔNG khôi phục được.\n` +
+      `Nếu chỉ muốn không tính công thì dùng "Từ chối" thay vì xoá.`
+    )) return;
+
+    // Gỡ khỏi màn hình trước cho mượt, hỏng thì trả lại.
+    const setter: Record<string, React.Dispatch<React.SetStateAction<any[]>>> = {
+      LEAVE: setLeaveRequests as any, OT: setOtRequests as any,
+      LATE: setLateRequests as any, ADVANCE: setAdvanceRequests as any,
+      SWAP: setSwapRequests as any
+    };
+    setter[type](prev => prev.filter((r: any) => r.id !== id));
+
+    const { data, error } = await supabase.from('requests').delete().eq('id', id).select();
+
+    if (error) {
+      setter[type](prev => [...prev, req]);
+      console.error('Lỗi xoá đơn:', error);
+      alert(`⚠️ Không xoá được đơn.\n\n${error.message}`);
+      return;
+    }
+    // RLS chặn im lặng: xoá không báo lỗi nhưng cũng không xoá dòng nào.
+    if (!data || data.length === 0) {
+      setter[type](prev => [...prev, req]);
+      alert('⚠️ ĐƠN KHÔNG BỊ XOÁ.\n\nCơ sở dữ liệu từ chối quyền xoá (RLS).\nCần chạy file add_delete_request_policy.sql trên Supabase → SQL Editor, rồi thử lại.');
+      return;
+    }
+
+    triggerNotification('Đã xoá đơn', `Đã xoá ${nhan[type]} của ${req.userName} ngày ${khoang}.`);
+  };
+
   const handleDeleteBonusBatch = async (ids: string[]) => {
     // Guard: Tháng đã chốt lương
     const lockedBonus = bonuses.find(b => ids.includes(b.id) && isMonthLocked(b.date, lockedMonths));
@@ -1655,33 +1982,12 @@ const App: React.FC = () => {
   };
 
   const handleImportBonusesGeneral = async () => {
-    // Simulate bulk import for multiple users
-    const newBonuses: BonusFine[] = [];
-    employees.forEach(emp => {
-      if (Math.random() > 0.7) { // 30% chance per employee
-        newBonuses.push({
-          id: Date.now().toString() + Math.random(),
-          userId: emp.id,
-          date: new Date(),
-          amount: 500000,
-          type: 'BONUS',
-          reason: 'Thưởng tháng (File Excel)'
-        });
-      }
-    });
-    const payload = newBonuses.map(b => ({
-      user_id: b.userId, // random ID might fail if not in auth/profiles? 
-      // Wait, MOCK_EMPLOYEES might have IDs not in DB?
-      // If these are real employees fetched from DB, they have real IDs.
-      date: b.date.toISOString(),
-      amount: b.amount,
-      type: b.type,
-      reason: b.reason
-    }));
-
-    setBonuses(prev => [...prev, ...newBonuses]);
-    await supabase.from('bonuses').insert(payload);
-    alert(`Đã nhập thành công ${newBonuses.length} mục từ Excel và lưu vào Database.`);
+    // ĐÃ VÔ HIỆU HOÁ. Bản cũ KHÔNG hề đọc file người dùng chọn — nó dùng
+    // Math.random() > 0.7 để ghi thưởng 500.000đ cho ~30% nhân viên vào bảng
+    // `bonuses`. Đó là code demo còn sót nhưng ghi tiền thật.
+    // Muốn dùng lại thì phải đọc file Excel thật bằng thư viện `xlsx`
+    // (đã có sẵn, xem cách dùng ở handleImportEmployees).
+    alert('⚠️ Tính năng nhập thưởng từ Excel chưa được hỗ trợ.\n\nVui lòng dùng "Thưởng hàng loạt" trong màn Bảng Lương để chọn nhân viên và nhập số tiền.');
     setIsGeneralBonusModalOpen(false);
   };
 
@@ -1732,7 +2038,7 @@ const App: React.FC = () => {
     }
   };
 
-  const handleUpdateOtStatus = async (id: string, status: RequestStatus) => {
+  const handleUpdateOtStatus = async (id: string, status: RequestStatus, reason?: string) => {
     // Guard: Tháng đã chốt lương
     const otReq = otRequests.find(r => r.id === id);
     if (otReq && isMonthLocked(otReq.date, lockedMonths)) {
@@ -1745,15 +2051,16 @@ const App: React.FC = () => {
       req.id === id ? { ...req, status } : req
     ));
     // Persist
-    await supabase.from('requests').update({ status }).eq('id', id);
+    await supabase.from('requests').update({ status, rejection_reason: reason || null }).eq('id', id);
     // Push notification
     if (otReq) {
       const label = status === 'APPROVED' ? '✅ Đã duyệt' : '❌ Bị từ chối';
-      sendPushToUser(otReq.userId, `${label} đơn tăng ca`, `Đơn tăng ca của bạn đã được ${status === 'APPROVED' ? 'duyệt' : 'từ chối'}.`);
+      const body = status === 'REJECTED' && reason ? `Lý do: ${reason}` : `Đơn tăng ca của bạn đã được ${status === 'APPROVED' ? 'duyệt' : 'từ chối'}.`;
+      sendPushToUser(otReq.userId, `${label} đơn tăng ca`, body);
     }
   };
 
-  const handleUpdateLateStatus = async (id: string, status: RequestStatus) => {
+  const handleUpdateLateStatus = async (id: string, status: RequestStatus, reason?: string) => {
     // Guard: Tháng đã chốt lương
     const lateReq = lateRequests.find(r => r.id === id);
     if (lateReq && isMonthLocked(lateReq.date, lockedMonths)) {
@@ -1766,15 +2073,16 @@ const App: React.FC = () => {
       req.id === id ? { ...req, status } : req
     ));
     // Persist
-    await supabase.from('requests').update({ status }).eq('id', id);
+    await supabase.from('requests').update({ status, rejection_reason: reason || null }).eq('id', id);
     // Push notification
     if (lateReq) {
       const label = status === 'APPROVED' ? '✅ Đã duyệt' : '❌ Bị từ chối';
-      sendPushToUser(lateReq.userId, `${label} giải trình đi trễ`, `Giải trình đi trễ của bạn đã được ${status === 'APPROVED' ? 'chấp nhận' : 'từ chối'}.`);
+      const body = status === 'REJECTED' && reason ? `Lý do: ${reason}` : `Giải trình đi trễ của bạn đã được ${status === 'APPROVED' ? 'chấp nhận' : 'từ chối'}.`;
+      sendPushToUser(lateReq.userId, `${label} giải trình đi trễ`, body);
     }
   };
 
-  const handleUpdateAdvanceStatus = async (id: string, status: RequestStatus) => {
+  const handleUpdateAdvanceStatus = async (id: string, status: RequestStatus, reason?: string) => {
     // Guard: Tháng đã chốt lương
     const advReq = advanceRequests.find(r => r.id === id);
     if (advReq && isMonthLocked(advReq.date, lockedMonths)) {
@@ -1787,15 +2095,16 @@ const App: React.FC = () => {
       req.id === id ? { ...req, status } : req
     ));
     // Persist
-    await supabase.from('requests').update({ status }).eq('id', id);
+    await supabase.from('requests').update({ status, rejection_reason: reason || null }).eq('id', id);
     // Push notification
     if (advReq) {
       const label = status === 'APPROVED' ? '✅ Đã duyệt' : '❌ Bị từ chối';
-      sendPushToUser(advReq.userId, `${label} đơn ứng lương`, `Đơn ứng lương của bạn đã được ${status === 'APPROVED' ? 'duyệt' : 'từ chối'}.`);
+      const body = status === 'REJECTED' && reason ? `Lý do: ${reason}` : `Đơn ứng lương của bạn đã được ${status === 'APPROVED' ? 'duyệt' : 'từ chối'}.`;
+      sendPushToUser(advReq.userId, `${label} đơn ứng lương`, body);
     }
   };
 
-  const handleUpdateLeaveStatus = async (id: string, status: RequestStatus) => {
+  const handleUpdateLeaveStatus = async (id: string, status: RequestStatus, reason?: string) => {
     const request = leaveRequests.find(r => r.id === id);
     if (!request) return;
 
@@ -1807,64 +2116,172 @@ const App: React.FC = () => {
 
     const oldStatus = request.status;
 
+    // Cảnh báo nếu duyệt đơn này sẽ vượt quỹ/trần tháng. Nhiều đơn PENDING cùng lúc
+    // đều hợp lệ lúc gửi nhưng tổng lại có thể vượt → cảnh báo, không chặn cứng.
+    if (status === 'APPROVED' && oldStatus !== 'APPROVED' && request.leaveType === 'PAID') {
+      const emp = employees.find(e => e.id === request.userId);
+      const restDayOf = makeRestDayPredicate(swapRequests.filter(s => s.userId === request.userId), holidays);
+      const days = countLeaveDays(request, holidays, restDayOf);
+      const approvedOnly = leaveRequests.filter(r => r.id !== id && r.status === 'APPROVED');
+      const remaining = emp ? getRemainingLeave(emp, approvedOnly, { holidays, isRestDay: restDayOf }) : 0;
+      const usedThisMonth = getPaidLeaveUsedThisMonth(
+        request.userId,
+        approvedOnly,
+        new Date(request.startDate),
+        holidays,
+        restDayOf
+      );
+
+      const warnings: string[] = [];
+      if (days > remaining) warnings.push(`- Quỹ phép năm chỉ còn ${remaining} ngày, đơn này ${days} ngày.`);
+      if (usedThisMonth + days > MONTHLY_PAID_LEAVE_QUOTA) {
+        warnings.push(`- Tháng này đã dùng ${usedThisMonth}/${MONTHLY_PAID_LEAVE_QUOTA} ngày, duyệt thêm sẽ thành ${usedThisMonth + days} ngày.`);
+      }
+
+      if (warnings.length > 0) {
+        const ok = window.confirm(`⚠️ DUYỆT ĐƠN NÀY SẼ VƯỢT ĐỊNH MỨC!\n\n${warnings.join('\n')}\n\nVẫn duyệt?`);
+        if (!ok) return;
+      }
+    }
+
     // 1. Optimistic Update Request State
     setLeaveRequests(prev => prev.map(req =>
       req.id === id ? { ...req, status } : req
     ));
 
     // 2. Persist Request Status
-    await supabase.from('requests').update({ status }).eq('id', id);
+    await supabase.from('requests').update({ status, rejection_reason: reason || null }).eq('id', id);
 
     // Push notification to employee
     const label = status === 'APPROVED' ? '✅ Đã duyệt' : '❌ Bị từ chối';
-    sendPushToUser(request.userId, `${label} đơn nghỉ phép`, `Đơn nghỉ phép của bạn đã được ${status === 'APPROVED' ? 'duyệt' : 'từ chối'}.`);
+    const body = status === 'REJECTED' && reason ? `Lý do: ${reason}` : `Đơn nghỉ phép của bạn đã được ${status === 'APPROVED' ? 'duyệt' : 'từ chối'}.`;
+    sendPushToUser(request.userId, `${label} đơn nghỉ phép`, body);
 
-    // 3. Handle Balance Logic (Only if PAID leave)
-    if (request.leaveType === 'PAID') {
-      // Calculate number of days
-      const dayDiff = differenceInDays(new Date(request.endDate), new Date(request.startDate)) + 1;
-      let daysToDeduct = dayDiff;
-      if (dayDiff === 1 && request.duration !== 'FULL') {
-        daysToDeduct = 0.5;
+    // Không còn bước trừ số dư: phép còn lại được tính lại từ chính danh sách đơn
+    // đã duyệt (getRemainingLeave), nên đơn Admin tạo sẵn APPROVED cũng tự trừ đúng.
+  };
+
+  // === ĐỔI NGÀY NGHỈ TUẦN (nghỉ Thứ 7, làm bù Chủ Nhật) ===
+  const handleSubmitSwapRequest = async (payload: SwapSubmitPayload) => {
+    const target = swapRequestTargetUser || currentUser;
+    const isAdminAction = !!swapRequestTargetUser;
+    if (!target) return;
+
+    const restDate = new Date(`${payload.restDate}T00:00:00`);
+    const workDate = pairedSunday(restDate);
+
+    // Đơn chạm cả hai tháng khi Thứ 7 là ngày cuối tháng → kiểm tra cả hai
+    if (isMonthLocked(restDate, lockedMonths) || isMonthLocked(workDate, lockedMonths)) {
+      alert(LOCKED_MONTH_MSG);
+      return;
+    }
+
+    // Chạy lại toàn bộ ràng buộc ở phía cha — modal có thể bị bỏ qua, và dữ liệu
+    // trong state có thể đã đổi từ lúc mở modal tới lúc bấm gửi.
+    const validationError = validateSwapRequest({
+      userId: target.id,
+      restDate: payload.restDate,
+      today: format(new Date(), 'yyyy-MM-dd'),
+      isAdmin: isAdminAction,
+      workDays: target.workDays,
+      holidays,
+      existingSwaps: swapRequests,
+      leaveRequests
+    });
+    if (validationError) {
+      alert(validationError);
+      return;
+    }
+
+    const status: RequestStatus = isAdminAction ? 'APPROVED' : 'PENDING';
+    // Không có ô lý do trên form: đổi ngày nghỉ là do công ty xếp lịch
+    const row = toSwapRow(target.id, restDate, SWAP_DEFAULT_REASON, status);
+
+    setIsSwapModalOpen(false);
+    setSwapRequestTargetUser(null);
+
+    // Không optimistic: insert rồi lấy dòng thật về, tránh hiện hai đơn khi
+    // realtime báo về cùng dòng vừa tạo.
+    const { data, error } = await supabase.from('requests').insert(row).select();
+    if (error) {
+      console.error('Error inserting swap request:', error);
+      const isDup = (error as any).code === '23505';
+      alert(isDup
+        ? '⚠️ Tuần này đã có đơn đổi ngày nghỉ còn hiệu lực (đã duyệt hoặc chờ duyệt). Mỗi tuần chỉ đổi được một lần.'
+        : '⚠️ Không lưu được đơn đổi ngày nghỉ.\n\nNếu lỗi nhắc tới cột swap_work_date hoặc ràng buộc type thì cần chạy file add_swap_request_type.sql trên Supabase trước.');
+      return;
+    }
+    if (!data || data.length === 0) {
+      // RLS chặn im lặng: insert không báo lỗi nhưng không trả dòng nào.
+      alert('⚠️ Đơn không được lưu (quyền truy cập từ chối). Vui lòng báo Admin kiểm tra quyền trên bảng requests, hoặc chạy add_swap_request_type.sql.');
+      return;
+    }
+
+    const created: SwapRequest[] = data.map((r: any) => mapSwapRow(r, employees));
+    setSwapRequests(prev => {
+      const ids = new Set(prev.map(s => s.id));
+      return [...prev, ...created.filter(s => !ids.has(s.id))];
+    });
+
+    const moTa = describeSwap(created[0]);
+    if (isAdminAction) {
+      triggerNotification('Đã tạo đơn đổi ngày nghỉ', `Đã tạo và duyệt cho ${target.name}: ${moTa}.`);
+      sendPushToUser(target.id, '🔁 Đơn đổi ngày nghỉ', `Admin đã tạo và duyệt đơn đổi ngày nghỉ cho bạn: ${moTa}.`);
+    } else {
+      triggerNotification('Đã gửi đơn', `Đã gửi đơn đổi ngày nghỉ: ${moTa}.`);
+      sendPushToManagers('🔁 Đơn đổi ngày nghỉ mới', `${target.name} xin ${moTa.charAt(0).toLowerCase()}${moTa.slice(1)}.`);
+    }
+  };
+
+  const handleUpdateSwapStatus = async (id: string, status: RequestStatus, reason?: string) => {
+    const req = swapRequests.find(r => r.id === id);
+    if (!req) return;
+
+    // Guard: tháng đã chốt lương — kiểm tra cả tháng của T7 lẫn tháng của CN
+    if (isMonthLocked(req.restDate, lockedMonths) || isMonthLocked(req.workDate, lockedMonths)) {
+      alert(LOCKED_MONTH_MSG);
+      return;
+    }
+
+    // Duyệt thì kiểm tra lại toàn bộ luật: ngày lễ mới thêm hay đơn nghỉ mới duyệt
+    // trong lúc đơn này chờ đều có thể làm nó không còn hợp lệ.
+    if (status === 'APPROVED' && req.status !== 'APPROVED') {
+      const err = validateSwapRequest({
+        userId: req.userId,
+        restDate: format(req.restDate, 'yyyy-MM-dd'),
+        today: format(new Date(), 'yyyy-MM-dd'),
+        isAdmin: true,
+        workDays: employees.find(e => e.id === req.userId)?.workDays,
+        holidays,
+        existingSwaps: swapRequests,
+        leaveRequests,
+        excludeId: id
+      });
+      if (err) {
+        alert(`🚫 KHÔNG THỂ DUYỆT ĐƠN NÀY!\n\n${err}`);
+        return;
       }
+    }
 
-      let newBalance: number | undefined;
-      const affectedUserId = request.userId;
-      const empProfile = employees.find(e => e.id === affectedUserId);
+    const oldStatus = req.status;
+    const oldReason = req.rejectionReason ?? null;
+    setSwapRequests(prev => prev.map(r => r.id === id ? { ...r, status, rejectionReason: reason || null } : r));
 
-      // If approving
-      if (status === 'APPROVED' && oldStatus !== 'APPROVED') {
-        if (empProfile) {
-          newBalance = (empProfile.leaveBalance || 0) - daysToDeduct;
-        }
-      }
-      // If reverting (Approval -> Pending/Rejected)
-      else if (oldStatus === 'APPROVED' && status !== 'APPROVED') {
-        if (empProfile) {
-          newBalance = (empProfile.leaveBalance || 0) + daysToDeduct;
-        }
-      }
+    const { error } = await supabase.from('requests').update({ status, rejection_reason: reason || null }).eq('id', id);
+    if (error) {
+      setSwapRequests(prev => prev.map(r => r.id === id ? { ...r, status: oldStatus, rejectionReason: oldReason } : r));
+      alert((error as any).code === '23505'
+        ? '⚠️ Không đổi được trạng thái: tuần này đã có đơn đổi ngày nghỉ khác còn hiệu lực.'
+        : `⚠️ Không cập nhật được đơn.\n\n${error.message}`);
+      return;
+    }
 
-      // Perform Update if Balance Changed
-      if (newBalance !== undefined && empProfile) {
-        // Optimistic Update Profile
-        const updatedEmployees = employees.map(emp => {
-          if (emp.id === affectedUserId) {
-            return { ...emp, leaveBalance: newBalance };
-          }
-          return emp;
-        });
-        setEmployees(updatedEmployees);
-
-        // Sync current user if needed
-        if (currentUser && currentUser.id === affectedUserId) {
-          const me = updatedEmployees.find(e => e.id === currentUser.id);
-          if (me) setCurrentUser(me);
-        }
-
-        // Persist Profile Balance
-        await supabase.from('profiles').update({ leave_balance: newBalance }).eq('id', affectedUserId);
-      }
+    if (status !== 'PENDING') {
+      const label = status === 'APPROVED' ? '✅ Đã duyệt' : '❌ Bị từ chối';
+      const body = status === 'REJECTED' && reason
+        ? `Lý do: ${reason}`
+        : `Đơn đổi ngày nghỉ (${describeSwapShort(req)}) của bạn đã được ${status === 'APPROVED' ? 'duyệt' : 'từ chối'}.`;
+      sendPushToUser(req.userId, `${label} đơn đổi ngày nghỉ`, body);
     }
   };
 
@@ -1883,13 +2300,17 @@ const App: React.FC = () => {
         base_salary: emp.baseSalary,
         allowance: emp.allowance,
         work_days: emp.workDays,
-        leave_balance: emp.leaveBalance,
         insurance_salary: emp.insuranceSalary,
         contract_type: emp.contractType,
         contract_date: emp.contractDate,
+        official_contract_date: emp.officialContractDate || null,
         employee_code: emp.employeeCode,
         status: emp.status,
-        date_of_birth: emp.dateOfBirth
+        date_of_birth: emp.dateOfBirth,
+        // Hai trường này trước đây chỉ có ở payload UPDATE, nên NV tạo mới bị
+        // mất dữ liệu nếu Admin nhập ngay từ form thêm mới
+        used_leave_legacy: emp.usedLeaveLegacy || 0,
+        resignation_date: emp.resignationDate || null
       };
 
       const { error } = await supabase.from('profiles').insert(payload);
@@ -1927,10 +2348,10 @@ const App: React.FC = () => {
         base_salary: emp.baseSalary,
         allowance: emp.allowance,
         work_days: emp.workDays,
-        leave_balance: emp.leaveBalance,
         insurance_salary: emp.insuranceSalary,
         contract_type: emp.contractType,
         contract_date: emp.contractDate,
+        official_contract_date: emp.officialContractDate || null,
 
         employee_code: emp.employeeCode, // Save to DB
         status: emp.status, // Fix: Save Status to DB
@@ -2274,11 +2695,12 @@ const App: React.FC = () => {
         myOverrides,
         holidays,
         salaryChanges,
-        myLeaveRequests
+        myLeaveRequests,
+        mySwapRequests
       );
     }
     return null;
-  }, [activeTab, myLogs, myOtRequests, myLateRequests, myAdvanceRequests, myBonuses, currentSalaryMonth, currentUser, holidays, myOverrides, salaryChanges, myLeaveRequests]);
+  }, [activeTab, myLogs, myOtRequests, myLateRequests, myAdvanceRequests, myBonuses, currentSalaryMonth, currentUser, holidays, myOverrides, salaryChanges, myLeaveRequests, mySwapRequests]);
 
   // Check Auth Loading
   if (authLoading) {
@@ -2421,7 +2843,8 @@ const App: React.FC = () => {
     otRequests.filter(r => r.status === 'PENDING').length +
     lateRequests.filter(r => r.status === 'PENDING').length +
     advanceRequests.filter(r => r.status === 'PENDING').length +
-    leaveRequests.filter(r => r.status === 'PENDING').length;
+    leaveRequests.filter(r => r.status === 'PENDING').length +
+    swapRequests.filter(r => r.status === 'PENDING').length;
 
   return (
     <div className="min-h-screen bg-gray-50 font-sans text-gray-900 flex flex-col items-center">
@@ -2569,8 +2992,15 @@ const App: React.FC = () => {
                 )}
               </div>
 
-              {/* Request Leave Button */}
-              <div className="flex justify-end mb-4">
+              {/* Request Leave / Swap Rest Day Buttons */}
+              <div className="flex justify-end gap-2 mb-4">
+                <button
+                  onClick={() => { setSwapRequestTargetUser(null); setIsSwapModalOpen(true); }}
+                  className="flex items-center gap-1 text-xs font-bold bg-violet-500 text-white px-3 py-2 rounded-lg shadow hover:bg-violet-600 active:scale-95 transition-all"
+                  title="Nghỉ Thứ 7, đi làm bù Chủ Nhật"
+                >
+                  <Repeat size={14} /> Đổi ngày nghỉ
+                </button>
                 <button
                   onClick={() => setIsLeaveModalOpen(true)}
                   className="flex items-center gap-1 text-xs font-bold bg-green-500 text-white px-3 py-2 rounded-lg shadow hover:bg-green-600 active:scale-95 transition-all"
@@ -2620,6 +3050,15 @@ const App: React.FC = () => {
                 />
               </div>
 
+              {/* Tăng ca ngoài công ty: khai theo khung giờ, không cần chấm công */}
+              <button
+                onClick={() => handleOpenDeclaredOT('HOME')}
+                className="w-full mb-8 py-3 bg-teal-600 hover:bg-teal-700 text-white rounded-xl font-bold shadow-lg active:scale-95 transition-all flex items-center justify-center gap-2"
+              >
+                <Home size={18} />
+                Tăng ca tại nhà
+              </button>
+
               {/* Today History */}
               <AttendanceHistory logs={myLogs} />
             </div>
@@ -2636,10 +3075,12 @@ const App: React.FC = () => {
                 lateRequests={myLateRequests}
                 overrides={myOverrides}
                 onExplainLate={handleExplainLate}
+                onDeclareOT={(d) => handleOpenDeclaredOT('HOME', undefined, d)}
                 holidays={holidays}
                 userRole={currentUser.role}
                 leaveRequests={myLeaveRequests}
                 advanceRequests={myAdvanceRequests}
+                swapRequests={mySwapRequests}
                 onFetchMonthData={fetchMonthData}
               />
             </div>
@@ -2653,10 +3094,14 @@ const App: React.FC = () => {
                 lateRequests={lateRequests}
                 advanceRequests={advanceRequests}
                 leaveRequests={leaveRequests}
+                swapRequests={swapRequests}
+                holidays={holidays}
                 onUpdateOtStatus={handleUpdateOtStatus}
                 onUpdateLateStatus={handleUpdateLateStatus}
                 onUpdateAdvanceStatus={handleUpdateAdvanceStatus}
                 onUpdateLeaveStatus={handleUpdateLeaveStatus}
+                onUpdateSwapStatus={handleUpdateSwapStatus}
+                onDeleteRequest={currentUser?.role === 'Admin' ? handleDeleteRequest : undefined}
               />
             </div>
           )}
@@ -2665,7 +3110,7 @@ const App: React.FC = () => {
             <div className="animate-fade-in pt-4 h-full">
               {!viewingEmployee ? (
                 <EmployeeManagement
-                  employees={employees}
+                  employees={sortedEmployees}
                   onAdd={handleAddEmployee}
                   onEdit={handleEditEmployee}
                   onDelete={handleDeleteEmployee}
@@ -2674,10 +3119,14 @@ const App: React.FC = () => {
                   onView={handleViewEmployee}
                   onQuickBonus={() => setIsGeneralBonusModalOpen(true)}
                   leaveRequests={leaveRequests}
+                  swapRequests={swapRequests}
+                  holidays={holidays}
                 />
               ) : (
                 <AdminEmployeeDetail
                   employee={viewingEmployee}
+                  employees={switchableEmployees}
+                  onSelectEmployee={handleViewEmployee}
                   onBack={handleBackFromView}
                   otRequests={otRequests}
                   lateRequests={lateRequests}
@@ -2696,6 +3145,7 @@ const App: React.FC = () => {
                   onDeleteSalaryChange={handleDeleteSalaryChange}
                   onRequestCreate={handleAdminCreateRequest}
                   leaveRequests={leaveRequests}
+                  swapRequests={swapRequests}
                   lockedMonths={lockedMonths} // Pass prop
                 />
               )}
@@ -2726,6 +3176,7 @@ const App: React.FC = () => {
             <div className="animate-fade-in pt-4">
               <CompanyCalendar
                 leaveRequests={leaveRequests}
+                swapRequests={swapRequests}
                 employees={visibleEmployees}
                 holidays={holidays}
                 currentUser={currentUser}
@@ -2736,7 +3187,9 @@ const App: React.FC = () => {
           {activeTab === 'payroll' && isAdmin && (
             <div className="animate-fade-in pt-4">
               <AdminPayrollManagement
-                employees={visibleEmployees}
+                // Truyền đủ để màn lương tự lọc theo THÁNG ĐANG XEM — nếu lọc sẵn
+                // theo hôm nay thì người nghỉ tháng trước biến mất khỏi báo cáo cũ
+                employees={sortedEmployees}
                 logs={logs}
                 otRequests={otRequests}
                 lateRequests={lateRequests}
@@ -2746,6 +3199,7 @@ const App: React.FC = () => {
                 holidays={holidays}
                 salaryChanges={salaryChanges}
                 leaveRequests={leaveRequests}
+                swapRequests={swapRequests}
                 onBulkSaveBonus={handleBulkAddBonus}
                 onDeleteBonusBatch={handleDeleteBonusBatch}
                 lockedMonths={lockedMonths}
@@ -2942,9 +3396,19 @@ const App: React.FC = () => {
         {/* OT Request Modal */}
         <OTRequestModal
           isOpen={isOtModalOpen}
-          onClose={() => setIsOtModalOpen(false)}
+          onClose={() => {
+            setIsOtModalOpen(false);
+            setOtRequestTargetUser(null);
+            setOtDefaultDate(undefined);
+            setOtModalMode('OFFICE');
+          }}
           onSubmit={handleSubmitOtRequest}
+          mode={otModalMode}
           type={pendingOtType}
+          targetName={otRequestTargetUser?.name}
+          defaultDate={otDefaultDate}
+          getExistingRanges={getExistingOtRanges}
+          getAttendanceTimes={getOtAttendanceTimes}
         />
 
         {/* Late Explain Modal */}
@@ -2979,7 +3443,8 @@ const App: React.FC = () => {
                 overrides.filter(o => o.userId === targetUser.id),
                 holidays,
                 salaryChanges,
-                leaveRequests.filter(r => r.userId === targetUser.id)
+                leaveRequests.filter(r => r.userId === targetUser.id),
+                swapRequests.filter(r => r.userId === targetUser.id)
               );
               netSalary = tempSalary.netSalary;
             }
@@ -3013,16 +3478,45 @@ const App: React.FC = () => {
                 setLeaveRequestTargetUser(null);
               }}
               onSubmit={handleSubmitLeaveRequest}
-              currentBalance={finalLeaveUser ? calculateRemainingLeave(
-                finalLeaveUser.contractDate || '',
-                finalLeaveUser.id,
-                leaveRequests.filter(req => req.userId === finalLeaveUser.id),
-                finalLeaveUser.usedLeaveLegacy || 0,
-                true
-              ) : 0}
+              currentBalance={finalLeaveUser
+                ? getRemainingLeave(finalLeaveUser, leaveRequests, {
+                  holidays,
+                  isRestDay: makeRestDayPredicate(swapRequests.filter(s => s.userId === finalLeaveUser.id), holidays)
+                })
+                : 0}
+              canUseAnnualLeave={finalLeaveUser ? accruesAnnualLeave(finalLeaveUser) : true}
+              contractTypeLabel={finalLeaveUser?.contractType}
               leaveHistory={leaveRequests.filter(req => req.userId === finalLeaveUser?.id)}
               userName={finalLeaveUser?.name}
-              paidLeaveUsedThisMonth={finalLeaveUser ? getPaidLeaveUsedThisMonth(finalLeaveUser.id, leaveRequests) : 0}
+              employeeId={finalLeaveUser?.id}
+              holidays={holidays}
+              swapRequests={swapRequests.filter(s => s.userId === finalLeaveUser?.id)}
+              allowSpecialLeave={isAdmin}
+              // Chỉ bỏ trần tháng khi Admin tạo HỘ người khác. Admin tự xin nghỉ
+              // cho chính mình thì leaveRequestTargetUser = null nên vẫn chịu trần.
+              enforceMonthlyQuota={!leaveRequestTargetUser}
+            />
+          );
+        })()}
+
+        {/* Swap Rest Day Modal (nghỉ Thứ 7, làm bù Chủ Nhật) */}
+        {(() => {
+          const swapUser = swapRequestTargetUser || currentUser;
+          return (
+            <SwapRequestModal
+              isOpen={isSwapModalOpen}
+              onClose={() => {
+                setIsSwapModalOpen(false);
+                setSwapRequestTargetUser(null);
+              }}
+              onSubmit={handleSubmitSwapRequest}
+              targetName={swapRequestTargetUser?.name}
+              isAdmin={!!swapRequestTargetUser}
+              employeeId={swapUser?.id || ''}
+              workDays={swapUser?.workDays}
+              holidays={holidays}
+              existingSwaps={swapRequests}
+              leaveRequests={leaveRequests}
             />
           );
         })()}
@@ -3032,7 +3526,7 @@ const App: React.FC = () => {
           // Compute late warnings for all employees
           const lateWarnings: Record<string, { level: 3 | 6; message: string }> = {};
           if (isGeneralBonusModalOpen) {
-            employees.forEach(emp => {
+            employees.filter(isWorkingEmployee).forEach(emp => {
               const empReport = calculateMonthlySalary(
                 new Date(),
                 logs.filter(l => l.userId === emp.id),
@@ -3044,7 +3538,8 @@ const App: React.FC = () => {
                 overrides.filter(o => o.userId === emp.id),
                 holidays,
                 salaryChanges,
-                leaveRequests.filter(r => r.userId === emp.id)
+                leaveRequests.filter(r => r.userId === emp.id),
+                swapRequests.filter(r => r.userId === emp.id)
               );
               if (empReport.isConsecutive6Months) {
                 lateWarnings[emp.id] = {

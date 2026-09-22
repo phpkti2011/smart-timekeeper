@@ -12,21 +12,26 @@ import {
   OverrideLog,
   Holiday,
   SalaryChange,
-  LeaveRequest
+  LeaveRequest,
+  SwapRequest
 } from '../types';
 
 import { TIME_RULES, OT_MULTIPLIERS } from '../constants';
 import { calculateDailyStats } from '../utils/attendanceCalculator';
 import { calculateMonthlySalary } from '../utils/salaryCalculator';
-import { ArrowLeft, Calendar, DollarSign, AlertTriangle, FileText, CheckCircle2, Clock, ChevronLeft, ChevronRight, Plus, Trash2, SlidersHorizontal, Edit2 } from 'lucide-react';
+import { ArrowLeft, Calendar, DollarSign, AlertTriangle, FileText, CheckCircle2, Clock, ChevronLeft, ChevronRight, Plus, Trash2, SlidersHorizontal, Edit2, ChevronDown, Check, Search, Repeat } from 'lucide-react';
 import { SalaryView } from './SalaryView';
 import { BonusPenaltyModal } from './BonusPenaltyModal';
 import { AttendanceEditModal } from './AttendanceEditModal';
 import { SalaryChangeModal } from './SalaryChangeModal';
+import { formatOTFormula, formatDeclaredRanges } from '../utils/otDisplay';
+import { restDayWorkedText } from '../utils/restDay';
 
 
 interface Props {
   employee: UserProfile;
+  employees: UserProfile[]; // Danh sách NV có thể chuyển đổi (để đổi NV ngay trong cửa sổ)
+  onSelectEmployee: (emp: UserProfile) => void; // Đổi sang NV khác
   onBack: () => void;
   // Global data sources (to be filtered by employee ID)
   otRequests: OTRequest[];
@@ -44,9 +49,10 @@ interface Props {
   salaryChanges: SalaryChange[];
   logs: AttendanceLog[];
   leaveRequests: LeaveRequest[];
+  swapRequests: SwapRequest[];
   onDeleteSalaryChange: (id: string, userId: string) => void;
   onAddSalaryChange: (data: { baseSalary: number; allowance: number; insuranceSalary: number; effectiveDate: string; reason: string }) => void;
-  onRequestCreate: (type: 'LEAVE' | 'ADVANCE', targetEmployee: UserProfile) => void;
+  onRequestCreate: (type: 'LEAVE' | 'ADVANCE' | 'OT' | 'SWAP', targetEmployee: UserProfile) => void;
   lockedMonths: string[]; // New prop
 }
 
@@ -72,6 +78,8 @@ const getVietnameseDayFull = (date: Date): string => {
 
 export const AdminEmployeeDetail: React.FC<Props> = ({
   employee,
+  employees,
+  onSelectEmployee,
   onBack,
   otRequests,
   lateRequests,
@@ -87,6 +95,7 @@ export const AdminEmployeeDetail: React.FC<Props> = ({
   salaryChanges,
   logs,
   leaveRequests,
+  swapRequests,
   onRequestCreate,
   onAddSalaryChange,
   onDeleteSalaryChange,
@@ -105,8 +114,39 @@ export const AdminEmployeeDetail: React.FC<Props> = ({
 
   const [editingSalaryChange, setEditingSalaryChange] = useState<SalaryChange | null>(null);
 
+  // Employee switcher (đổi NV ngay trong cửa sổ, không cần quay lại)
+  const [isSwitcherOpen, setIsSwitcherOpen] = useState(false);
+  const [switcherSearch, setSwitcherSearch] = useState('');
+
   const handlePrevMonth = () => setSelectedMonth(subMonths(selectedMonth, 1));
   const handleNextMonth = () => setSelectedMonth(addMonths(selectedMonth, 1));
+
+  // Điều hướng nhân viên
+  const currentIndex = employees.findIndex(e => e.id === employee.id);
+  const hasPrevEmployee = currentIndex > 0;
+  const hasNextEmployee = currentIndex >= 0 && currentIndex < employees.length - 1;
+
+  const handleSelectEmployee = (emp: UserProfile) => {
+    onSelectEmployee(emp);
+    setIsSwitcherOpen(false);
+    setSwitcherSearch('');
+  };
+
+  const handlePrevEmployee = () => {
+    if (hasPrevEmployee) handleSelectEmployee(employees[currentIndex - 1]);
+  };
+  const handleNextEmployee = () => {
+    if (hasNextEmployee) handleSelectEmployee(employees[currentIndex + 1]);
+  };
+
+  const filteredSwitcherEmployees = employees.filter(emp => {
+    const q = switcherSearch.toLowerCase();
+    return (
+      emp.name.toLowerCase().includes(q) ||
+      emp.role.toLowerCase().includes(q) ||
+      (emp.employeeCode || '').toLowerCase().includes(q)
+    );
+  });
 
   // Filter global data for this specific employee
   const employeeOtRequests = otRequests.filter(r => r.userId === employee.id);
@@ -115,6 +155,7 @@ export const AdminEmployeeDetail: React.FC<Props> = ({
   const employeeBonuses = bonuses.filter(b => b.userId === employee.id);
   const employeeOverrides = overrides.filter(o => o.userId === employee.id);
   const employeeLeaveRequests = leaveRequests.filter(r => r.userId === employee.id);
+  const employeeSwapRequests = swapRequests.filter(r => r.userId === employee.id);
 
   const monthBonuses = employeeBonuses.filter(b => isSameMonth(b.date, selectedMonth));
 
@@ -148,12 +189,13 @@ export const AdminEmployeeDetail: React.FC<Props> = ({
         dayOtReqs,
         dayLateReqs,
         employeeLeaveRequests,
-        override // Pass override
+        override, // Pass override
+        employeeSwapRequests
       );
     });
 
     return { stats, simulatedLogs: [] }; // simulatedLogs unused
-  }, [selectedMonth, employee, employeeLogs, employeeOtRequests, employeeLateRequests, employeeOverrides, holidays, employeeLeaveRequests]);
+  }, [selectedMonth, employee, employeeLogs, employeeOtRequests, employeeLateRequests, employeeOverrides, holidays, employeeLeaveRequests, employeeSwapRequests]);
 
   const salaryReport = useMemo(() => {
     return calculateMonthlySalary(
@@ -167,9 +209,10 @@ export const AdminEmployeeDetail: React.FC<Props> = ({
       employeeOverrides,
       holidays,
       salaryChanges,
-      employeeLeaveRequests
+      employeeLeaveRequests,
+      employeeSwapRequests
     );
-  }, [selectedMonth, monthData, employee, employeeOtRequests, employeeLateRequests, employeeAdvances, employeeBonuses, holidays, employeeOverrides, salaryChanges, employeeLeaveRequests]);
+  }, [selectedMonth, monthData, employee, employeeOtRequests, employeeLateRequests, employeeAdvances, employeeBonuses, holidays, employeeOverrides, salaryChanges, employeeLeaveRequests, employeeSwapRequests]);
 
 
   const handleAddBonusSubmit = (data: Omit<BonusFine, 'id'>) => {
@@ -225,17 +268,100 @@ export const AdminEmployeeDetail: React.FC<Props> = ({
       <div className="bg-slate-800 p-4 sm:p-6 text-white sticky top-0 z-30 shadow-lg">
         <div className="flex flex-col gap-4 mb-2">
           {/* Top Row: Name & Info */}
-          <div className="flex items-center gap-3 w-full">
+          <div className="flex items-center gap-1.5 sm:gap-3 w-full">
             <button onClick={onBack} className="p-2 hover:bg-white/10 rounded-full transition shrink-0">
               <ArrowLeft size={20} className="sm:w-6 sm:h-6" />
             </button>
-            <div className="min-w-0 flex-1">
-              <h1 className="text-lg sm:text-xl font-bold truncate">{employee.name}</h1>
-              <div className="flex items-center gap-2">
-                <p className="text-slate-400 text-xs sm:text-sm truncate max-w-[150px]">{employee.role}</p>
-                <span className="text-[10px] text-slate-500 bg-slate-700/50 px-1.5 py-0.5 rounded">Logs: {employeeLogs.length}</span>
-              </div>
+
+            {/* Prev Employee */}
+            <button
+              onClick={handlePrevEmployee}
+              disabled={!hasPrevEmployee}
+              className="p-1.5 rounded-full transition shrink-0 hover:bg-white/10 disabled:opacity-30 disabled:cursor-not-allowed"
+              title="Nhân viên trước"
+            >
+              <ChevronLeft size={20} />
+            </button>
+
+            {/* Name (clickable → switcher dropdown) */}
+            <div className="min-w-0 flex-1 relative">
+              <button
+                onClick={() => setIsSwitcherOpen(o => !o)}
+                className="min-w-0 w-full text-left flex items-center gap-1.5 rounded-lg px-1.5 py-0.5 -ml-1.5 hover:bg-white/10 transition"
+                title="Đổi nhân viên"
+              >
+                <div className="min-w-0">
+                  <h1 className="text-lg sm:text-xl font-bold truncate flex items-center gap-1.5">
+                    <span className="truncate">{employee.name}</span>
+                    <ChevronDown size={18} className={`shrink-0 text-slate-300 transition-transform ${isSwitcherOpen ? 'rotate-180' : ''}`} />
+                  </h1>
+                  <div className="flex items-center gap-2">
+                    <p className="text-slate-400 text-xs sm:text-sm truncate max-w-[150px]">{employee.role}</p>
+                    <span className="text-[10px] text-slate-500 bg-slate-700/50 px-1.5 py-0.5 rounded">Logs: {employeeLogs.length}</span>
+                  </div>
+                </div>
+              </button>
+
+              {/* Switcher Dropdown */}
+              {isSwitcherOpen && (
+                <>
+                  {/* Overlay để đóng khi bấm ra ngoài */}
+                  <div className="fixed inset-0 z-30" onClick={() => setIsSwitcherOpen(false)} />
+                  <div className="absolute left-0 top-full mt-2 w-72 max-w-[calc(100vw-2rem)] bg-white text-gray-800 rounded-xl shadow-2xl border border-gray-200 z-40 overflow-hidden">
+                    {/* Search */}
+                    <div className="p-2 border-b border-gray-100 relative">
+                      <Search className="absolute left-4 top-1/2 -translate-y-1/2 text-gray-400" size={16} />
+                      <input
+                        type="text"
+                        autoFocus
+                        value={switcherSearch}
+                        onChange={(e) => setSwitcherSearch(e.target.value)}
+                        placeholder="Tìm nhân viên..."
+                        className="w-full pl-9 pr-3 py-2 bg-gray-50 border border-gray-200 rounded-lg text-sm outline-none focus:ring-2 focus:ring-blue-500 text-gray-900 placeholder-gray-400"
+                      />
+                    </div>
+                    {/* List */}
+                    <div className="max-h-72 overflow-y-auto no-scrollbar py-1">
+                      {filteredSwitcherEmployees.length === 0 ? (
+                        <div className="px-4 py-6 text-center text-sm text-gray-400">Không tìm thấy nhân viên.</div>
+                      ) : (
+                        filteredSwitcherEmployees.map(emp => {
+                          const isActive = emp.id === employee.id;
+                          return (
+                            <button
+                              key={emp.id}
+                              onClick={() => handleSelectEmployee(emp)}
+                              className={`w-full flex items-center gap-3 px-3 py-2 text-left transition-colors ${isActive ? 'bg-blue-50' : 'hover:bg-gray-50'}`}
+                            >
+                              <img
+                                src={emp.avatar}
+                                alt={emp.name}
+                                className="w-8 h-8 rounded-full object-cover border border-gray-100 bg-gray-200 shrink-0"
+                              />
+                              <div className="min-w-0 flex-1">
+                                <div className={`text-sm font-bold truncate ${isActive ? 'text-blue-700' : 'text-gray-800'}`}>{emp.name}</div>
+                                <div className="text-[11px] text-gray-500 truncate">{emp.role}</div>
+                              </div>
+                              {isActive && <Check size={16} className="text-blue-600 shrink-0" />}
+                            </button>
+                          );
+                        })
+                      )}
+                    </div>
+                  </div>
+                </>
+              )}
             </div>
+
+            {/* Next Employee */}
+            <button
+              onClick={handleNextEmployee}
+              disabled={!hasNextEmployee}
+              className="p-1.5 rounded-full transition shrink-0 hover:bg-white/10 disabled:opacity-30 disabled:cursor-not-allowed"
+              title="Nhân viên kế tiếp"
+            >
+              <ChevronRight size={20} />
+            </button>
           </div>
 
           {/* Bottom Row: Actions & Month Selector (Moved Here) */}
@@ -273,6 +399,19 @@ export const AdminEmployeeDetail: React.FC<Props> = ({
                 className="bg-indigo-600 hover:bg-indigo-500 text-white px-2 sm:px-3 py-1.5 rounded-lg text-[10px] sm:text-xs font-bold transition flex items-center gap-1.5 shadow-sm active:scale-95 whitespace-nowrap"
               >
                 <DollarSign size={14} /> <span className="hidden xs:inline">T.Đơn Ứng</span><span className="inline xs:hidden">Ứng</span>
+              </button>
+              <button
+                onClick={() => onRequestCreate('OT', employee)}
+                className="bg-rose-600 hover:bg-rose-500 text-white px-2 sm:px-3 py-1.5 rounded-lg text-[10px] sm:text-xs font-bold transition flex items-center gap-1.5 shadow-sm active:scale-95 whitespace-nowrap"
+              >
+                <Clock size={14} /> <span className="hidden xs:inline">T.Đơn Tăng Ca</span><span className="inline xs:hidden">T.Ca</span>
+              </button>
+              <button
+                onClick={() => onRequestCreate('SWAP', employee)}
+                className="bg-violet-600 hover:bg-violet-500 text-white px-2 sm:px-3 py-1.5 rounded-lg text-[10px] sm:text-xs font-bold transition flex items-center gap-1.5 shadow-sm active:scale-95 whitespace-nowrap"
+                title="Nghỉ Thứ 7, làm bù Chủ Nhật"
+              >
+                <Repeat size={14} /> <span className="hidden xs:inline">Đổi Ngày Nghỉ</span><span className="inline xs:hidden">Đổi CN</span>
               </button>
             </div>
           </div>
@@ -335,11 +474,12 @@ export const AdminEmployeeDetail: React.FC<Props> = ({
               if (stat.status === 'leave' && !stat.isOverride) {
                 cardBg = "bg-green-50";
                 borderColor = "border-green-200";
-              } else if (stat.isSunday && !stat.isOverride) {
+              } else if (stat.isRestDay && !stat.isOverride) {
+                // Ngày nghỉ tuần: Chủ Nhật, hoặc Thứ 7 đã đổi (đơn đổi ngày nghỉ)
                 if (stat.otBreakdown.totalConvertedDays > 0) {
                   cardBg = "bg-purple-50";
                   borderColor = "border-purple-200";
-                  note = "Làm Chủ Nhật";
+                  note = restDayWorkedText(stat.restDayKind);
                 } else {
                   // Sunday off - simplified view or opacity
                   cardBg = "bg-slate-50 opacity-60";
@@ -427,7 +567,7 @@ export const AdminEmployeeDetail: React.FC<Props> = ({
                   {stat.otBreakdown.totalConvertedDays > 0 && (
                     <div className="mt-3 pt-2 border-t border-dashed border-gray-200 text-[10px] space-y-1">
                       <div className="text-center italic text-gray-400 mb-1">
-                        {(stat.otBreakdown.earlyMorningMinutes + stat.otBreakdown.lunchMinutes + stat.otBreakdown.eveningMinutes + stat.otBreakdown.sundayMinutes)} / 60 / 8 x {stat.isSunday ? OT_MULTIPLIERS.SUNDAY : OT_MULTIPLIERS.WEEKDAY} = {stat.otBreakdown.totalConvertedDays.toFixed(3)}
+                        {formatOTFormula(stat.otBreakdown, stat.isRestDay ? OT_MULTIPLIERS.SUNDAY : OT_MULTIPLIERS.WEEKDAY)}
                       </div>
                       {stat.otBreakdown.earlyMorningMinutes > 0 && (
                         <div className="flex justify-between text-blue-600">
@@ -496,8 +636,20 @@ export const AdminEmployeeDetail: React.FC<Props> = ({
                       )}
                       {stat.otBreakdown.sundayMinutes > 0 && (
                         <div className="flex justify-between text-purple-600 font-bold">
-                          <span>• Chủ Nhật:</span>
+                          <span>• {stat.restDayKind === 'SWAP_REST' ? 'Nghỉ bù (đổi CN)' : 'Chủ Nhật'}:</span>
                           <span>{stat.otBreakdown.sundayMinutes}p</span>
+                        </div>
+                      )}
+                      {stat.otBreakdown.declaredMinutes > 0 && (
+                        <div className="flex justify-between text-teal-600">
+                          <span>• Khai báo ({formatDeclaredRanges(stat.otRequests || [])}):</span>
+                          <span className="font-bold">{stat.otBreakdown.declaredMinutes}p</span>
+                        </div>
+                      )}
+                      {stat.otBreakdown.nightMinutes > 0 && (
+                        <div className="flex justify-between text-indigo-600">
+                          <span>• Trong đó khung đêm 22:00–06:00 (×2):</span>
+                          <span className="font-bold">{stat.otBreakdown.nightMinutes}p</span>
                         </div>
                       )}
                     </div>

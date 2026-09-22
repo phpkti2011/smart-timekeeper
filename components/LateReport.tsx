@@ -2,7 +2,7 @@ import React, { useMemo, useState } from 'react';
 import { format, subMonths, startOfMonth } from 'date-fns';
 import { vi } from 'date-fns/locale';
 import { AlertTriangle, Clock, TrendingUp, Filter, ChevronDown, ChevronUp } from 'lucide-react';
-import { UserProfile, AttendanceLog, LateRequest, OverrideLog, Holiday, LeaveRequest, MonthlySalaryReport } from '../types';
+import { UserProfile, AttendanceLog, LateRequest, OverrideLog, Holiday, LeaveRequest, MonthlySalaryReport, SwapRequest } from '../types';
 import { getLateCountForMonth } from '../utils/salaryCalculator';
 
 interface EmployeeLateData {
@@ -27,6 +27,7 @@ interface Props {
     overrides: OverrideLog[];
     holidays: Holiday[];
     leaveRequests: LeaveRequest[];
+    swapRequests?: SwapRequest[];
     selectedMonth: Date;
     reportData: { empId: string; report: MonthlySalaryReport }[] | null;
 }
@@ -38,6 +39,7 @@ export const LateReport: React.FC<Props> = ({
     overrides,
     holidays,
     leaveRequests,
+    swapRequests = [],
     selectedMonth,
     reportData
 }) => {
@@ -51,18 +53,19 @@ export const LateReport: React.FC<Props> = ({
             const empLateReqs = lateRequests.filter(r => r.userId === emp.id);
             const empOverrides = (overrides || []).filter(o => o.userId === emp.id);
             const empLeaveReqs = leaveRequests.filter(r => r.userId === emp.id);
+            const empSwapReqs = swapRequests.filter(r => r.userId === emp.id);
 
             // Get report data for this employee
             const empReport = reportData?.find(r => r.empId === emp.id)?.report;
             const currentMonthLate = empReport?.totalLateCount ?? getLateCountForMonth(
-                selectedMonth, empLogs, empLateReqs, empOverrides, holidays, emp, empLeaveReqs
+                selectedMonth, empLogs, empLateReqs, empOverrides, holidays, emp, empLeaveReqs, empSwapReqs
             );
 
             // Monthly breakdown (last 6 months, newest first = selectedMonth, then 5 previous)
             const months = Array.from({ length: 6 }, (_, i) => subMonths(selectedMonth, i));
             const monthlyBreakdown = months.map((m, idx) => {
                 if (idx === 0) return currentMonthLate;
-                return getLateCountForMonth(m, empLogs, empLateReqs, empOverrides, holidays, emp, empLeaveReqs);
+                return getLateCountForMonth(m, empLogs, empLateReqs, empOverrides, holidays, emp, empLeaveReqs, empSwapReqs);
             });
 
             // Consecutive late months (from newest, requires ≥2 late/month)

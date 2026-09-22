@@ -2,11 +2,14 @@ import { createClient } from '@supabase/supabase-js';
 
 // === CONFIG ===
 const SUPABASE_URL = process.env.VITE_SUPABASE_URL || '';
-const SUPABASE_KEY = process.env.VITE_SUPABASE_ANON_KEY || '';
+// Dùng service_role để bypass RLS (server-side cần đọc tất cả logs của mọi user)
+const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.VITE_SUPABASE_ANON_KEY || '';
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, {
+  auth: { persistSession: false, autoRefreshToken: false }
+});
 
 // === HELPERS ===
 function formatDate(d: Date): string {
@@ -40,9 +43,12 @@ function timeToMinutes(h: number, m: number): number {
   return h * 60 + m;
 }
 
-async function sendTelegram(text: string): Promise<void> {
+async function sendTelegram(text: string): Promise<{ ok: boolean; status: number; body: string }> {
+  if (!BOT_TOKEN || !CHAT_ID) {
+    return { ok: false, status: 0, body: 'Missing BOT_TOKEN or CHAT_ID env var' };
+  }
   const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
-  await fetch(url, {
+  const r = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -52,38 +58,79 @@ async function sendTelegram(text: string): Promise<void> {
       disable_web_page_preview: true,
     }),
   });
+  const body = await r.text();
+  return { ok: r.ok, status: r.status, body };
 }
+
+// Trả về ngày làm việc gần nhất trước hôm nay (bỏ qua Chủ Nhật)
+function getLastWorkingDay(): Date {
+  let d = getVNDate(-1);
+  while (d.getDay() === 0) {
+    d = new Date(d.getTime() - 24 * 60 * 60 * 1000);
+  }
+  return d;
+}
+
+// Cột DATE trả 'yyyy-MM-dd'; cột timestamptz thì cắt 10 ký tự đầu (UTC) — khớp
+// cửa sổ truy vấn log theo ngày UTC bên dưới.
+const ymd = (v: any): string => (v ? String(v).slice(0, 10) : '');
 
 // === MAIN LOGIC ===
 async function generateReport(): Promise<string> {
-  const yesterday = getVNDate(-1);
+  const yesterday = getLastWorkingDay();
   const today = getVNDate(0);
   const tomorrow = getVNDate(1);
   const weekEnd = getVNDate(7);
 
   const yesterdayISO = formatDateISO(yesterday);
+  const todayISO = formatDateISO(today);
   const tomorrowISO = formatDateISO(tomorrow);
   const weekEndISO = formatDateISO(weekEnd);
+
+  // Sáng Thứ 2: getLastWorkingDay trả về Thứ 7. Chủ Nhật vừa qua chỉ được báo
+  // cho RIÊNG nhân viên có đơn đổi ngày nghỉ (làm bù CN) đã duyệt.
+  const prevCalendarDay = getVNDate(-1);
+  const swapSundayISO = prevCalendarDay.getDay() === 0 ? formatDateISO(prevCalendarDay) : null;
+
+  // Giờ hiện tại VN (theo phút) — dùng để check ca đã đến giờ chưa
+  const nowVN = new Date(new Date().getTime() + 7 * 60 * 60 * 1000);
+  const currentMins = nowVN.getUTCHours() * 60 + nowVN.getUTCMinutes();
+
+  // Helper: ca làm việc đã qua giờ kết thúc chưa (chỉ quan trọng cho dữ liệu ngày hôm nay)
+  const isShiftPassed = (shiftEndMins: number, dateStr: string): boolean => {
+    if (dateStr < todayISO) return true; // Ngày trong quá khứ → ca luôn đã qua
+    if (dateStr > todayISO) return false; // Ngày tương lai → chưa qua
+    return currentMins >= shiftEndMins; // Hôm nay → so giờ hiện tại
+  };
+
+  // Các flag time-aware cho một ngày báo cáo
+  const buildFlags = (dateStr: string) => ({
+    morningIn: isShiftPassed(timeToMinutes(8, 30), dateStr),
+    morningOut: isShiftPassed(timeToMinutes(12, 30), dateStr),
+    afterIn: isShiftPassed(timeToMinutes(14, 0), dateStr),
+    afterOut: isShiftPassed(timeToMinutes(18, 0), dateStr),
+  });
 
   // 1. Fetch employees
   const { data: employees } = await supabase
     .from('profiles')
-    .select('id, name, role, status, work_days')
+    .select('id, name, role, status, work_days, resignation_date')
     .eq('status', 'ACTIVE');
 
   if (!employees || employees.length === 0) {
     return '📋 Không có nhân viên nào trong hệ thống.';
   }
 
-  // 2. Fetch yesterday's attendance logs
-  const startOfYesterday = `${yesterdayISO}T00:00:00.000Z`;
-  const endOfYesterday = `${yesterdayISO}T23:59:59.999Z`;
+  // 2. Fetch attendance logs cho ngày báo cáo (và Chủ Nhật làm bù, nếu có).
+  // Thứ 7 < Chủ Nhật nên cửa sổ là [T7, CN]; không có CN thì chỉ một ngày.
+  const firstISO = yesterdayISO;
+  const lastISO = swapSundayISO ?? yesterdayISO;
 
   const { data: logs } = await supabase
     .from('attendance_logs')
     .select('*')
-    .gte('timestamp', startOfYesterday)
-    .lte('timestamp', endOfYesterday);
+    .gte('timestamp', `${firstISO}T00:00:00.000Z`)
+    .lte('timestamp', `${lastISO}T23:59:59.999Z`);
 
   // 3. Fetch leave requests (approved + pending)
   const { data: leaveRequests } = await supabase
@@ -92,11 +139,29 @@ async function generateReport(): Promise<string> {
     .eq('type', 'LEAVE')
     .in('status', ['APPROVED', 'PENDING']);
 
-  // 4. Fetch overrides for yesterday
+  // 3b. Đơn đổi ngày nghỉ (nghỉ T7 = cột date, làm bù CN = cột swap_work_date).
+  // Một đơn nằm gọn trong một tuần nên ±8 ngày quanh hôm nay là đủ.
+  // Giữ đồng bộ với utils/restDay.ts. File này chạy trên serverless nên không
+  // import từ đó được, phải chép tay luật: chỉ đơn APPROVED có hiệu lực.
+  const { data: swapRows } = await supabase
+    .from('requests')
+    .select('user_id, date, swap_work_date, status')
+    .eq('type', 'SWAP')
+    .in('status', ['APPROVED', 'PENDING'])
+    .gte('date', formatDateISO(getVNDate(-8)))
+    .lte('date', weekEndISO);
+
+  const approvedSwaps = (swapRows || []).filter((s: any) => s.status === 'APPROVED');
+  const isSwapRestDay = (uid: string, d: string) =>
+    approvedSwaps.some((s: any) => s.user_id === uid && ymd(s.date) === d);
+  const isSwapWorkDay = (uid: string, d: string) =>
+    approvedSwaps.some((s: any) => s.user_id === uid && ymd(s.swap_work_date) === d);
+
+  // 4. Fetch overrides cho các ngày báo cáo
   const { data: overrides } = await supabase
     .from('attendance_overrides')
     .select('*')
-    .eq('date', yesterdayISO);
+    .in('date', swapSundayISO ? [yesterdayISO, swapSundayISO] : [yesterdayISO]);
 
   // === ANALYZE ===
 
@@ -106,6 +171,7 @@ async function generateReport(): Promise<string> {
   const otList: string[] = [];
   const leaveThisWeek: string[] = [];
   const leaveTomorrow: string[] = [];
+  const swapThisWeek: string[] = [];
 
   const MORNING_START = timeToMinutes(8, 0);
   const AFTERNOON_START = timeToMinutes(13, 30);
@@ -113,125 +179,162 @@ async function generateReport(): Promise<string> {
   const AFTERNOON_END = timeToMinutes(17, 30);
   const LATE_BUFFER = 5; // 5 phút buffer
 
-  for (const emp of employees) {
-    if (emp.role === 'Admin') continue;
+  // Các ngày cần phân tích: ngày làm việc gần nhất cho mọi người; thêm Chủ Nhật
+  // vừa qua cho riêng NV có đơn làm bù CN (mọi ca của ngày đó đều đã kết thúc).
+  const reportDays = [
+    { iso: yesterdayISO, dow: yesterday.getDay(), swapWorkersOnly: false, suffix: '', flags: buildFlags(yesterdayISO) },
+    ...(swapSundayISO
+      ? [{ iso: swapSundayISO, dow: 0, swapWorkersOnly: true, suffix: ' (làm bù Chủ Nhật)', flags: buildFlags(swapSundayISO) }]
+      : [])
+  ];
 
-    const empLogs = (logs || []).filter((l: any) => l.user_id === emp.id);
-    const empOverride = (overrides || []).find((o: any) => o.user_id === emp.id);
+  const logDayISO = (l: any): string => ymd(l.timestamp);
 
-    // Skip if has override (Admin đã điều chỉnh)
-    if (empOverride) continue;
+  for (const rd of reportDays) {
+    const dateISO = rd.iso;
+    const { morningIn: MORNING_IN_PASSED, morningOut: MORNING_OUT_PASSED, afterIn: AFTER_IN_PASSED, afterOut: AFTER_OUT_PASSED } = rd.flags;
 
-    // Check if yesterday is a working day for this employee
-    const yesterdayDow = yesterday.getDay(); // 0=Sun
-    const workDaysStr = emp.work_days || '1,2,3,4,5,6';
-    const workDays = workDaysStr.split(',').map(Number);
-    // Convert JS dow (0=Sun) to our format (1=Mon, 7=Sun)
-    const mappedDow = yesterdayDow === 0 ? 7 : yesterdayDow;
-    if (!workDays.includes(mappedDow)) continue;
+    for (const emp of employees) {
+      if (emp.role === 'Admin') continue;
 
-    // Check leave for yesterday
-    const onLeaveYesterday = (leaveRequests || []).some((lr: any) => {
-      if (lr.user_id !== emp.id || lr.status !== 'APPROVED') return false;
-      const start = lr.start_date?.split('T')[0];
-      const end = lr.end_date?.split('T')[0];
-      return start <= yesterdayISO && end >= yesterdayISO && lr.leave_duration === 'FULL';
-    });
-    if (onLeaveYesterday) continue;
-
-    // Group logs by type
-    const getLog = (type: string) => empLogs.find((l: any) => l.type === type);
-
-    const inMorning = getLog('Vào sáng');
-    const outMorning = getLog('Ra sáng');
-    const inAfternoon = getLog('Vào chiều');
-    const outAfternoon = getLog('Ra chiều');
-    const otMorning = getLog('Tăng ca sáng');
-    const otAfternoon = getLog('Tăng ca chiều');
-
-    // === LATE CHECK ===
-    if (inMorning) {
-      const t = parseTime(inMorning.timestamp);
-      const mins = timeToMinutes(t.hours, t.minutes);
-      if (mins > MORNING_START + LATE_BUFFER) {
-        const lateBy = mins - MORNING_START;
-        lateList.push(`  • ${emp.name} - Trễ ${lateBy} phút (ca sáng)`);
+      // Skip NV đã nghỉ việc trước ngày báo cáo
+      if (emp.resignation_date) {
+        const resignDateStr = emp.resignation_date.split('T')[0];
+        if (dateISO > resignDateStr) continue;
       }
-    }
-    if (inAfternoon) {
-      const t = parseTime(inAfternoon.timestamp);
-      const mins = timeToMinutes(t.hours, t.minutes);
-      if (mins > AFTERNOON_START + LATE_BUFFER) {
-        const lateBy = mins - AFTERNOON_START;
-        lateList.push(`  • ${emp.name} - Trễ ${lateBy} phút (ca chiều)`);
-      }
-    }
 
-    // === MISSING CHECK-IN/OUT ===
-    const missing: string[] = [];
-    const hasAnyLog = empLogs.length > 0;
+      // Chủ Nhật vừa qua chỉ xét NV có đơn làm bù CN đã duyệt
+      if (rd.swapWorkersOnly && !isSwapWorkDay(emp.id, dateISO)) continue;
 
-    if (!hasAnyLog) {
-      // Không có log nào cả ngày → kiểm tra có đơn nghỉ (PENDING) không
-      const hasPendingLeave = (leaveRequests || []).some((lr: any) => {
-        if (lr.user_id !== emp.id) return false;
+      const empLogs = (logs || []).filter((l: any) => l.user_id === emp.id && logDayISO(l) === dateISO);
+      const empOverride = (overrides || []).find((o: any) => o.user_id === emp.id && ymd(o.date) === dateISO);
+
+      // Skip if has override (Admin đã điều chỉnh)
+      if (empOverride) continue;
+
+      // Check if this is a working day for this employee
+      const workDaysStr = emp.work_days || '1,2,3,4,5,6';
+      const workDays = workDaysStr.split(',').map(Number);
+      // Convert JS dow (0=Sun) to our format (1=Mon, 7=Sun)
+      const mappedDow = rd.dow === 0 ? 7 : rd.dow;
+      const scheduledOff = !workDays.includes(mappedDow);
+      // Thứ 7 đã đổi thành ngày nghỉ bù → bỏ qua như Chủ Nhật.
+      // Ngày nghỉ theo lịch thì bỏ qua, TRỪ khi hôm đó là Chủ Nhật làm bù.
+      if (isSwapRestDay(emp.id, dateISO)) continue;
+      if (scheduledOff && !isSwapWorkDay(emp.id, dateISO)) continue;
+
+      const ten = `${emp.name}${rd.suffix}`;
+
+      // Check leave for this day
+      const onLeave = (leaveRequests || []).some((lr: any) => {
+        if (lr.user_id !== emp.id || lr.status !== 'APPROVED') return false;
         const start = lr.start_date?.split('T')[0];
         const end = lr.end_date?.split('T')[0];
-        return start <= yesterdayISO && end >= yesterdayISO;
+        return start <= dateISO && end >= dateISO && lr.leave_duration === 'FULL';
       });
+      if (onLeave) continue;
 
-      if (hasPendingLeave) {
-        missingList.push(`  • ${emp.name} - Không chấm công (có đơn nghỉ chờ duyệt ⏳)`);
+      // Group logs by type
+      const getLog = (type: string) => empLogs.find((l: any) => l.type === type);
+
+      const inMorning = getLog('Vào sáng');
+      const outMorning = getLog('Ra sáng');
+      const inAfternoon = getLog('Vào chiều');
+      const outAfternoon = getLog('Ra chiều');
+      const otMorning = getLog('Tăng ca sáng');
+      const otAfternoon = getLog('Tăng ca chiều');
+
+      // === LATE CHECK ===
+      if (inMorning) {
+        const t = parseTime(inMorning.timestamp);
+        const mins = timeToMinutes(t.hours, t.minutes);
+        if (mins > MORNING_START + LATE_BUFFER) {
+          const lateBy = mins - MORNING_START;
+          lateList.push(`  • ${ten} - Trễ ${lateBy} phút (ca sáng)`);
+        }
+      }
+      if (inAfternoon) {
+        const t = parseTime(inAfternoon.timestamp);
+        const mins = timeToMinutes(t.hours, t.minutes);
+        if (mins > AFTERNOON_START + LATE_BUFFER) {
+          const lateBy = mins - AFTERNOON_START;
+          lateList.push(`  • ${ten} - Trễ ${lateBy} phút (ca chiều)`);
+        }
+      }
+
+      // === MISSING CHECK-IN/OUT ===
+      const missing: string[] = [];
+      const hasAnyLog = empLogs.length > 0;
+
+      if (!hasAnyLog) {
+        // Chưa qua giờ vào sáng → không thể kết luận "vắng cả ngày" hay "không chấm công" → bỏ qua
+        if (!MORNING_IN_PASSED) {
+          // Skip: ca sáng chưa đến giờ kết thúc, đợi
+        } else {
+          // Không có log nào cả ngày → kiểm tra có đơn nghỉ (PENDING) không
+          const hasPendingLeave = (leaveRequests || []).some((lr: any) => {
+            if (lr.user_id !== emp.id) return false;
+            const start = lr.start_date?.split('T')[0];
+            const end = lr.end_date?.split('T')[0];
+            return start <= dateISO && end >= dateISO;
+          });
+
+          if (hasPendingLeave) {
+            missingList.push(`  • ${ten} - Không chấm công (có đơn nghỉ chờ duyệt ⏳)`);
+          } else {
+            absentList.push(`  • ${ten} - <b>Vắng cả ngày, không có đơn nghỉ phép</b>`);
+          }
+        }
       } else {
-        absentList.push(`  • ${emp.name} - <b>Vắng cả ngày, không có đơn nghỉ phép</b>`);
-      }
-    } else {
-      if (inMorning && !outMorning) missing.push('Ra sáng');
-      if (!inMorning && outMorning) missing.push('Vào sáng');
-      if (inAfternoon && !outAfternoon) missing.push('Ra chiều');
-      if (!inAfternoon && outAfternoon) missing.push('Vào chiều');
-      // Có ca sáng nhưng không có ca chiều (và ngược lại) - có thể nghỉ nửa ngày
-      if ((inMorning || outMorning) && !inAfternoon && !outAfternoon) {
-        // Check if half-day leave afternoon
-        const halfLeaveAfternoon = (leaveRequests || []).some((lr: any) =>
-          lr.user_id === emp.id && lr.status === 'APPROVED' &&
-          lr.start_date?.split('T')[0] <= yesterdayISO &&
-          lr.end_date?.split('T')[0] >= yesterdayISO &&
-          lr.leave_duration === 'AFTERNOON'
-        );
-        if (!halfLeaveAfternoon) missing.push('Vào chiều + Ra chiều');
-      }
-      if (!inMorning && !outMorning && (inAfternoon || outAfternoon)) {
-        const halfLeaveMorning = (leaveRequests || []).some((lr: any) =>
-          lr.user_id === emp.id && lr.status === 'APPROVED' &&
-          lr.start_date?.split('T')[0] <= yesterdayISO &&
-          lr.end_date?.split('T')[0] >= yesterdayISO &&
-          lr.leave_duration === 'MORNING'
-        );
-        if (!halfLeaveMorning) missing.push('Vào sáng + Ra sáng');
+        // Chỉ flag missing cho các ca đã đến giờ kết thúc
+        if (MORNING_IN_PASSED && !inMorning && outMorning) missing.push('Vào sáng');
+        if (MORNING_OUT_PASSED && inMorning && !outMorning) missing.push('Ra sáng');
+        if (AFTER_IN_PASSED && !inAfternoon && outAfternoon) missing.push('Vào chiều');
+        if (AFTER_OUT_PASSED && inAfternoon && !outAfternoon) missing.push('Ra chiều');
+
+        // Có ca sáng nhưng không có ca chiều → có thể nghỉ nửa ngày
+        // Chỉ check nếu ca chiều đã qua giờ vào (hoặc ra)
+        if (AFTER_IN_PASSED && (inMorning || outMorning) && !inAfternoon && !outAfternoon) {
+          const halfLeaveAfternoon = (leaveRequests || []).some((lr: any) =>
+            lr.user_id === emp.id && lr.status === 'APPROVED' &&
+            lr.start_date?.split('T')[0] <= dateISO &&
+            lr.end_date?.split('T')[0] >= dateISO &&
+            lr.leave_duration === 'AFTERNOON'
+          );
+          if (!halfLeaveAfternoon) missing.push('Vào chiều + Ra chiều');
+        }
+        if (MORNING_IN_PASSED && !inMorning && !outMorning && (inAfternoon || outAfternoon)) {
+          const halfLeaveMorning = (leaveRequests || []).some((lr: any) =>
+            lr.user_id === emp.id && lr.status === 'APPROVED' &&
+            lr.start_date?.split('T')[0] <= dateISO &&
+            lr.end_date?.split('T')[0] >= dateISO &&
+            lr.leave_duration === 'MORNING'
+          );
+          if (!halfLeaveMorning) missing.push('Vào sáng + Ra sáng');
+        }
+
+        if (missing.length > 0) {
+          missingList.push(`  • ${ten} - Thiếu: ${missing.join(', ')}`);
+        }
       }
 
-      if (missing.length > 0) {
-        missingList.push(`  • ${emp.name} - Thiếu: ${missing.join(', ')}`);
+      // === OT CHECK ===
+      if (otMorning) {
+        const t = parseTime(otMorning.timestamp);
+        const earlyMinutes = MORNING_START - timeToMinutes(t.hours, t.minutes);
+        if (earlyMinutes > 0) {
+          otList.push(`  • ${ten} - OT sáng sớm ${earlyMinutes} phút`);
+        }
       }
-    }
-
-    // === OT CHECK ===
-    if (otMorning) {
-      const t = parseTime(otMorning.timestamp);
-      const earlyMinutes = MORNING_START - timeToMinutes(t.hours, t.minutes);
-      if (earlyMinutes > 0) {
-        otList.push(`  • ${emp.name} - OT sáng sớm ${earlyMinutes} phút`);
-      }
-    }
-    if (otAfternoon || (outAfternoon && !otAfternoon)) {
-      // Check evening OT
-      const outLog = outAfternoon;
-      if (outLog) {
-        const t = parseTime(outLog.timestamp);
-        const overtimeMinutes = timeToMinutes(t.hours, t.minutes) - AFTERNOON_END;
-        if (overtimeMinutes > 15) {
-          otList.push(`  • ${emp.name} - OT chiều tối ${overtimeMinutes} phút`);
+      if (otAfternoon || (outAfternoon && !otAfternoon)) {
+        // Check evening OT
+        const outLog = outAfternoon;
+        if (outLog) {
+          const t = parseTime(outLog.timestamp);
+          const overtimeMinutes = timeToMinutes(t.hours, t.minutes) - AFTERNOON_END;
+          if (overtimeMinutes > 15) {
+            otList.push(`  • ${ten} - OT chiều tối ${overtimeMinutes} phút`);
+          }
         }
       }
     }
@@ -240,6 +343,12 @@ async function generateReport(): Promise<string> {
   // === LEAVE THIS WEEK & TOMORROW ===
   for (const emp of employees) {
     if (emp.role === 'Admin') continue;
+
+    // Skip NV đã nghỉ việc
+    if (emp.resignation_date) {
+      const resignDateStr = emp.resignation_date.split('T')[0];
+      if (yesterdayISO > resignDateStr) continue;
+    }
 
     const empLeaves = (leaveRequests || []).filter((lr: any) =>
       lr.user_id === emp.id && (lr.status === 'APPROVED' || lr.status === 'PENDING')
@@ -251,7 +360,11 @@ async function generateReport(): Promise<string> {
       if (!startDate || !endDate) continue;
 
       const statusLabel = lr.status === 'PENDING' ? ' ⏳' : '';
-      const typeLabel = lr.leave_type === 'PAID' ? 'có lương' : 'không lương';
+      // Giữ đồng bộ với LEAVE_TYPE_LABEL trong utils/leaveTypes.ts. File này chạy
+      // trên serverless nên không import từ đó được, phải chép tay.
+      const typeLabel = lr.leave_type === 'UNPAID' ? 'không lương'
+        : lr.leave_type === 'SPECIAL' ? 'nghỉ chế độ (có lương)'
+          : lr.leave_type === 'INSURANCE' ? 'nghỉ chế độ (BHXH chi trả)' : 'có lương';
       const durationLabel = lr.leave_duration === 'MORNING' ? ', nửa sáng'
         : lr.leave_duration === 'AFTERNOON' ? ', nửa chiều' : '';
 
@@ -273,11 +386,24 @@ async function generateReport(): Promise<string> {
     }
   }
 
+  // === ĐỔI NGÀY NGHỈ TUẦN NÀY ===
+  // Đơn có Chủ Nhật làm bù từ hôm nay trở đi (đơn đã qua hẳn thì không nhắc nữa)
+  for (const s of (swapRows || [])) {
+    const restISO = ymd(s.date);
+    const workISO = ymd(s.swap_work_date);
+    if (!restISO || !workISO) continue;
+    if (workISO < todayISO || restISO > weekEndISO) continue;
+    const emp = employees.find((e: any) => e.id === s.user_id);
+    if (!emp || emp.role === 'Admin') continue;
+    const statusLabel = s.status === 'PENDING' ? ' ⏳' : '';
+    swapThisWeek.push(`  • ${emp.name} - nghỉ T7 ${formatDate(new Date(restISO))}, làm bù CN ${formatDate(new Date(workISO))}${statusLabel}`);
+  }
+
   // === BUILD MESSAGE ===
   const sections: string[] = [];
 
   sections.push(`📋 <b>BÁO CÁO NGÀY ${formatDate(today)}</b>`);
-  sections.push(`📆 Dữ liệu ngày: <b>${formatDate(yesterday)}</b>`);
+  sections.push(`📆 Dữ liệu ngày: <b>${formatDate(yesterday)}</b>${swapSundayISO ? ` (+ CN ${formatDate(prevCalendarDay)} cho NV làm bù)` : ''}`);
   sections.push('');
 
   // Absent (nghỉ không phép) — hiển thị đầu tiên vì nghiêm trọng nhất
@@ -333,6 +459,13 @@ async function generateReport(): Promise<string> {
     sections.push('  Không có');
   }
 
+  // Swap rest day this week — chỉ hiện khi có, để báo cáo không dài thêm
+  if (swapThisWeek.length > 0) {
+    sections.push('');
+    sections.push(`🔁 <b>ĐỔI NGÀY NGHỈ TUẦN NÀY (nghỉ T7, làm bù CN)</b>`);
+    sections.push([...new Set(swapThisWeek)].join('\n'));
+  }
+
   sections.push('');
   sections.push('⏳ = Chờ duyệt');
 
@@ -355,16 +488,37 @@ export default async function handler(req: any, res: any) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
 
+  const envCheck = {
+    hasBotToken: !!process.env.TELEGRAM_BOT_TOKEN,
+    hasChatId: !!process.env.TELEGRAM_CHAT_ID,
+    hasServiceRole: !!process.env.SUPABASE_SERVICE_ROLE_KEY,
+    hasSupabaseUrl: !!process.env.VITE_SUPABASE_URL,
+    hasCronSecret: !!process.env.CRON_SECRET,
+  };
+
   try {
     const report = await generateReport();
 
     // Split if message too long (Telegram limit: 4096 chars)
+    let results: Array<{ ok: boolean; status: number; body: string }> = [];
     if (report.length > 4000) {
       const mid = report.lastIndexOf('\n\n', 2000);
-      await sendTelegram(report.substring(0, mid));
-      await sendTelegram(report.substring(mid));
+      results.push(await sendTelegram(report.substring(0, mid)));
+      results.push(await sendTelegram(report.substring(mid)));
     } else {
-      await sendTelegram(report);
+      results.push(await sendTelegram(report));
+    }
+
+    const allOk = results.every(r => r.ok);
+    if (!allOk) {
+      const failed = results.find(r => !r.ok)!;
+      return res.status(500).json({
+        error: 'Telegram send failed',
+        telegramStatus: failed.status,
+        telegramBody: failed.body,
+        env: envCheck,
+        reportLength: report.length,
+      });
     }
 
     return res.status(200).json({
@@ -372,11 +526,14 @@ export default async function handler(req: any, res: any) {
       message: 'Report sent to Telegram',
       timestamp: new Date().toISOString(),
       reportLength: report.length,
+      env: envCheck,
     });
   } catch (error: any) {
     console.error('Daily report error:', error);
     return res.status(500).json({
       error: error.message || 'Internal error',
+      stack: error.stack,
+      env: envCheck,
     });
   }
 }

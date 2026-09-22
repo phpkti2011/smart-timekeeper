@@ -1,8 +1,9 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { format, startOfMonth, subMonths } from 'date-fns';
 import { supabase } from '../utils/supabaseClient';
-import { UserProfile, AttendanceLog, OTRequest, LateRequest, SalaryAdvanceRequest, BonusFine, MonthlySalaryReport, Holiday, PayrollPeriod, PayrollDetail, OverrideLog, SalaryChange, LeaveRequest } from '../types';
+import { UserProfile, AttendanceLog, OTRequest, LateRequest, SalaryAdvanceRequest, BonusFine, MonthlySalaryReport, Holiday, PayrollPeriod, PayrollDetail, OverrideLog, SalaryChange, LeaveRequest, SwapRequest } from '../types';
 import { calculateMonthlySalary } from '../utils/salaryCalculator';
+import { isPayrollEmployee } from '../utils/employeeFilters';
 import { Download, Lock, CheckCircle, AlertTriangle, FileText, X, Gift, Users, Unlock, RotateCcw, Search, Clock } from 'lucide-react';
 import { BulkBonusModal } from './BulkBonusModal';
 import { ConfirmDialog } from './ConfirmDialog';
@@ -19,6 +20,7 @@ interface Props {
     holidays: Holiday[];
     salaryChanges: SalaryChange[];
     leaveRequests: LeaveRequest[];
+    swapRequests?: SwapRequest[];
     onBulkSaveBonus: (items: Omit<BonusFine, 'id'>[]) => Promise<void>;
     onDeleteBonusBatch: (ids: string[]) => Promise<void>;
     lockedMonths: string[];
@@ -36,6 +38,7 @@ export const AdminPayrollManagement: React.FC<Props> = ({
     holidays,
     salaryChanges,
     leaveRequests,
+    swapRequests = [],
     onBulkSaveBonus,
     onDeleteBonusBatch,
     lockedMonths,
@@ -77,12 +80,20 @@ export const AdminPayrollManagement: React.FC<Props> = ({
         if (onFetchMonthData) onFetchMonthData(selectedMonth);
     }, [selectedMonth, onFetchMonthData]);
 
+    // Nhân viên thuộc bảng lương của THÁNG ĐANG XEM (không phải của hôm nay):
+    // loại tài khoản chờ duyệt / bị khoá / Admin, và người đã rời trước tháng đó.
+    // Lọc theo kỳ nên bảng lương tháng cũ giữ nguyên đúng danh sách đã chốt.
+    const payrollEmployees = useMemo(
+        () => employees.filter(emp => emp.role !== 'Admin' && isPayrollEmployee(emp, selectedMonth)),
+        [employees, selectedMonth]
+    );
+
     // 2b. Generate Live Report for Selected Month
     useEffect(() => {
         const periodDetails: { empId: string; report: MonthlySalaryReport }[] = [];
         let total = 0;
 
-        employees.forEach(emp => {
+        payrollEmployees.forEach(emp => {
             const empBonuses = bonuses.filter(b => b.userId === emp.id);
             const empOverrides = overrides.filter(o => o.userId === emp.id);
 
@@ -98,7 +109,8 @@ export const AdminPayrollManagement: React.FC<Props> = ({
                 empOverrides,
                 holidays,
                 salaryChanges,
-                leaveRequests.filter(r => r.userId === emp.id)
+                leaveRequests.filter(r => r.userId === emp.id),
+                swapRequests.filter(r => r.userId === emp.id)
             );
 
             periodDetails.push({ empId: emp.id, report: salaryReport });
@@ -107,7 +119,7 @@ export const AdminPayrollManagement: React.FC<Props> = ({
 
         setReport({ details: periodDetails, totalSalary: total });
 
-    }, [selectedMonth, employees, logs, otRequests, lateRequests, advanceRequests, bonuses, holidays, salaryChanges, leaveRequests, overrides]);
+    }, [selectedMonth, payrollEmployees, logs, otRequests, lateRequests, advanceRequests, bonuses, holidays, salaryChanges, leaveRequests, swapRequests, overrides]);
 
     // Derive late warnings from salary report
     const lateWarnings = React.useMemo(() => {
@@ -132,7 +144,8 @@ export const AdminPayrollManagement: React.FC<Props> = ({
 
     // Helper: Kiểm tra nhân viên đã xác nhận lương
     const getConfirmationStatus = () => {
-        const activeEmployees = employees.filter(e => e.status === 'ACTIVE' && e.role !== 'Admin');
+        // Cùng bộ lọc với bảng lương để mẫu số luôn khớp số dòng đang hiển thị
+        const activeEmployees = payrollEmployees;
         const confirmedIds = new Set(
             bonuses
                 .filter(b =>
@@ -634,12 +647,13 @@ export const AdminPayrollManagement: React.FC<Props> = ({
             {/* View: Late Report */}
             {activeTab === 'LATE_REPORT' && (
                 <LateReport
-                    employees={employees}
+                    employees={payrollEmployees}
                     logs={logs}
                     lateRequests={lateRequests}
                     overrides={overrides || []}
                     holidays={holidays}
                     leaveRequests={leaveRequests}
+                    swapRequests={swapRequests}
                     selectedMonth={selectedMonth}
                     reportData={report?.details || null}
                 />
@@ -816,7 +830,7 @@ export const AdminPayrollManagement: React.FC<Props> = ({
             <BulkBonusModal
                 isOpen={isBulkBonusModalOpen}
                 onClose={() => setIsBulkBonusModalOpen(false)}
-                employees={employees}
+                employees={payrollEmployees}
                 onSave={onBulkSaveBonus}
                 existingBonuses={bonuses}
                 onDeleteBatch={onDeleteBonusBatch}

@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { startOfDay, addDays, isWithinInterval, startOfWeek, endOfWeek, isSameDay, format, isMonday } from 'date-fns';
 import { LeaveRequest, UserProfile } from '../types';
 import { CalendarOff, X, UserMinus, ChevronDown, ChevronUp } from 'lucide-react';
+import { isPaidText } from '../utils/leaveTypes';
 
 interface Props {
   leaveRequests: LeaveRequest[];
@@ -39,7 +40,7 @@ export const LeaveAlert: React.FC<Props> = ({ leaveRequests, employees, currentU
     const getLeaveInfo = (req: LeaveRequest): LeaveInfo => {
       const emp = employees.find(e => e.id === req.userId);
       const durationText = req.duration === 'MORNING' ? 'Ngh\u1EC9 s\u00E1ng' : req.duration === 'AFTERNOON' ? 'Ngh\u1EC9 chi\u1EC1u' : 'Ngh\u1EC9 c\u1EA3 ng\u00E0y';
-      const typeText = req.leaveType === 'PAID' ? 'c\u00F3 l\u01B0\u01A1ng' : 'kh\u00F4ng l\u01B0\u01A1ng';
+      const typeText = isPaidText(req.leaveType);
       const start = format(new Date(req.startDate), 'dd/MM');
       const end = format(new Date(req.endDate), 'dd/MM');
       const dateRange = isSameDay(new Date(req.startDate), new Date(req.endDate)) ? start : `${start} - ${end}`;

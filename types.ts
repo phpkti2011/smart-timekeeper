@@ -73,10 +73,9 @@ export interface UserProfile {
   allowance?: number;
   workDays?: string; // e.g., "1,2,3,4,5,6"
   contractType?: 'Hợp đồng chính thức' | 'Hợp đồng thử việc' | 'Part-time' | 'CTV';
-  contractDate?: string; // ISO Date string YYYY-MM-DD
-  leaveBalance?: number;
+  contractDate?: string; // Ngày vào làm / bắt đầu thử việc — mốc tính công và thâm niên
+  officialContractDate?: string | null; // Ngày ký HĐ chính thức — mốc tích luỹ phép năm
   insuranceSalary?: number;
-  lastLeaveIncrementDate?: Date; // Track when we last added monthly leave
   usedLeaveLegacy?: number; // Manually entered used leave
   resignationDate?: string | null; // ISO Date YYYY-MM-DD, null = still working
 }
@@ -99,6 +98,13 @@ export interface OTBreakdown {
   lunchMinutes: number;
   eveningMinutes: number;
   sundayMinutes: number;
+  /** Phút tăng ca khai theo khung giờ. Là MỘT BUCKET RIÊNG — cộng vào tổng phút. */
+  declaredMinutes: number;
+  /**
+   * Phút rơi vào khung đêm 22:00–06:00. Là TẬP CON của các bucket trên,
+   * KHÔNG phải số hạng — cộng nó vào tổng là đếm trùng.
+   */
+  nightMinutes: number;
   totalConvertedDays: number; // The "0.275 công" value
 }
 
@@ -111,7 +117,10 @@ export interface BaseRequestInfo {
   userRole: UserRole;
   createdAt?: Date; // Added
   processedAt?: Date; // Added
+  rejectionReason?: string | null;
 }
+
+export type OTLocation = 'OFFICE' | 'HOME';
 
 export interface OTRequest extends BaseRequestInfo {
   id: string;
@@ -119,6 +128,11 @@ export interface OTRequest extends BaseRequestInfo {
   shift: 'MORNING' | 'AFTERNOON';
   reason: string;
   status: RequestStatus;
+  // Khung giờ khai báo. CÓ ĐỦ cả hai thì số phút lấy theo khung giờ này;
+  // thiếu (đơn cũ) thì đơn chỉ là cờ mở khoá, phút suy từ giờ chấm công.
+  otStart?: string | null;   // 'HH:mm'
+  otEnd?: string | null;     // 'HH:mm'; <= otStart nghĩa là vắt qua nửa đêm
+  otLocation?: OTLocation;   // thiếu = OFFICE
 }
 
 export interface LateRequest extends BaseRequestInfo {
@@ -130,7 +144,14 @@ export interface LateRequest extends BaseRequestInfo {
 }
 
 // --- LEAVE TYPES ---
-export type LeaveType = 'PAID' | 'UNPAID';
+/**
+ * PAID     — phép năm, trừ quỹ, công ty trả lương.
+ * SPECIAL  — nghỉ chế độ công ty trả nguyên lương (cưới, tang — Điều 115 khoản 1).
+ * INSURANCE— nghỉ chế độ do BHXH chi trả (thai sản, khám thai, vợ sinh con).
+ *            Công ty trả 0 đồng nhưng KHÔNG phải nghỉ không lương và KHÔNG phải vắng.
+ * UNPAID   — nghỉ không hưởng lương (việc riêng, Điều 115 khoản 2).
+ */
+export type LeaveType = 'PAID' | 'UNPAID' | 'SPECIAL' | 'INSURANCE';
 export type LeaveDuration = 'FULL' | 'MORNING' | 'AFTERNOON';
 
 export interface LeaveRequest extends BaseRequestInfo {
@@ -150,6 +171,28 @@ export interface Holiday {
   duration?: 'FULL' | 'MORNING' | 'AFTERNOON'; // Added duration
 }
 
+// --- ĐỔI NGÀY NGHỈ HÀNG TUẦN ---
+/**
+ * Ngày nghỉ tuần mặc định là Chủ Nhật. Một đơn SWAP đã duyệt đổi ngày nghỉ tuần
+ * của RIÊNG nhân viên đó sang Thứ 7 cùng tuần:
+ *   - restDate (Thứ 7)  → ngày nghỉ tuần: công chuẩn 0, chấm công thì mọi phút ×2.0
+ *   - workDate (CN sau) → ngày làm việc thường: công chuẩn 1.0, OT ×1.5
+ * Chỉ đơn APPROVED có hiệu lực. Xem utils/restDay.ts.
+ */
+export type RestDayKind =
+  | 'SUNDAY'     // Chủ Nhật theo lịch, không có đơn đổi
+  | 'SWAP_REST'  // Thứ 7 đã đổi thành ngày nghỉ tuần
+  | 'SWAP_WORK'  // Chủ Nhật đã đổi thành ngày làm việc
+  | 'WORKDAY';   // Ngày làm việc bình thường
+
+export interface SwapRequest extends BaseRequestInfo {
+  id: string;
+  restDate: Date;   // Thứ 7 nghỉ bù (cột requests.date)
+  workDate: Date;   // Chủ Nhật làm bù = restDate + 1 (cột requests.swap_work_date)
+  reason: string;
+  status: RequestStatus;
+}
+
 export interface DailyStats {
   date: Date;
   standardWorkDays: number; // 0, 0.5, or 1.0
@@ -157,7 +200,15 @@ export interface DailyStats {
   isLate: boolean;
   isExcused: boolean; // True if late but approved
   lateMinutes: number;
+  /**
+   * Chủ Nhật THEO LỊCH — chỉ dùng cho nhãn/màu cột. Mọi quyết định về TIỀN
+   * (reset công chuẩn, hệ số ×2, gộp công tháng) phải nhìn isRestDay.
+   */
   isSunday: boolean;
+  /** Ngày nghỉ tuần THỰC TẾ sau khi áp đơn đổi ngày nghỉ đã duyệt. */
+  isRestDay: boolean;
+  restDayKind: RestDayKind;
+  swapRequest?: SwapRequest; // Đơn đổi đã duyệt chạm ngày này (nếu có)
   logs: AttendanceLog[];
   status: 'present' | 'absent' | 'leave' | 'holiday' | 'future';
   statusText?: string;

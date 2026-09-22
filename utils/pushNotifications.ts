@@ -91,11 +91,14 @@ export async function sendPushToAdmins(
   url: string = '/'
 ): Promise<void> {
   try {
+    // status NULL = hồ sơ cũ chưa có cột này, vẫn coi là đang hoạt động.
+    // resignation_date NULL = chưa nghỉ việc — người đã nghỉ không nhận đơn từ nội bộ nữa.
     const { data: admins } = await supabase
       .from('profiles')
       .select('id')
       .eq('role', 'Admin')
-      .eq('status', 'ACTIVE');
+      .or('status.eq.ACTIVE,status.is.null')
+      .is('resignation_date', null);
 
     if (admins) {
       for (const admin of admins) {
@@ -117,7 +120,8 @@ export async function sendPushToManagers(
       .from('profiles')
       .select('id')
       .in('role', ['Admin', 'Manager'])
-      .eq('status', 'ACTIVE');
+      .or('status.eq.ACTIVE,status.is.null')
+      .is('resignation_date', null);
 
     if (managers) {
       for (const mgr of managers) {

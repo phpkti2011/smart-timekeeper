@@ -12,9 +12,16 @@ import {
   pairedSunday, isSwapVoidedByHoliday, makeRestDayPredicate, toSwapRow, mapSwapRow, SWAP_DEFAULT_REASON
 } from '../utils/restDay';
 import { calculateDailyStats } from '../utils/attendanceCalculator';
-import { calculateMonthlySalary } from '../utils/salaryCalculator';
+import { calculateMonthlySalary, getVirtualBirthdayBonus } from '../utils/salaryCalculator';
 import { countLeaveDays, leaveDayMap, findOverlappingLeave } from '../utils/leaveTypes';
-import { AttendanceLog, AttendanceType, Holiday, LeaveRequest, SwapRequest, UserProfile } from '../types';
+import {
+  normalizeName, normalizePhone, validateName, validateDateOfBirth, validatePhone, warnPhonePrefix,
+  validateAvatarUrl, buildProfileChanges, describeProfileChanges, validateProfileRequest,
+  applyProfileChanges, revertProfileChanges, patchToColumns, mapProfileRow, toProfileRow,
+  computeCoverCrop, PROFILE_DEFAULT_REASON
+} from '../utils/profileChange';
+import { mapDirectoryRow, mapFullProfileRow } from '../utils/employeeFilters';
+import { AttendanceLog, AttendanceType, Holiday, LeaveRequest, SwapRequest, UserProfile, ProfileChangeRequest, ProfileChangeSet } from '../types';
 
 // calculateMonthlySalary in ra console.log debug — tắt cho gọn
 console.log = () => { };
@@ -304,4 +311,209 @@ test('leaveDayMap / findOverlappingLeave: T7 đã đổi không trừ phép, CN 
   const old = mkLeave(SUN, SUN, 'APPROVED', 'old');
   assert.equal(findOverlappingLeave('u1', { startDate: D(SUN), endDate: D(SUN), duration: 'FULL' }, [old], {}), null);
   assert.equal(findOverlappingLeave('u1', { startDate: D(SUN), endDate: D(SUN), duration: 'FULL' }, [old], { isRestDay: pred })?.id, 'old');
+});
+
+// ==================== ĐỔI THÔNG TIN CÁ NHÂN ====================
+const PEMP: UserProfile = { ...EMP, dateOfBirth: '1995-03-02', phone: '0912345678', avatar: 'https://old.example/a.jpg', contractDate: '2020-01-01' };
+const TODAY = '2025-11-05';
+
+const mkProfileReq = (changes: ProfileChangeSet, status: ProfileChangeRequest['status'] = 'PENDING', id = 'p1'): ProfileChangeRequest => ({
+  id, userId: 'u1', userName: EMP.name, userAvatar: '', userRole: EMP.role,
+  date: D(TODAY), changes, reason: PROFILE_DEFAULT_REASON, status, createdAt: new Date(`${TODAY}T14:30:00`)
+});
+
+test('normalizeName / normalizePhone', () => {
+  assert.equal(normalizeName('  Nguyễn   Văn  An '), 'Nguyễn Văn An');
+  assert.equal(normalizePhone('+84 912 345 678'), '0912345678');
+  assert.equal(normalizePhone('0084912345678'), '0912345678');
+  assert.equal(normalizePhone('84912345678'), '0912345678');
+  assert.equal(normalizePhone('091.234.5678'), '0912345678');
+  assert.equal(normalizePhone('(091) 234-5678'), '0912345678');
+});
+
+test('validateName: từng luật', () => {
+  assert.match(validateName('')!, /không được để trống/);
+  assert.match(validateName('An')!, /ít nhất 2 từ/);
+  assert.match(validateName('Nguyễn Văn An 123')!, /chỉ gồm chữ cái/);
+  assert.match(validateName('A'.repeat(30) + ' ' + 'B'.repeat(30))!, /quá dài/);
+  assert.equal(validateName('Nguyễn Văn An'), null);
+  assert.equal(validateName("Nguyễn O'Brien-Lê"), null);
+});
+
+test('validateDateOfBirth: từng luật', () => {
+  const o = { today: TODAY, contractDate: '2020-01-01' };
+  assert.match(validateDateOfBirth('', o)!, /không được để trống/);
+  assert.match(validateDateOfBirth('abc', o)!, /không hợp lệ/);
+  assert.match(validateDateOfBirth('2025-11-06', o)!, /quá khứ/);
+  assert.match(validateDateOfBirth('2025-11-05', o)!, /quá khứ/);
+  assert.match(validateDateOfBirth('2011-01-01', o)!, /14 tuổi/);   // chưa đủ 15
+  assert.equal(validateDateOfBirth('2010-11-05', o), null);          // đúng 15 tuổi hôm nay (biên)
+  assert.match(validateDateOfBirth('1949-01-01', o)!, /76 tuổi/);
+  assert.match(validateDateOfBirth('1995-03-02', { today: TODAY, contractDate: '1990-01-01' })!, /trước ngày vào làm/);
+  assert.equal(validateDateOfBirth('1995-03-02', o), null);
+});
+
+test('validatePhone / warnPhonePrefix', () => {
+  assert.equal(validatePhone(''), null);                               // rỗng = xoá số, hợp lệ
+  assert.match(validatePhone('091234567')!, /đúng 10 chữ số, hiện 9/);
+  assert.match(validatePhone('09123456789')!, /đúng 10 chữ số, hiện 11/);
+  assert.match(validatePhone('912345678a')!, /chỉ gồm chữ số/);
+  assert.match(validatePhone('1912345678')!, /bắt đầu bằng 0/);
+  assert.equal(validatePhone('+84 912 345 678'), null);
+  assert.equal(validatePhone('02838123456'), null);                    // số bàn 11 số
+  assert.equal(warnPhonePrefix('0912345678'), null);
+  assert.equal(warnPhonePrefix('0328123456'), null);
+  assert.equal(warnPhonePrefix('02838123456'), null);
+  assert.match(warnPhonePrefix('0612345678')!, /Đầu số 061x/);        // cảnh báo, không chặn
+});
+
+test('validateAvatarUrl: chỉ nhận https', () => {
+  assert.equal(validateAvatarUrl('https://x.supabase.co/storage/v1/object/public/avatars/u/pending-1.jpg'), null);
+  assert.match(validateAvatarUrl('http://x.example/a.jpg')!, /không hợp lệ/);
+  assert.match(validateAvatarUrl('javascript:alert(1)')!, /không hợp lệ/);
+  assert.match(validateAvatarUrl('')!, /không hợp lệ/);
+});
+
+test('buildProfileChanges: chỉ giữ trường THỰC SỰ đổi', () => {
+  const same = buildProfileChanges(PEMP, { name: PEMP.name, dateOfBirth: '1995-03-02', phone: '0912345678', avatar: PEMP.avatar });
+  assert.deepEqual(same, {});
+  // đổi mỗi khoảng trắng trong tên / định dạng SĐT → không phải thay đổi
+  const ws = buildProfileChanges(PEMP, { name: '  Nguyễn   Văn  Test ', dateOfBirth: '1995-03-02', phone: '+84 912 345 678', avatar: PEMP.avatar });
+  assert.deepEqual(ws, {});
+  const c = buildProfileChanges(PEMP, { name: 'Nguyễn Văn An', dateOfBirth: '1995-03-20', phone: '', avatar: 'https://new.example/b.jpg', avatarPath: 'u1/pending-1.jpg' });
+  assert.deepEqual(c.name, { old: PEMP.name, new: 'Nguyễn Văn An' });
+  assert.deepEqual(c.dateOfBirth, { old: '1995-03-02', new: '1995-03-20' });
+  assert.deepEqual(c.phone, { old: '0912345678', new: null });       // xoá trắng ≠ không đổi
+  assert.deepEqual(c.avatar, { old: PEMP.avatar, new: 'https://new.example/b.jpg', newPath: 'u1/pending-1.jpg' });
+});
+
+test('describeProfileChanges: "A → B", ngày dd/MM/yyyy, null hiện "Chưa có"', () => {
+  const lines = describeProfileChanges({
+    name: { old: 'A B', new: 'A C' },
+    dateOfBirth: { old: null, new: '1995-03-20' },
+    phone: { old: '0912345678', new: null },
+    avatar: { old: null, new: 'https://x/y.jpg' }
+  });
+  assert.deepEqual(lines, [
+    'Họ tên: A B → A C',
+    'Ngày sinh: Chưa có → 20/03/1995',
+    'Số điện thoại: 0912345678 → Chưa có',
+    'Ảnh đại diện: Chưa có → ảnh mới'
+  ]);
+});
+
+test('validateProfileRequest: hợp lệ, không có thay đổi, đã có đơn PENDING, excludeId, chuyển tiếp lỗi từng trường', () => {
+  const base = { userId: 'u1', today: TODAY, contractDate: '2020-01-01', existingRequests: [] as ProfileChangeRequest[] };
+  const c: ProfileChangeSet = { name: { old: 'A B', new: 'Nguyễn Văn An' } };
+  assert.equal(validateProfileRequest({ ...base, changes: c }), null);
+  assert.match(validateProfileRequest({ ...base, changes: {} })!, /Chưa có thay đổi/);
+  const pending = mkProfileReq({ phone: { old: null, new: '0912345678' } });
+  assert.match(validateProfileRequest({ ...base, changes: c, existingRequests: [pending] })!, /đang có một đề nghị/);
+  assert.equal(validateProfileRequest({ ...base, changes: c, existingRequests: [pending], excludeId: 'p1' }), null);
+  // Đơn APPROVED / REJECTED không chiếm chỗ
+  assert.equal(validateProfileRequest({ ...base, changes: c, existingRequests: [mkProfileReq(c, 'APPROVED'), mkProfileReq(c, 'REJECTED', 'p2')] }), null);
+  assert.match(validateProfileRequest({ ...base, changes: { name: { old: 'A B', new: 'An' } } })!, /ít nhất 2 từ/);
+  assert.match(validateProfileRequest({ ...base, changes: { dateOfBirth: { old: null, new: null } } })!, /không được để trống/);
+  assert.equal(validateProfileRequest({ ...base, changes: { phone: { old: '0912345678', new: null } } }), null); // xoá số là hợp lệ
+});
+
+test('applyProfileChanges: idempotent, bỏ qua trường đã trùng; patchToColumns đổi sang snake_case', () => {
+  const c: ProfileChangeSet = { name: { old: PEMP.name, new: 'Nguyễn Văn An' }, phone: { old: '0912345678', new: '0987654321' } };
+  const first = applyProfileChanges(PEMP, c);
+  assert.deepEqual(first.patch, { name: 'Nguyễn Văn An', phone: '0987654321' });
+  assert.deepEqual(first.skipped, []);
+  const second = applyProfileChanges({ ...PEMP, ...first.patch }, c);   // duyệt lần hai
+  assert.deepEqual(second.patch, {});
+  assert.deepEqual(second.skipped, ['name', 'phone']);
+  assert.deepEqual(
+    patchToColumns({ name: 'X', dateOfBirth: '1990-01-01', phone: null, avatar: 'u' }),
+    { name: 'X', date_of_birth: '1990-01-01', phone: null, avatar: 'u' }
+  );
+});
+
+test('revertProfileChanges: trả giá trị cũ; trường đã bị sửa tiếp thì bỏ qua', () => {
+  const c: ProfileChangeSet = { name: { old: PEMP.name, new: 'Nguyễn Văn An' }, phone: { old: '0912345678', new: '0987654321' } };
+  const applied = { ...PEMP, name: 'Nguyễn Văn An', phone: '0987654321' };
+  const r1 = revertProfileChanges(applied, c);
+  assert.deepEqual(r1.patch, { name: PEMP.name, phone: '0912345678' });
+  assert.deepEqual(r1.skipped, []);
+  const edited = { ...applied, phone: '0900000000' };                    // Admin sửa tiếp SĐT sau khi duyệt
+  const r2 = revertProfileChanges(edited, c);
+  assert.deepEqual(r2.patch, { name: PEMP.name });
+  assert.deepEqual(r2.skipped, ['phone']);
+});
+
+test('toProfileRow / mapProfileRow: ghi và đọc lại khớp nhau; chịu được JSON dạng chuỗi, null, khoá lạ', () => {
+  const c: ProfileChangeSet = { name: { old: 'A B', new: 'A C' }, avatar: { old: null, new: 'https://x/y.jpg', newPath: 'u1/pending-1.jpg' } };
+  const row = toProfileRow('u1', c, '  ', 'PENDING', TODAY);
+  assert.equal(row.type, 'PROFILE');
+  assert.equal(row.date, TODAY);
+  assert.equal(row.reason, PROFILE_DEFAULT_REASON);
+  assert.deepEqual(row.profile_changes, c);
+  const back = mapProfileRow({ ...row, id: 7, created_at: null, rejection_reason: null }, [{ id: 'u1', name: 'A', avatar: '', role: EMP.role }]);
+  assert.equal(back.id, '7');
+  assert.deepEqual(back.changes, c);
+  assert.equal(format(back.date, 'yyyy-MM-dd'), TODAY);
+  assert.equal(back.userName, 'A');
+  const fromString = mapProfileRow({ ...row, id: 8, profile_changes: JSON.stringify(c) }, []);
+  assert.deepEqual(fromString.changes, c);
+  const fromNull = mapProfileRow({ ...row, id: 9, profile_changes: null }, []);
+  assert.deepEqual(fromNull.changes, {});
+  const junk = mapProfileRow({ ...row, id: 10, profile_changes: { name: { old: 'a', new: 'b' }, hacker: { old: 1, new: 2 }, phone: 'not-an-object' } }, []);
+  assert.deepEqual(Object.keys(junk.changes), ['name']);
+});
+
+test('getVirtualBirthdayBonus: đổi ngày sinh làm thưởng nhảy sang tháng khác', () => {
+  const emp = { ...PEMP, contractDate: '2020-01-01' };
+  const cuT3 = getVirtualBirthdayBonus({ ...emp, dateOfBirth: '1995-03-02' }, D('2026-03-01'));
+  const cuT4 = getVirtualBirthdayBonus({ ...emp, dateOfBirth: '1995-03-02' }, D('2026-04-01'));
+  const moiT4 = getVirtualBirthdayBonus({ ...emp, dateOfBirth: '1995-04-20' }, D('2026-04-01'));
+  const moiT3 = getVirtualBirthdayBonus({ ...emp, dateOfBirth: '1995-04-20' }, D('2026-03-01'));
+  assert.ok(cuT3 && cuT3.amount > 0);
+  assert.equal(cuT4, null);
+  assert.ok(moiT4 && moiT4.amount > 0);
+  assert.equal(moiT3, null);
+  assert.equal(cuT3!.amount, moiT4!.amount);                            // cùng thâm niên → cùng mức
+  assert.equal(getVirtualBirthdayBonus({ ...emp, dateOfBirth: null }, D('2026-03-01')), null); // chính là bug cũ ở màn Lương
+});
+
+test('computeCoverCrop: cắt vuông căn giữa; ảnh nhỏ hơn đích thì không phóng to', () => {
+  assert.deepEqual(computeCoverCrop(1200, 800, 512), { sx: 200, sy: 0, sw: 800, sh: 800, dw: 512, dh: 512 });
+  assert.deepEqual(computeCoverCrop(800, 1200, 512), { sx: 0, sy: 200, sw: 800, sh: 800, dw: 512, dh: 512 });
+  assert.deepEqual(computeCoverCrop(300, 300, 512), { sx: 0, sy: 0, sw: 300, sh: 300, dw: 300, dh: 300 });
+});
+
+test('mapDirectoryRow: KHÔNG có lương (undefined, không phải 0), gắn cờ isDirectoryOnly', () => {
+  const d = mapDirectoryRow({ id: 'u2', name: 'B', avatar: null, role: 'Nhân Viên Sản Xuất', status: 'ACTIVE', employee_code: 'NV2', date_of_birth: '1990-01-01', resignation_date: null, base_salary: 99 });
+  assert.equal(d.isDirectoryOnly, true);
+  assert.equal(d.baseSalary, undefined);
+  assert.equal(d.allowance, undefined);
+  assert.equal(d.insuranceSalary, undefined);
+  assert.equal(d.phone, undefined);
+  assert.equal(d.email, undefined);
+  assert.equal(d.avatar, '');
+  assert.equal(d.dateOfBirth, '1990-01-01');
+});
+
+test('mapFullProfileRow: nạp đủ dateOfBirth / employeeCode / phone, ưu tiên email đăng nhập', () => {
+  const f = mapFullProfileRow(
+    { id: 'u1', name: 'A', avatar: '', role: 'Admin', email: 'db@x', phone: '0912345678', base_salary: 26000000, date_of_birth: '1995-03-02', employee_code: 'NV1' },
+    { email: 'auth@x', avatarUrl: 'https://meta/a.png' }
+  );
+  assert.equal(f.dateOfBirth, '1995-03-02');
+  assert.equal(f.employeeCode, 'NV1');
+  assert.equal(f.phone, '0912345678');
+  assert.equal(f.email, 'auth@x');
+  assert.equal(f.avatar, 'https://meta/a.png');
+  assert.equal(f.baseSalary, 26000000);
+  assert.equal(f.isDirectoryOnly, undefined);
+});
+
+test('chống tái phát: map dòng danh bạ bằng mapper ĐẦY ĐỦ rồi spread lên currentUser sẽ XOÁ lương', () => {
+  const me = mapFullProfileRow({ id: 'u1', name: 'A', role: 'Nhân Viên Sản Xuất', base_salary: 26000000 });
+  const dirRow = { id: 'u1', name: 'A', role: 'Nhân Viên Sản Xuất' };   // dòng employee_directory: không có base_salary
+  const wrong = { ...me, ...mapFullProfileRow(dirRow) };                // cách cũ: key baseSalary có mặt với undefined → ghi đè
+  assert.equal(wrong.baseSalary, undefined);
+  const right = { ...me, ...mapDirectoryRow(dirRow) };                   // mapDirectoryRow KHÔNG tạo key lương → không ghi đè
+  assert.equal(right.baseSalary, 26000000);
 });

@@ -68,6 +68,7 @@ export interface UserProfile {
   // Extended HR Fields
   dateOfBirth?: string | null; // ISO Date YYYY-MM-DD
   email?: string;
+  phone?: string | null; // Số di động, chuẩn hoá 10 số bắt đầu bằng 0. NULL = chưa khai.
   password?: string; // Replaced managerEmail
   baseSalary?: number;
   allowance?: number;
@@ -78,6 +79,12 @@ export interface UserProfile {
   insuranceSalary?: number;
   usedLeaveLegacy?: number; // Manually entered used leave
   resignationDate?: string | null; // ISO Date YYYY-MM-DD, null = still working
+  /**
+   * Hồ sơ RÚT GỌN từ view employee_directory: không có lương, email, số điện
+   * thoại. Nhân viên thường chỉ nhận dạng này cho đồng nghiệp. KHÔNG BAO GIỜ
+   * đưa hồ sơ dạng này vào calculateMonthlySalary.
+   */
+  isDirectoryOnly?: boolean;
 }
 
 export interface SalaryChange {
@@ -189,6 +196,33 @@ export interface SwapRequest extends BaseRequestInfo {
   id: string;
   restDate: Date;   // Thứ 7 nghỉ bù (cột requests.date)
   workDate: Date;   // Chủ Nhật làm bù = restDate + 1 (cột requests.swap_work_date)
+  reason: string;
+  status: RequestStatus;
+}
+
+// --- ĐỔI THÔNG TIN CÁ NHÂN ---
+/**
+ * Nhân viên ĐỀ NGHỊ sửa 4 trường; Admin duyệt thì App mới ghi vào profiles.
+ * Nội dung nằm ở cột JSONB requests.profile_changes: mỗi trường có đổi là một
+ * entry {old, new}. Lưu "old" để màn duyệt hiện "A → B" và để hoàn tác được.
+ * Xem utils/profileChange.ts.
+ */
+export type ProfileField = 'name' | 'dateOfBirth' | 'phone' | 'avatar';
+
+export interface ProfileFieldChange {
+  old: string | null;
+  new: string | null;
+  /** Chỉ avatar: đường dẫn object trên Storage (uid/pending-ts.jpg) để xoá khi từ chối. */
+  newPath?: string;
+}
+
+/** Trường không đổi thì KHÔNG có mặt (khác với new = null nghĩa là xoá trắng). */
+export type ProfileChangeSet = Partial<Record<ProfileField, ProfileFieldChange>>;
+
+export interface ProfileChangeRequest extends BaseRequestInfo {
+  id: string;
+  date: Date;              // requests.date — ngày gửi, để sắp xếp / lọc tháng
+  changes: ProfileChangeSet;
   reason: string;
   status: RequestStatus;
 }

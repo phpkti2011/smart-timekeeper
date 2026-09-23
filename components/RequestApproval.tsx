@@ -1,12 +1,13 @@
 
 import React, { useState } from 'react';
 import { format, isSameMonth, startOfMonth, subMonths, addMonths } from 'date-fns';
-import { OTRequest, LateRequest, SalaryAdvanceRequest, RequestStatus, LeaveRequest, SwapRequest, Holiday } from '../types';
-import { FileCheck, Check, XCircle, Clock, Filter, CheckCircle2, XCircle as XIcon, AlertTriangle, RotateCcw, DollarSign, Calendar, ChevronLeft, ChevronRight, CheckSquare, Square, Layers, Moon, Trash2, Repeat } from 'lucide-react';
+import { OTRequest, LateRequest, SalaryAdvanceRequest, RequestStatus, LeaveRequest, SwapRequest, Holiday, ProfileChangeRequest, UserProfile } from '../types';
+import { FileCheck, Check, XCircle, Clock, Filter, CheckCircle2, XCircle as XIcon, AlertTriangle, RotateCcw, DollarSign, Calendar, ChevronLeft, ChevronRight, CheckSquare, Square, Layers, Moon, Trash2, Repeat, UserCog } from 'lucide-react';
 import { splitOTRange } from '../utils/otRules';
 import { OT_LOCATION_LABEL } from '../utils/otDisplay';
 import { LEAVE_TYPE_LABEL, getLeaveBadgeClass } from '../utils/leaveTypes';
 import { isSwapVoidedByHoliday } from '../utils/restDay';
+import { describeProfileChanges, PROFILE_DEFAULT_REASON } from '../utils/profileChange';
 
 interface Props {
   otRequests: OTRequest[];
@@ -14,6 +15,9 @@ interface Props {
   advanceRequests?: SalaryAdvanceRequest[];
   leaveRequests?: LeaveRequest[];
   swapRequests?: SwapRequest[];
+  profileRequests?: ProfileChangeRequest[];
+  /** Để cảnh báo số điện thoại trùng với nhân viên khác ngay trong thẻ đơn */
+  employees?: UserProfile[];
   /** Để gắn nhãn "vô hiệu" cho đơn đổi ngày nghỉ trùng ngày lễ thêm sau khi duyệt */
   holidays?: Holiday[];
   onUpdateOtStatus: (id: string, status: RequestStatus, reason?: string) => void;
@@ -21,8 +25,9 @@ interface Props {
   onUpdateAdvanceStatus?: (id: string, status: RequestStatus, reason?: string) => void;
   onUpdateLeaveStatus?: (id: string, status: RequestStatus, reason?: string) => void;
   onUpdateSwapStatus?: (id: string, status: RequestStatus, reason?: string) => void;
+  onUpdateProfileStatus?: (id: string, status: RequestStatus, reason?: string) => void;
   /** Xoá hẳn đơn — dùng cho đơn nhập trùng / nhập nhầm. Chỉ truyền vào khi là Admin. */
-  onDeleteRequest?: (id: string, type: 'LEAVE' | 'OT' | 'LATE' | 'ADVANCE' | 'SWAP') => void;
+  onDeleteRequest?: (id: string, type: 'LEAVE' | 'OT' | 'LATE' | 'ADVANCE' | 'SWAP' | 'PROFILE') => void;
 }
 
 type CombinedRequest =
@@ -30,9 +35,10 @@ type CombinedRequest =
   | ({ type: 'LATE' } & LateRequest)
   | ({ type: 'ADVANCE' } & SalaryAdvanceRequest)
   | ({ type: 'LEAVE'; date: Date } & LeaveRequest)
-  | ({ type: 'SWAP'; date: Date } & SwapRequest);
+  | ({ type: 'SWAP'; date: Date } & SwapRequest)
+  | ({ type: 'PROFILE' } & ProfileChangeRequest);
 
-type RequestTypeFilter = 'ALL' | 'LEAVE' | 'OT' | 'LATE' | 'ADVANCE' | 'SWAP';
+type RequestTypeFilter = 'ALL' | 'LEAVE' | 'OT' | 'LATE' | 'ADVANCE' | 'SWAP' | 'PROFILE';
 
 export const RequestApproval: React.FC<Props> = ({
   otRequests,
@@ -40,12 +46,15 @@ export const RequestApproval: React.FC<Props> = ({
   advanceRequests = [],
   leaveRequests = [],
   swapRequests = [],
+  profileRequests = [],
+  employees = [],
   holidays = [],
   onUpdateOtStatus,
   onUpdateLateStatus,
   onUpdateAdvanceStatus,
   onUpdateLeaveStatus,
   onUpdateSwapStatus,
+  onUpdateProfileStatus,
   onDeleteRequest
 }) => {
   const [filter, setFilter] = useState<'PENDING' | 'PROCESSED'>('PENDING');
@@ -66,7 +75,9 @@ export const RequestApproval: React.FC<Props> = ({
     ...advanceRequests.map(r => ({ ...r, type: 'ADVANCE' as const })),
     ...leaveRequests.map(r => ({ ...r, type: 'LEAVE' as const, date: r.startDate })),
     // Sắp xếp / lọc theo tháng bằng Thứ 7 nghỉ bù
-    ...swapRequests.map(r => ({ ...r, type: 'SWAP' as const, date: r.restDate }))
+    ...swapRequests.map(r => ({ ...r, type: 'SWAP' as const, date: r.restDate })),
+    // Đơn đổi thông tin đã có sẵn cột date = ngày gửi
+    ...profileRequests.map(r => ({ ...r, type: 'PROFILE' as const }))
   ];
 
   const pendingRequests = combinedList.filter(r => r.status === 'PENDING').sort((a, b) => b.date.getTime() - a.date.getTime());
@@ -100,6 +111,7 @@ export const RequestApproval: React.FC<Props> = ({
     else if (req.type === 'ADVANCE' && onUpdateAdvanceStatus) onUpdateAdvanceStatus(req.id, status, reason);
     else if (req.type === 'LEAVE' && onUpdateLeaveStatus) onUpdateLeaveStatus(req.id, status, reason);
     else if (req.type === 'SWAP' && onUpdateSwapStatus) onUpdateSwapStatus(req.id, status, reason);
+    else if (req.type === 'PROFILE' && onUpdateProfileStatus) onUpdateProfileStatus(req.id, status, reason);
   };
 
   // Reject with reason
@@ -196,6 +208,7 @@ export const RequestApproval: React.FC<Props> = ({
             { id: 'LATE', label: 'Đi trễ' },
             { id: 'ADVANCE', label: 'Ứng lương' },
             { id: 'SWAP', label: 'Đổi ngày nghỉ' },
+            { id: 'PROFILE', label: 'Đổi thông tin' },
           ].map((tab) => {
             const count = getCount(pList, tab.id as RequestTypeFilter);
             return (
@@ -281,7 +294,8 @@ export const RequestApproval: React.FC<Props> = ({
               <div className={`absolute left-0 top-0 bottom-0 w-1 ${req.type === 'OT' ? 'bg-indigo-500' :
                 req.type === 'LATE' ? 'bg-red-500' :
                   req.type === 'LEAVE' ? 'bg-green-500' :
-                    req.type === 'SWAP' ? 'bg-violet-500' : 'bg-teal-500'
+                    req.type === 'SWAP' ? 'bg-violet-500' :
+                      req.type === 'PROFILE' ? 'bg-pink-500' : 'bg-teal-500'
                 }`}></div>
 
               {/* User Info Header */}
@@ -314,6 +328,10 @@ export const RequestApproval: React.FC<Props> = ({
                   ) : req.type === 'SWAP' ? (
                     <span className="text-[10px] font-bold px-2 py-1 rounded-md uppercase tracking-wide bg-violet-50 text-violet-600 border border-violet-200 flex items-center gap-1">
                       <Repeat size={10} /> Đổi ngày nghỉ
+                    </span>
+                  ) : req.type === 'PROFILE' ? (
+                    <span className="text-[10px] font-bold px-2 py-1 rounded-md uppercase tracking-wide bg-pink-50 text-pink-600 border border-pink-200 flex items-center gap-1">
+                      <UserCog size={10} /> Đổi thông tin
                     </span>
                   ) : (
                     <span className="text-[10px] font-bold px-2 py-1 rounded-md uppercase tracking-wide bg-teal-50 text-teal-600 flex items-center gap-1">
@@ -415,9 +433,46 @@ export const RequestApproval: React.FC<Props> = ({
                 </div>
               )}
 
+              {req.type === 'PROFILE' && (() => {
+                const newPhone = req.changes.phone?.new;
+                const dupPhone = newPhone
+                  ? employees.find(e => e.id !== req.userId && !!e.phone && e.phone === newPhone)
+                  : undefined;
+                const lines = describeProfileChanges(req.changes);
+                return (
+                  <div className="mb-3 relative z-10 text-xs text-gray-700 bg-pink-50/60 border border-pink-100 p-2.5 rounded-lg space-y-1">
+                    {lines.length === 0 && <div className="text-gray-400 italic">(không có nội dung)</div>}
+                    {lines.map(l => (
+                      <div key={l} className="flex items-start gap-1"><span className="text-pink-500">•</span><span>{l}</span></div>
+                    ))}
+                    {req.changes.avatar?.new && (
+                      <div className="flex items-center gap-2 pt-1">
+                        <img src={req.changes.avatar.old || `https://ui-avatars.com/api/?name=${encodeURIComponent(req.userName)}`} className="w-10 h-10 rounded-full object-cover border bg-white" alt="" />
+                        <span className="text-gray-400">→</span>
+                        <img src={req.changes.avatar.new} className="w-10 h-10 rounded-full object-cover border-2 border-pink-300 bg-white" alt="" />
+                      </div>
+                    )}
+                    {req.changes.dateOfBirth && req.status === 'PENDING' && (
+                      <div className="flex items-center gap-1 text-amber-700 font-semibold pt-1 border-t border-pink-100">
+                        <AlertTriangle size={11} /> Đổi ngày sinh ảnh hưởng thưởng sinh nhật. Khi duyệt sẽ hiện số tiền cụ thể.
+                      </div>
+                    )}
+                    {dupPhone && (
+                      <div className="flex items-center gap-1 text-red-700 font-semibold pt-1 border-t border-pink-100">
+                        <AlertTriangle size={11} /> Số {newPhone} đang thuộc về {dupPhone.name}. Duyệt sẽ bị cơ sở dữ liệu từ chối.
+                      </div>
+                    )}
+                    <div className="text-[10px] text-gray-500 pt-1 border-t border-pink-100">
+                      Duyệt = ghi thẳng vào hồ sơ nhân viên. Từ chối = không đổi gì.
+                    </div>
+                  </div>
+                );
+              })()}
+
               {/* Đơn đổi ngày nghỉ không có ô lý do (công ty xếp lịch) nên khối
-                  chi tiết bên trên đã nói đủ, không hiện dòng trích dẫn nữa. */}
-              {req.type !== 'SWAP' && (
+                  chi tiết bên trên đã nói đủ, không hiện dòng trích dẫn nữa.
+                  Đơn đổi thông tin chỉ hiện khi nhân viên có ghi chú thật. */}
+              {req.type !== 'SWAP' && !(req.type === 'PROFILE' && req.reason === PROFILE_DEFAULT_REASON) && (
                 <div className="mb-4 relative z-10">
                   <p className="text-sm text-gray-800 font-medium leading-relaxed bg-gray-50 p-3 rounded-xl border border-gray-100 italic">
                     "{req.reason}"
@@ -481,10 +536,12 @@ export const RequestApproval: React.FC<Props> = ({
                       else if (req.type === 'ADVANCE' && onUpdateAdvanceStatus) onUpdateAdvanceStatus(req.id, 'PENDING');
                       else if (req.type === 'LEAVE' && onUpdateLeaveStatus) onUpdateLeaveStatus(req.id, 'PENDING');
                       else if (req.type === 'SWAP' && onUpdateSwapStatus) onUpdateSwapStatus(req.id, 'PENDING');
+                      else if (req.type === 'PROFILE' && onUpdateProfileStatus) onUpdateProfileStatus(req.id, 'PENDING');
                     }}
                     className="text-xs font-bold text-gray-500 hover:text-gray-800 bg-gray-100 hover:bg-gray-200 px-3 py-2 rounded-lg transition-colors flex items-center gap-1.5 active:scale-95 cursor-pointer shadow-sm border border-gray-200"
+                    title={req.type === 'PROFILE' && req.status === 'APPROVED' ? 'Trả hồ sơ về giá trị cũ rồi mở lại đơn' : undefined}
                   >
-                    <RotateCcw size={14} /> Hoàn duyệt
+                    <RotateCcw size={14} /> {req.type === 'PROFILE' && req.status === 'APPROVED' ? 'Hoàn tác & mở lại đơn' : 'Hoàn duyệt'}
                   </button>
                 </div>
               )}

@@ -85,50 +85,56 @@ export async function sendPushToUser(
   }
 }
 
+/**
+ * Danh sách id Admin đang hoạt động — người nhận thông báo khi có đơn mới.
+ *
+ * Đọc từ VIEW employee_directory chứ không phải bảng profiles: hàm này do
+ * NHÂN VIÊN THƯỜNG gọi lúc gửi đơn, mà sau khi siết RLS họ chỉ còn đọc được
+ * dòng profiles của chính mình → lọc role='Admin' sẽ trả rỗng và Admin
+ * ngừng nhận thông báo IM LẶNG. View chưa tồn tại (chưa chạy
+ * restrict_profile_salary_access.sql) thì lùi về profiles.
+ *
+ * status NULL = hồ sơ cũ chưa có cột này, vẫn coi là đang hoạt động.
+ * resignation_date NULL = chưa nghỉ việc.
+ */
+async function activeAdminIds(): Promise<string[]> {
+  const pick = (rows: { id: string }[] | null) => (rows || []).map(r => r.id);
+
+  const { data, error } = await supabase
+    .from('employee_directory')
+    .select('id')
+    .eq('role', 'Admin')
+    .or('status.eq.ACTIVE,status.is.null')
+    .is('resignation_date', null);
+  if (!error) return pick(data);
+
+  const fb = await supabase
+    .from('profiles')
+    .select('id')
+    .eq('role', 'Admin')
+    .or('status.eq.ACTIVE,status.is.null')
+    .is('resignation_date', null);
+  return pick(fb.data);
+}
+
+/** Gửi cho mọi Admin đang hoạt động. Chỉ Admin — Quản Lý Sản Xuất không duyệt được đơn nào. */
 export async function sendPushToAdmins(
   title: string,
   body: string,
   url: string = '/'
 ): Promise<void> {
   try {
-    // status NULL = hồ sơ cũ chưa có cột này, vẫn coi là đang hoạt động.
-    // resignation_date NULL = chưa nghỉ việc — người đã nghỉ không nhận đơn từ nội bộ nữa.
-    const { data: admins } = await supabase
-      .from('profiles')
-      .select('id')
-      .eq('role', 'Admin')
-      .or('status.eq.ACTIVE,status.is.null')
-      .is('resignation_date', null);
-
-    if (admins) {
-      for (const admin of admins) {
-        sendPushToUser(admin.id, title, body, url);
-      }
+    for (const id of await activeAdminIds()) {
+      sendPushToUser(id, title, body, url);
     }
   } catch (err) {
     console.error('Failed to send push to admins:', err);
   }
 }
 
-export async function sendPushToManagers(
-  title: string,
-  body: string,
-  url: string = '/'
-): Promise<void> {
-  try {
-    const { data: managers } = await supabase
-      .from('profiles')
-      .select('id')
-      .in('role', ['Admin', 'Manager'])
-      .or('status.eq.ACTIVE,status.is.null')
-      .is('resignation_date', null);
-
-    if (managers) {
-      for (const mgr of managers) {
-        sendPushToUser(mgr.id, title, body, url);
-      }
-    }
-  } catch (err) {
-    console.error('Failed to send push to managers:', err);
-  }
-}
+/**
+ * Tên cũ, giữ để không phải sửa 7 chỗ gọi. Trước đây lọc ['Admin','Manager']
+ * nhưng 'Manager' không phải giá trị trong UserRole nên thực tế chỉ Admin nhận;
+ * nay gọi thẳng sendPushToAdmins cho đúng với thực tế.
+ */
+export const sendPushToManagers = sendPushToAdmins;

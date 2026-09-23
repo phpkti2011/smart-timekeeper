@@ -297,6 +297,9 @@ export const AdminEmployeeDetail: React.FC<Props> = ({
                   </h1>
                   <div className="flex items-center gap-2">
                     <p className="text-slate-400 text-xs sm:text-sm truncate max-w-[150px]">{employee.role}</p>
+                    {employee.phone && (
+                      <span className="text-[10px] text-slate-300 bg-slate-700/50 px-1.5 py-0.5 rounded">📞 {employee.phone}</span>
+                    )}
                     <span className="text-[10px] text-slate-500 bg-slate-700/50 px-1.5 py-0.5 rounded">Logs: {employeeLogs.length}</span>
                   </div>
                 </div>

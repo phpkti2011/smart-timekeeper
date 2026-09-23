@@ -1,13 +1,16 @@
 import React, { useState } from 'react';
 import { createPortal } from 'react-dom';
 import { UserProfile, UserRole, UserStatus, LeaveRequest, Holiday, SwapRequest } from '../types';
-import { Users, Search, Plus, Edit2, Trash2, X, Calendar, Eye, DollarSign, CheckCircle2, Lock, Undo, UserMinus } from 'lucide-react';
+import { Users, Search, Plus, Edit2, Trash2, X, Calendar, Eye, DollarSign, CheckCircle2, Lock, Undo, UserMinus, Camera } from 'lucide-react';
 import { accruesAnnualLeave, getAccruedLeaveThisYear, getPaidLeaveUsedThisYear, getRemainingLeave } from '../utils/leaveTypes';
 import { differenceInYears, format } from 'date-fns';
 import { parseVNDate, formatVNDate } from '../utils/dateInput';
 import { AdminLeaveManagement } from './AdminLeaveManagement';
 import { isWorkingEmployee } from '../utils/employeeFilters';
 import { makeRestDayPredicate } from '../utils/restDay';
+import { validatePhone, normalizePhone } from '../utils/profileChange';
+import { compressAvatar, validateImageFile } from '../utils/imageResize';
+import { uploadFinalAvatar } from '../utils/avatarStorage';
 
 interface Props {
   employees: UserProfile[];
@@ -48,6 +51,7 @@ export const EmployeeManagement: React.FC<Props> = ({ employees, onAdd, onEdit, 
     role: 'Nhân Viên Sản Xuất',
     avatar: '',
     email: '',
+    phone: '',
     password: '',
     baseSalary: 0,
     allowance: 0,
@@ -60,6 +64,10 @@ export const EmployeeManagement: React.FC<Props> = ({ employees, onAdd, onEdit, 
     status: 'ACTIVE',
     dateOfBirth: ''
   });
+
+  // Ảnh đại diện — Admin đổi được cho nhân viên, ghi thẳng không qua đơn
+  const avatarFileRef = React.useRef<HTMLInputElement>(null);
+  const [avatarBusy, setAvatarBusy] = useState(false);
 
   // Date Input Refs
   const dobInputRef = React.useRef<HTMLInputElement>(null);
@@ -125,8 +133,9 @@ export const EmployeeManagement: React.FC<Props> = ({ employees, onAdd, onEdit, 
       id: crypto.randomUUID(),
       employeeCode: '',
       role: 'Nhân Viên Sản Xuất',
-      avatar: `https://picsum.photos/seed/${Date.now()}/100/100`,
+      avatar: '', // để trống → lúc lưu tự sinh ảnh chữ cái theo tên (trước đây là ảnh phong cảnh ngẫu nhiên từ picsum)
       email: '',
+      phone: '',
       password: '',
       baseSalary: 0,
       allowance: 0,
@@ -153,7 +162,8 @@ export const EmployeeManagement: React.FC<Props> = ({ employees, onAdd, onEdit, 
       insuranceSalary: emp.insuranceSalary || 0,
       usedLeaveLegacy: emp.usedLeaveLegacy || 0,
       status: emp.status || 'ACTIVE',
-      dateOfBirth: emp.dateOfBirth || ''
+      dateOfBirth: emp.dateOfBirth || '',
+      phone: emp.phone || ''
     });
     setIsModalOpen(true);
   };
@@ -162,6 +172,27 @@ export const EmployeeManagement: React.FC<Props> = ({ employees, onAdd, onEdit, 
     onEdit({ ...emp, status: 'ACTIVE' });
   };
 
+  const handleAdminPickAvatar = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const f = e.target.files?.[0];
+    e.target.value = '';
+    if (!f || !formData.id) return;
+    const err = validateImageFile(f);
+    if (err) { alert(err); return; }
+    setAvatarBusy(true);
+    try {
+      const blob = await compressAvatar(f);
+      const up = await uploadFinalAvatar(formData.id, blob);
+      setFormData(prev => ({ ...prev, avatar: up.url }));
+    } catch (err: any) {
+      alert(err?.message || 'Không tải được ảnh.');
+    } finally {
+      setAvatarBusy(false);
+    }
+  };
+
+  const letterAvatar = (name?: string) =>
+    `https://ui-avatars.com/api/?name=${encodeURIComponent(name || 'NV')}&background=random`;
+
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (!formData.name) {
@@ -169,8 +200,17 @@ export const EmployeeManagement: React.FC<Props> = ({ employees, onAdd, onEdit, 
       return;
     }
 
+    const phoneError = validatePhone(formData.phone || '');
+    if (phoneError) {
+      alert(phoneError);
+      return;
+    }
+
     const processedData: UserProfile = {
       ...(formData as UserProfile),
+      // Luôn ghi dạng chuẩn hoá (0912345678) để unique index ở DB có nghĩa
+      phone: normalizePhone(formData.phone || '') || null,
+      avatar: formData.avatar || letterAvatar(formData.name),
       baseSalary: Number(formData.baseSalary),
       allowance: Number(formData.allowance),
       insuranceSalary: Number(formData.insuranceSalary),
@@ -442,6 +482,32 @@ export const EmployeeManagement: React.FC<Props> = ({ employees, onAdd, onEdit, 
               </button>
             </div>
             <form onSubmit={handleSubmit} className="p-6 pt-2 space-y-5 overflow-y-auto no-scrollbar">
+              {/* Ảnh đại diện — trước đây không ai đổi được, NV do Admin tạo nhận ảnh phong cảnh ngẫu nhiên */}
+              <div className="flex items-center gap-4">
+                <img
+                  src={formData.avatar || letterAvatar(formData.name)}
+                  alt="avatar"
+                  className="w-16 h-16 rounded-full object-cover border-2 border-gray-200 bg-gray-100 shrink-0"
+                />
+                <div className="flex flex-wrap gap-2">
+                  <button
+                    type="button"
+                    disabled={avatarBusy}
+                    onClick={() => avatarFileRef.current?.click()}
+                    className="text-xs font-bold px-3 py-2 rounded-lg bg-blue-600 text-white hover:bg-blue-700 active:scale-95 transition flex items-center gap-1.5 disabled:opacity-50"
+                  >
+                    <Camera size={14} /> {avatarBusy ? 'Đang tải…' : 'Đổi ảnh'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setFormData(prev => ({ ...prev, avatar: letterAvatar(prev.name) }))}
+                    className="text-xs font-bold px-3 py-2 rounded-lg bg-gray-100 text-gray-700 hover:bg-gray-200 active:scale-95 transition"
+                  >
+                    Dùng ảnh chữ cái
+                  </button>
+                  <input ref={avatarFileRef} type="file" accept="image/jpeg,image/png,image/webp" className="hidden" onChange={handleAdminPickAvatar} />
+                </div>
+              </div>
               <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                 <div>
                   <label className="block text-sm text-gray-600 mb-1.5">Mã NV</label>
@@ -491,7 +557,7 @@ export const EmployeeManagement: React.FC<Props> = ({ employees, onAdd, onEdit, 
                   </div>
                 </div>
               </div>
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                 <div>
                   <label className="block text-sm text-gray-600 mb-1.5">Email (dùng đăng nhập)</label>
                   <input
@@ -500,6 +566,16 @@ export const EmployeeManagement: React.FC<Props> = ({ employees, onAdd, onEdit, 
                     onChange={(e) => setFormData({ ...formData, email: e.target.value })}
                     className="w-full px-4 py-2.5 bg-white text-gray-900 border border-gray-200 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm"
                     placeholder="nv@gmail.com"
+                  />
+                </div>
+                <div>
+                  <label className="block text-sm text-gray-600 mb-1.5">Số điện thoại</label>
+                  <input
+                    type="tel"
+                    value={formData.phone || ''}
+                    onChange={(e) => setFormData({ ...formData, phone: e.target.value })}
+                    className="w-full px-4 py-2.5 bg-white text-gray-900 border border-gray-200 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm"
+                    placeholder="0912345678"
                   />
                 </div>
                 <div>

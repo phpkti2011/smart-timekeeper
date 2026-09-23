@@ -1,6 +1,6 @@
 # 📋 TÀI LIỆU QUY CÁCH, LOGIC & NGUYÊN TẮC PHẦN MỀM CHẤM CÔNG P&D
 
-> **Phiên bản:** 4.1 | **Cập nhật:** 22/09/2026  
+> **Phiên bản:** 4.2 | **Cập nhật:** 23/09/2026  
 > **Công nghệ:** React + TypeScript + Vite + Supabase (PostgreSQL) + Gemini AI  
 > **Tác giả:** Phạm Hồng Phúc
 
@@ -15,6 +15,7 @@
 5. [Quy tắc đi trễ](#5-quy-tắc-đi-trễ)
 6. [Nghỉ phép](#6-nghỉ-phép)
    - [6b. Đổi ngày nghỉ hàng tuần](#6b-đổi-ngày-nghỉ-hàng-tuần)
+   - [6c. Đổi thông tin cá nhân](#6c-đổi-thông-tin-cá-nhân)
 7. [Ngày lễ](#7-ngày-lễ)
 8. [Tính lương](#8-tính-lương)
 9. [Thưởng / Phạt](#9-thưởng--phạt)
@@ -53,12 +54,14 @@
 | `profiles` | Thông tin nhân viên |
 | `attendance_logs` | Log chấm công |
 | `attendance_overrides` | Điều chỉnh công thủ công |
-| `requests` | Đơn OT / Trễ / Nghỉ phép / Ứng lương / Đổi ngày nghỉ (`SWAP`) |
+| `requests` | Đơn OT / Trễ / Nghỉ phép / Ứng lương / Đổi ngày nghỉ (`SWAP`) / Đổi thông tin cá nhân (`PROFILE`) |
 | `bonuses` | Thưởng / Phạt |
 | `holidays` | Ngày lễ |
 | `salary_changes` | Lịch sử thay đổi lương |
 | `payroll_periods` | Bảng lương đã chốt |
 | `settings` | Cấu hình GPS/IP công ty |
+| `employee_directory` | **VIEW** danh bạ rút gọn (8 cột: id, tên, ảnh, chức vụ, trạng thái, mã NV, ngày sinh, ngày nghỉ việc — **không** lương/email/SĐT). Nhân viên thường đọc đồng nghiệp qua đây. Xem mục 2. |
+| Storage `avatars` | Bucket **công khai** chứa ảnh đại diện: `{uid}/pending-{ts}.jpg` (chờ duyệt) và `{uid}/{ts}.jpg` (đã duyệt / Admin đổi). Xem mục 6c. |
 
 ---
 
@@ -83,7 +86,44 @@
 
 ### Phân quyền
 - **Admin**: Toàn quyền (duyệt đơn, quản lý nhân sự, cấu hình, bypass GPS, chốt lương).
-- **Nhân viên thường**: Chỉ xem/chấm công/gửi đơn của chính mình.
+- **Nhân viên thường**: Chỉ xem/chấm công/gửi đơn của chính mình. Xem và **đề nghị sửa**
+  hồ sơ cá nhân (mục 6c); mọi thay đổi phải Admin duyệt.
+- **Quản Lý Sản Xuất**: về dữ liệu giống nhân viên thường — **không** xem được lương của ai
+  (họ chỉ cần biết ai nghỉ, thông tin đó nằm ở bảng đơn từ).
+
+### Ai đọc được gì (RLS — từ 4.2, cần chạy `restrict_profile_salary_access.sql`)
+Trước 4.2 mọi nhân viên đăng nhập đều tải về `profiles.select('*')` của cả công ty, tức là
+đọc được lương cơ bản, lương BHXH của mọi người bằng DevTools. Từ 4.2:
+
+| Dữ liệu | Chủ hồ sơ | Admin | Người khác (đã đăng nhập) |
+|---|---|---|---|
+| `profiles` đầy đủ (lương, phụ cấp, lương BHXH, email, SĐT) | ✅ | ✅ | ❌ |
+| `employee_directory` (VIEW 8 cột, không lương/email/SĐT) | ✅ | ✅ | ✅ |
+| `salary_changes`, `bonuses` | ✅ | ✅ | ❌ |
+| Đơn ứng lương (`requests.type = 'ADVANCE'`) | ✅ | ✅ | ❌ |
+| Đơn nghỉ / OT / trễ / đổi ngày nghỉ / đổi thông tin | ✅ | ✅ | ✅ (lịch công ty cần) |
+| Ghi `profiles` (UPDATE) | ❌ | ✅ | ❌ |
+
+- Policy dùng hàm `public.is_admin()` (`SECURITY DEFINER`) thay vì SELECT `profiles` trực
+  tiếp: policy đặt trên `profiles` mà tự đọc `profiles` sẽ gây lỗi `42P17 infinite
+  recursion` và khoá cứng app.
+- VIEW `employee_directory` **cố ý không** đặt `security_invoker = true` (view phải bỏ qua
+  RLS của bảng gốc). Supabase Advisor sẽ cảnh báo `security_definer_view` — **đừng "sửa cho
+  hết warning"**, làm vậy danh bạ trống với mọi nhân viên và Admin ngừng nhận thông báo.
+- Code chạy được với **cả hai** trạng thái DB (trước và sau khi chạy SQL): Admin đọc
+  `profiles`; nhân viên đọc `employee_directory`, view chưa có thì lùi về `profiles` kèm
+  `console.warn`. Hồ sơ danh bạ (`mapDirectoryRow`) gắn cờ `isDirectoryOnly`, lương để
+  `undefined` (không phải 0) và **không bao giờ** đưa vào `calculateMonthlySalary`.
+  `currentUser` luôn nạp bằng `mapFullProfileRow` từ dòng `profiles` của chính mình
+  (`refreshCurrentUser`), không bao giờ spread từ mảng `employees`.
+- Thông báo đẩy "có đơn mới" gửi cho Admin lấy danh sách Admin từ `employee_directory`
+  (nhân viên thường không còn đọc được `profiles` người khác).
+- Ngày sinh vẫn nằm trong danh bạ vì lịch sinh nhật công ty đang công khai sẵn.
+- Thứ tự triển khai an toàn: deploy code → PHẦN A của SQL (tạo hàm + view, chưa siết) →
+  đăng nhập bằng tài khoản nhân viên kiểm tra Lịch công ty còn đủ tên/ảnh/sinh nhật →
+  PHẦN B (siết policy) → kiểm tra lại bằng DevTools. Cuối file SQL có khối **HOÀN TÁC**
+  (5 giây, không mất dữ liệu). BƯỚC 7b (UPDATE `requests` chỉ Admin) chỉ chạy nếu BƯỚC 0
+  cho thấy policy cũ đang mở cho mọi người.
 
 ---
 
@@ -527,6 +567,95 @@ Ngày lễ rơi vào Thứ 7 hoặc Chủ Nhật của đơn đã duyệt → đ
 
 ---
 
+## 6c. Đổi thông tin cá nhân
+
+Nhân viên bấm vào **ảnh/tên ở góc trên** để mở màn Hồ sơ: xem toàn bộ thông tin của mình
+và **đề nghị sửa 4 trường**: họ tên, ngày sinh, số điện thoại, ảnh đại diện. Đề nghị là đơn
+loại `PROFILE` trong bảng `requests`; **Admin duyệt thì phần mềm mới ghi vào `profiles`**,
+nhân viên không tự sửa được gì. Các trường công ty quản lý (mã NV, email, chức vụ, loại HĐ,
+ngày vào làm, ngày ký HĐ chính thức, ngày làm việc, lương) chỉ đọc — sai thì liên hệ Admin.
+Toàn bộ luật nằm ở `utils/profileChange.ts` (module thuần, chạy được bằng node).
+
+> **Cần chạy 3 file SQL trên Supabase, theo thứ tự:**
+> 1. `add_profile_request_type.sql` — **trước khi deploy**: thêm `PROFILE` vào CHECK của
+>    cột `type`; cột `requests.profile_changes` (JSONB); cột `profiles.phone` + unique index
+>    chống trùng số; unique index "mỗi người một đơn PROFILE đang chờ"; policy cho nhân viên
+>    tự xoá đơn PROFILE `PENDING` của mình. Thiếu thì insert bị từ chối và phần mềm nhắc
+>    đúng tên file.
+> 2. `setup_avatar_storage.sql` — **trước khi deploy**: bucket `avatars` (công khai, 2 MB,
+>    jpeg/png/webp) và 4 policy "đọc công khai; ghi/sửa/xoá trong thư mục của mình hoặc là
+>    Admin".
+> 3. `restrict_profile_salary_access.sql` — **sau khi deploy**, xem mục 2 "Ai đọc được gì".
+
+### Dữ liệu đơn
+Cột `date` = ngày gửi (để lọc tháng / sắp xếp như đơn khác). Cột `profile_changes` chỉ chứa
+trường **có đổi**, lưu **cả giá trị cũ** để màn duyệt hiện "A → B" và để hoàn tác được:
+
+```json
+{ "name":   { "old": "Nguyễn Văn A", "new": "Nguyễn Văn An" },
+  "phone":  { "old": null, "new": "0912345678" },
+  "avatar": { "old": "https://…/1700.jpg", "new": "https://…/pending-1727.jpg",
+              "newPath": "<uid>/pending-1727.jpg" } }
+```
+
+Lý do tuỳ chọn; để trống thì điền `PROFILE_DEFAULT_REASON` ("Cập nhật thông tin cá nhân")
+và màn duyệt ẩn dòng lý do.
+
+### Luật validate (`validateProfileRequest`)
+| Trường | Luật |
+|---|---|
+| Chung | Phải có ít nhất một thay đổi. **Mỗi người một đơn `PENDING`** (chặn ở app; unique index ở DB là lưới cuối). |
+| Họ tên | Không rỗng; ít nhất 2 từ; tối đa 50 ký tự; chỉ chữ, khoảng trắng, nháy, gạch nối. Gộp khoảng trắng trước khi so — đổi mỗi khoảng trắng không tính là thay đổi. |
+| Ngày sinh | Ở quá khứ; tuổi 15–75; trước ngày vào làm. Luôn kèm cảnh báo "đổi ngày sinh làm đổi thưởng sinh nhật các tháng chưa chốt lương". |
+| Số điện thoại | Chuẩn hoá về 10 số bắt đầu bằng 0 (`+84`, `84`, `0084`, dấu chấm/gạch/ngoặc/khoảng trắng đều chấp nhận; 11 số chỉ nhận đầu `02` cố định). Rỗng = xoá số. Đầu số lạ chỉ **cảnh báo**, không chặn. Trùng số người khác → DB từ chối lúc **duyệt** (mã 23505), Admin thấy "đã thuộc về nhân viên khác", đơn vẫn `PENDING`; màn duyệt cũng cảnh báo trước nếu thấy trùng trong danh sách. |
+| Ảnh | JPG/PNG/WEBP, tối đa 10 MB trước khi nén; nén phía trình duyệt về 512×512 JPEG (~60 KB); URL phải https. |
+
+### Quy trình
+- Nhân viên gửi → `PENDING` → push cho **Admin** (chỉ Admin; QLSX không duyệt đơn nào).
+  Đang có đơn chờ thì form khoá, hiện banner cam + nút **"Huỷ đề nghị"** (xoá đơn và xoá
+  ảnh `pending-*` trên Storage).
+- Admin duyệt (màn Duyệt Đơn, tab "Đổi thông tin"): ghi `profiles` **trước**, đổi status
+  **sau** — ghi `profiles` lỗi thì đơn vẫn `PENDING`, không mất gì. Bước ghi **idempotent**
+  (bỏ qua trường mà giá trị hiện tại đã bằng giá trị mới) nên bấm Duyệt lần hai an toàn.
+- Đơn có đổi ngày sinh → hộp xác nhận liệt kê **chênh lệch thưởng sinh nhật từng tháng chưa
+  chốt** trong năm (tính bằng `getVirtualBirthdayBonus` với ngày cũ và mới). Không chặn theo
+  tháng chốt lương vì tháng đã chốt được đóng băng trong `payroll_details`.
+- Từ chối: không chạm `profiles`; xoá ảnh `pending-*`.
+- **Hoàn duyệt** đơn đã duyệt (nút "Hoàn tác & mở lại đơn"): trả lại giá trị cũ **chỉ với
+  trường mà giá trị hiện tại vẫn bằng giá trị mới** — ai sửa tay sau đó thì bỏ qua và nói
+  rõ; đơn về `PENDING`. Thứ tự cũng là `profiles` trước, status sau.
+- Admin sửa trực tiếp trong tab Nhân sự (kể cả số điện thoại, ảnh) → ghi thẳng, không cần
+  đơn. Ghi `processed_at` khi duyệt/từ chối.
+- Sau khi duyệt, hồ sơ của chính nhân viên được nạp lại (`refreshCurrentUser`) nên header
+  đổi tên/ảnh ngay; đồng nghiệp thấy tên/ảnh mới khi tải lại (xem mục 15).
+
+### Ảnh đại diện (Storage bucket `avatars`, công khai)
+- Nhân viên chọn ảnh → nén phía trình duyệt (`utils/imageResize.ts`: chặn theo loại/dung
+  lượng **trước** khi decode để ảnh 50 MP không sập tab điện thoại; giữ đúng chiều ảnh chụp
+  dọc; cắt vuông căn giữa bằng `computeCoverCrop`) → tải lên `avatars/{uid}/pending-{ts}.jpg`
+  **lúc gửi đơn**; đơn lưu cả URL lẫn `newPath`.
+- Trước khi tải ảnh mới, xoá mọi `pending-*` cũ trong thư mục mình → mỗi người tối đa 1
+  ảnh chờ.
+- Duyệt: ghi URL vào `profiles.avatar`, file nằm nguyên. Từ chối / huỷ: xoá file.
+- **Không ghi đè đường dẫn cố định** — nếu không ảnh sẽ đổi ngay khi chưa duyệt.
+- Admin đổi ảnh cho NV trong tab Nhân sự → `avatars/{uid}/{ts}.jpg`, ghi thẳng. Nút "Dùng
+  ảnh chữ cái" quay về `ui-avatars.com` như lúc đăng ký.
+- Ảnh đã duyệt cũ không dọn tự động; cuối `setup_avatar_storage.sql` có câu dọn `pending-*`
+  mồ côi để chạy tay.
+
+### Ghi chú
+- Trong lúc viết tính năng này phát hiện và sửa 3 lỗi có sẵn: (1) `fetchProfile` không nạp
+  `dateOfBirth` nên màn Lương của chính nhân viên thiếu thưởng sinh nhật và `BirthdayAlert`
+  của chính mình không bao giờ hiện; (2) `getVirtualBirthdayBonus` dùng `isSameMonth` so
+  cả **năm** nên thưởng sinh nhật **chưa bao giờ** được cộng tự động (xem mục 9); (3)
+  `sendPushToManagers` lọc vai trò `'Manager'` không tồn tại trong `UserRole`.
+- Kiểm thử: `npm run test:pure` — 41 test; phần đổi thông tin phủ chuẩn hoá, từng luật
+  validate, diff, apply/revert idempotent, map dòng, thưởng sinh nhật đổi tháng, và test
+  chống tái phát "map dòng danh bạ bằng mapper đầy đủ rồi spread lên `currentUser` làm mất
+  lương".
+
+---
+
 ## 7. Ngày lễ
 
 ### Loại ngày lễ
@@ -617,6 +746,11 @@ insuranceDeduction = insuranceSalary × 10.5%
 
 ### Thưởng sinh nhật tự động (`getVirtualBirthdayBonus`)
 - Tự động thêm vào tháng sinh nhật (không cần Admin tạo).
+- **Sửa ở 4.2:** trước đây so tháng bằng `isSameMonth` của date-fns — hàm này so cả **năm**
+  (03/1995 ≠ 03/2026) nên khoản này **chưa bao giờ** được cộng tự động từ commit đầu. Nay so
+  đúng tháng. Hệ quả: từ tháng chưa chốt đầu tiên sau khi deploy, nhân viên đủ thâm niên sẽ
+  **tự có** thưởng sinh nhật trong bảng lương; nếu Admin từng thêm tay khoản này thì phải
+  xoá bản thêm tay để khỏi trùng. Tháng đã chốt không đổi.
 - Điều kiện: Thâm niên ≥ 1 năm + Hợp đồng chính thức + Có ngày sinh + Có ngày ký HĐ.
 
 | Thâm niên | Mức thưởng |
@@ -726,10 +860,10 @@ Lắng nghe thay đổi realtime trên 6 bảng:
 | Bảng | Hành động |
 |------|-----------|
 | `attendance_logs` | Cập nhật logs khi có chấm công mới |
-| `requests` | Cập nhật đơn OT/Trễ/Phép/Ứng lương/Đổi ngày nghỉ |
+| `requests` | Cập nhật đơn OT/Trễ/Phép/Ứng lương/Đổi ngày nghỉ/Đổi thông tin (kể cả DELETE khi NV huỷ đề nghị) |
 | `bonuses` | Cập nhật thưởng/phạt |
 | `attendance_overrides` | Cập nhật override |
-| `profiles` | Cập nhật khi có nhân viên mới đăng ký |
+| `profiles` | Cập nhật khi có nhân viên mới đăng ký / Admin sửa hồ sơ. **Sau khi siết RLS (mục 2)** nhân viên thường chỉ còn nhận sự kiện trên dòng của **chính mình** (→ `refreshCurrentUser`); tên/ảnh mới của đồng nghiệp chỉ hiện khi tải lại trang. |
 | `payroll_periods` | Cập nhật khi chốt/mở lương |
 
 ### Thông báo
@@ -788,6 +922,8 @@ Lắng nghe thay đổi realtime trên 6 bảng:
 | `dateOfBirth` | string | Ngày sinh |
 | `usedLeaveLegacy` | number | Phép đã dùng trước khi dùng phần mềm / điều chỉnh tay |
 | `resignationDate` | string | Ngày nghỉ việc |
+| `phone` | string \| null | Số điện thoại, 10 số bắt đầu bằng 0; **không trùng** (unique index `profiles_phone_unique`); null = chưa khai |
+| `isDirectoryOnly` | boolean | `true` = hồ sơ rút gọn từ view `employee_directory` — không có lương/email/SĐT, **không** đưa vào tính lương |
 
 ### Loại hợp đồng (`contractType`)
 | Giá trị | Mô tả |

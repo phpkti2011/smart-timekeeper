@@ -89,3 +89,54 @@ export const selectLeaveScreenEmployees = (
 
   return { visible, hiddenResignedCount, hiddenBlockedCount };
 };
+
+// === MAP DÒNG BẢNG profiles ===
+// Hai hàm map tách bạch, cố ý không dùng chung: hồ sơ đầy đủ có lương, hồ sơ
+// danh bạ thì KHÔNG. Để chung một hàm là sẽ có ngày ai đó "cho tiện" map cả
+// lương vào danh bạ.
+
+/**
+ * Hồ sơ ĐẦY ĐỦ từ bảng `profiles` (Admin đọc mọi người; ai cũng đọc được dòng
+ * của chính mình). `fallback` dùng cho lúc đăng nhập: email lấy từ auth,
+ * avatar lấy từ user_metadata nếu profile chưa có.
+ */
+export const mapFullProfileRow = (
+  e: any,
+  fallback: { email?: string; avatarUrl?: string } = {}
+): UserProfile => ({
+  id: e.id,
+  name: e.name,
+  role: e.role,
+  avatar: e.avatar || fallback.avatarUrl || '',
+  email: fallback.email ?? e.email,
+  phone: e.phone ?? null,
+  baseSalary: e.base_salary,
+  allowance: e.allowance || 0,
+  insuranceSalary: e.insurance_salary || 0,
+  workDays: e.work_days || '1,2,3,4,5,6',
+  contractType: e.contract_type || 'Hợp đồng chính thức',
+  contractDate: e.contract_date,
+  officialContractDate: e.official_contract_date || null,
+  employeeCode: e.employee_code,
+  status: e.status,
+  dateOfBirth: e.date_of_birth ?? null,
+  usedLeaveLegacy: e.used_leave_legacy || 0,
+  resignationDate: e.resignation_date || null
+});
+
+/**
+ * Hồ sơ RÚT GỌN từ view `employee_directory` — KHÔNG có lương, email, SĐT.
+ * Lương để undefined chứ KHÔNG đặt 0: số 0 trông như "lương bằng không" và
+ * sẽ lừa được mắt người review.
+ */
+export const mapDirectoryRow = (e: any): UserProfile => ({
+  id: e.id,
+  name: e.name,
+  role: e.role,
+  avatar: e.avatar || '',
+  status: e.status,
+  employeeCode: e.employee_code,
+  dateOfBirth: e.date_of_birth ?? null,
+  resignationDate: e.resignation_date ?? null,
+  isDirectoryOnly: true
+});

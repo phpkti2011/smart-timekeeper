@@ -26,7 +26,8 @@ import {
   CheckCircle,
   Bell, // Added
   Info, // Added
-  Repeat
+  Repeat,
+  ChevronRight
 } from 'lucide-react';
 import { DigitalClock } from './components/DigitalClock';
 import { TimeButton } from './components/TimeButton';
@@ -44,6 +45,7 @@ import { SalaryView } from './components/SalaryView';
 import { BonusPenaltyModal } from './components/BonusPenaltyModal';
 import { LeaveRequestModal } from './components/LeaveRequestModal';
 import { SwapRequestModal, SwapSubmitPayload } from './components/SwapRequestModal';
+import { ProfileScreen } from './components/ProfileScreen';
 import { SalaryAdvanceModal } from './components/SalaryAdvanceModal'; // New Import
 import { CompanyCalendar } from './components/CompanyCalendar';
 import { HolidayAlert } from './components/HolidayAlert';
@@ -53,7 +55,7 @@ import { AuthScreen } from './components/AuthScreen';
 import { PushNotificationToggle } from './components/PushNotificationToggle';
 import { InstallPrompt } from './components/InstallPrompt';
 import { SalaryConfirmationModal } from './components/SalaryConfirmationModal';
-import { AttendanceLog, AttendanceType, Coordinates, OTRequest, LateRequest, SalaryAdvanceRequest, RequestStatus, UserProfile, BonusFine, LeaveRequest, LeaveType, LeaveDuration, OverrideLog, Holiday, SalaryChange, SwapRequest } from './types';
+import { AttendanceLog, AttendanceType, Coordinates, OTRequest, LateRequest, SalaryAdvanceRequest, RequestStatus, UserProfile, BonusFine, LeaveRequest, LeaveType, LeaveDuration, OverrideLog, Holiday, SalaryChange, SwapRequest, ProfileChangeRequest, ProfileChangeSet, ProfileField } from './types';
 
 import { COMPANY_SETTINGS, MOCK_USER, MOCK_EMPLOYEES, MOCK_BONUSES, MOCK_ADVANCES, MOCK_HOLIDAYS } from './constants';
 import { calculateDistance, getCurrentPosition, getPublicIP } from './utils/geo';
@@ -63,10 +65,12 @@ import { startOfMonth, eachDayOfInterval, endOfMonth, isFuture, isSameDay, diffe
 import { getVirtualBirthdayBonus } from './utils/salaryCalculator';
 import { accruesAnnualLeave, countLeaveDays, getPaidLeaveUsedThisMonth, getRemainingLeave, findOverlappingLeave, LEAVE_TYPE_LABEL, getRequestStatusText, MONTHLY_PAID_LEAVE_QUOTA } from './utils/leaveTypes';
 import { validateOTRanges, toMinuteOfDay } from './utils/otRules';
-import { parseRequestDate } from './utils/dateInput';
+import { parseRequestDate, formatVNDate } from './utils/dateInput';
 import { mapLeaveRow } from './utils/leaveQueries';
 import { mapSwapRow, toSwapRow, validateSwapRequest, describeSwap, describeSwapShort, findSwapBlockingLeave, makeRestDayPredicate, pairedSunday, SWAP_DEFAULT_REASON } from './utils/restDay';
-import { isResignedAndHidden, isWorkingEmployee } from './utils/employeeFilters';
+import { mapProfileRow, toProfileRow, validateProfileRequest, applyProfileChanges, revertProfileChanges, patchToColumns, describeProfileChangesShort, PROFILE_FIELD_LABEL } from './utils/profileChange';
+import { removeAvatarPath, removePendingAvatars } from './utils/avatarStorage';
+import { isResignedAndHidden, isWorkingEmployee, mapFullProfileRow, mapDirectoryRow } from './utils/employeeFilters';
 import { supabase } from './utils/supabaseClient';
 import { sendPushToUser, sendPushToManagers } from './utils/pushNotifications';
 
@@ -104,6 +108,7 @@ const App: React.FC = () => {
   const [advanceRequests, setAdvanceRequests] = useState<SalaryAdvanceRequest[]>(MOCK_ADVANCES);
   const [leaveRequests, setLeaveRequests] = useState<LeaveRequest[]>([]);
   const [swapRequests, setSwapRequests] = useState<SwapRequest[]>([]); // Đơn đổi ngày nghỉ tuần
+  const [profileRequests, setProfileRequests] = useState<ProfileChangeRequest[]>([]); // Đơn đổi thông tin cá nhân
   const [overrides, setOverrides] = useState<OverrideLog[]>([]); // New State
   const [holidays, setHolidays] = useState<Holiday[]>(MOCK_HOLIDAYS); // New State
   const [salaryChanges, setSalaryChanges] = useState<SalaryChange[]>([]); // New State: Salary History
@@ -151,6 +156,7 @@ const App: React.FC = () => {
   const [isGeneralBonusModalOpen, setIsGeneralBonusModalOpen] = useState(false);
   const [isLeaveModalOpen, setIsLeaveModalOpen] = useState(false);
   const [isSwapModalOpen, setIsSwapModalOpen] = useState(false); // Đổi ngày nghỉ tuần
+  const [isProfileOpen, setIsProfileOpen] = useState(false); // Màn thông tin cá nhân (bấm avatar ở header)
   const [isAdvanceModalOpen, setIsAdvanceModalOpen] = useState(false); // New State
   const [currentAdvanceLimit, setCurrentAdvanceLimit] = useState(0); // Store limit when opening prompt
 
@@ -215,24 +221,13 @@ const App: React.FC = () => {
         .single();
 
       if (data) {
-        const user: UserProfile = {
-          id: data.id,
-          name: data.name,
-          role: data.role,
-          avatar: data.avatar || session.user.user_metadata.avatar_url,
+        // Map ĐỦ trường (kể cả dateOfBirth, employeeCode, phone). Trước đây thiếu
+        // dateOfBirth nên màn Lương của chính mình không có thưởng sinh nhật và
+        // popup sinh nhật của chính mình không bao giờ hiện.
+        setCurrentUser(mapFullProfileRow(data, {
           email: session.user.email,
-          baseSalary: data.base_salary,
-          allowance: data.allowance || 0,
-          insuranceSalary: data.insurance_salary || 0,
-          workDays: data.work_days || "1,2,3,4,5,6",
-          contractType: data.contract_type || 'Hợp đồng chính thức',
-          contractDate: data.contract_date,
-          officialContractDate: data.official_contract_date || null,
-          usedLeaveLegacy: data.used_leave_legacy || 0,
-          resignationDate: data.resignation_date || null,
-          status: data.status // Don't override DB value
-        };
-        setCurrentUser(user);
+          avatarUrl: session.user.user_metadata?.avatar_url
+        }));
       } else {
         // Fallback if profile not found (sign up trigger lag?)
         setCurrentUser(null);
@@ -252,25 +247,20 @@ const App: React.FC = () => {
     }
   }, [currentUser?.id]); // Only refetch if ID changes (login), not on every user update to avoid loops
 
-  // Sync Current User with Employees List
-  useEffect(() => {
-    if (currentUser && employees.length > 0) {
-      const freshUser = employees.find(e => e.id === currentUser.id);
-      // Only update if there are meaningful differences to avoid loops
-      if (freshUser) {
-        // Check simple integrity or specific fields
-        const hasChanges =
-          freshUser.usedLeaveLegacy !== currentUser.usedLeaveLegacy ||
-          freshUser.contractDate !== currentUser.contractDate ||
-          freshUser.officialContractDate !== currentUser.officialContractDate ||
-          freshUser.resignationDate !== currentUser.resignationDate;
-
-        if (hasChanges) {
-          setCurrentUser(prev => ({ ...prev!, ...freshUser }));
-        }
-      }
+  /**
+   * Nạp lại hồ sơ ĐẦY ĐỦ của chính mình. Dòng của mình luôn đọc được kể cả sau
+   * khi siết RLS trên profiles.
+   *
+   * Thay cho effect cũ merge từ mảng `employees` bằng spread: với nhân viên
+   * thường, mảng đó là danh bạ RÚT GỌN không có lương, spread lên currentUser
+   * sẽ ghi đè undefined lên baseSalary → màn Lương của chính họ hiện 0đ.
+   */
+  const refreshCurrentUser = async (uid: string) => {
+    const { data } = await supabase.from('profiles').select('*').eq('id', uid).single();
+    if (data) {
+      setCurrentUser(prev => prev ? mapFullProfileRow(data, { email: prev.email, avatarUrl: prev.avatar }) : prev);
     }
-  }, [employees, currentUser?.id]);
+  };
 
   // === Nhân viên đã sắp xếp theo bảng chữ cái (tên gọi, chuẩn VN) ===
   const sortedEmployees = useMemo(() => [...employees].sort(compareByGivenName), [employees]);
@@ -290,6 +280,7 @@ const App: React.FC = () => {
   const myLateRequests = useMemo(() => lateRequests.filter(r => r.userId === currentUser?.id), [lateRequests, currentUser?.id]);
   const myLeaveRequests = useMemo(() => leaveRequests.filter(r => r.userId === currentUser?.id), [leaveRequests, currentUser?.id]);
   const mySwapRequests = useMemo(() => swapRequests.filter(r => r.userId === currentUser?.id), [swapRequests, currentUser?.id]);
+  const myProfileRequests = useMemo(() => profileRequests.filter(r => r.userId === currentUser?.id), [profileRequests, currentUser?.id]);
   const myAdvanceRequests = useMemo(() => advanceRequests.filter(r => r.userId === currentUser?.id), [advanceRequests, currentUser?.id]);
   const myOverrides = useMemo(() => overrides.filter(o => o.userId === currentUser?.id), [overrides, currentUser?.id]);
   const myBonuses = useMemo(() => bonuses.filter(b => b.userId === currentUser?.id), [bonuses, currentUser?.id]);
@@ -367,30 +358,29 @@ const App: React.FC = () => {
     setLoadedMonths(initialMonths);
 
     try {
-      // 1. Fetch Employees
-      const { data: empData } = await supabase.from('profiles').select('*');
-      if (empData) {
-        const mappedEmps: UserProfile[] = empData.map((e: any) => ({
-          id: e.id,
-          name: e.name,
-          role: e.role,
-          avatar: e.avatar,
-          email: e.email,
-          baseSalary: e.base_salary,
-          allowance: e.allowance || 0,
-          insuranceSalary: e.insurance_salary || 0,
-          workDays: e.work_days || "1,2,3,4,5,6",
-          contractType: e.contract_type || 'Hợp đồng chính thức',
-          contractDate: e.contract_date,
-          officialContractDate: e.official_contract_date || null,
-
-          employeeCode: e.employee_code, // Map from DB
-          status: e.status, // Fix: Map status from DB
-          dateOfBirth: e.date_of_birth,
-          usedLeaveLegacy: e.used_leave_legacy || 0,
-          resignationDate: e.resignation_date || null
-        }));
-        setEmployees(mappedEmps);
+      // 1. Fetch Employees — Admin lấy hồ sơ đầy đủ; nhân viên thường chỉ lấy
+      // DANH BẠ (view employee_directory: tên/ảnh/chức vụ/sinh nhật, KHÔNG có
+      // lương). RLS chặn ở DB, đây chỉ là đường đọc hợp lệ. View chưa tồn tại
+      // (chưa chạy restrict_profile_salary_access.sql) thì lùi về profiles để
+      // bản deploy này chạy được trên CẢ HAI trạng thái DB — nhờ đó hoàn tác
+      // SQL không cần hoàn tác code và ngược lại.
+      const isAdminUser = currentUser?.role === 'Admin';
+      let empData: any[] = [];
+      if (isAdminUser) {
+        const { data } = await supabase.from('profiles').select('*');
+        empData = data || [];
+        setEmployees(empData.map((e: any) => mapFullProfileRow(e)));
+      } else {
+        const { data, error } = await supabase.from('employee_directory').select('*');
+        if (error || !data) {
+          console.warn('[DIRECTORY] Chưa có employee_directory, dùng profiles:', error?.message);
+          const fb = await supabase.from('profiles').select('*');
+          empData = fb.data || [];
+          setEmployees(empData.map((e: any) => mapFullProfileRow(e)));
+        } else {
+          empData = data;
+          setEmployees(empData.map(mapDirectoryRow));
+        }
       }
 
       // 2. Fetch Logs (Unlimited - Recursive Pagination)
@@ -543,6 +533,9 @@ const App: React.FC = () => {
           .map(mapSwap);
         setSwapRequests([...swaps, ...extraSwaps]);
 
+        // Đơn đổi thông tin cá nhân — 3 tháng gần nhất là đủ (chỉ để duyệt và xem lịch sử)
+        setProfileRequests(reqData.filter((r: any) => r.type === 'PROFILE').map((r: any) => mapProfileRow(r, empData)));
+
         const advances = reqData.filter((r: any) => r.type === 'ADVANCE').map((r: any) => ({
           ...mapBaseRequest(r, empData),
           id: r.id,
@@ -618,6 +611,9 @@ const App: React.FC = () => {
         setCompanyConfig(newConfig);
       }
 
+      // 8. Nạp lại hồ sơ đầy đủ của chính mình — KHÔNG lấy từ mảng employees
+      if (currentUser?.id) await refreshCurrentUser(currentUser.id);
+
     } catch (error) {
       console.error("Error fetching data:", error);
     } finally {
@@ -679,11 +675,13 @@ const App: React.FC = () => {
       });
       const newLeaves = reqsRes.data.filter((r: any) => r.type === 'LEAVE').map((r: any) => mapLeaveRow(r, empData));
       const newAdvances = reqsRes.data.filter((r: any) => r.type === 'ADVANCE').map((r: any) => ({ ...mapReq(r), id: r.id, date: new Date(r.created_at), amount: r.amount, reason: r.reason, status: r.status }));
+      const newProfiles = reqsRes.data.filter((r: any) => r.type === 'PROFILE').map((r: any) => mapProfileRow(r, empData));
 
       if (newOts.length) setOtRequests(prev => { const ids = new Set(prev.map(r => r.id)); return [...prev, ...newOts.filter(r => !ids.has(r.id))]; });
       if (newLates.length) setLateRequests(prev => { const ids = new Set(prev.map(r => r.id)); return [...prev, ...newLates.filter(r => !ids.has(r.id))]; });
       if (newLeaves.length) setLeaveRequests(prev => { const ids = new Set(prev.map(r => r.id)); return [...prev, ...newLeaves.filter(r => !ids.has(r.id))]; });
       if (newAdvances.length) setAdvanceRequests(prev => { const ids = new Set(prev.map(r => r.id)); return [...prev, ...newAdvances.filter(r => !ids.has(r.id))]; });
+      if (newProfiles.length) setProfileRequests(prev => { const ids = new Set(prev.map(r => r.id)); return [...prev, ...newProfiles.filter(r => !ids.has(r.id))]; });
     }
 
     if (swapRes.data && swapRes.data.length > 0) {
@@ -845,6 +843,7 @@ const App: React.FC = () => {
           setLeaveRequests(prev => prev.filter(r => r.id !== oldRec.id));
           setAdvanceRequests(prev => prev.filter(r => r.id !== oldRec.id));
           setSwapRequests(prev => prev.filter(r => r.id !== String(oldRec.id)));
+          setProfileRequests(prev => prev.filter(r => r.id !== String(oldRec.id)));
           return;
         }
 
@@ -873,6 +872,11 @@ const App: React.FC = () => {
           const req = mapSwapRow(newRec, employees);
           // Insert của chính mình đã được thêm qua .select() → khử trùng theo id
           setSwapRequests(prev => eventType === 'UPDATE'
+            ? prev.map(r => r.id === req.id ? req : r)
+            : (prev.some(r => r.id === req.id) ? prev : [...prev, req]));
+        } else if (newRec.type === 'PROFILE') {
+          const req = mapProfileRow(newRec, employees);
+          setProfileRequests(prev => eventType === 'UPDATE'
             ? prev.map(r => r.id === req.id ? req : r)
             : (prev.some(r => r.id === req.id) ? prev : [...prev, req]));
         }
@@ -916,24 +920,10 @@ const App: React.FC = () => {
           return;
         }
 
-        const newProfile: UserProfile = {
-          id: newRec.id,
-          name: newRec.name,
-          role: newRec.role,
-          avatar: newRec.avatar,
-          email: newRec.email,
-          baseSalary: newRec.base_salary,
-          allowance: newRec.allowance || 0,
-          insuranceSalary: newRec.insurance_salary || 0,
-          workDays: newRec.work_days || "1,2,3,4,5,6",
-          contractType: newRec.contract_type || 'Hợp đồng chính thức',
-          contractDate: newRec.contract_date,
-          officialContractDate: newRec.official_contract_date || null,
-          usedLeaveLegacy: newRec.used_leave_legacy || 0,
-          resignationDate: newRec.resignation_date || null,
-          employeeCode: newRec.employee_code,
-          status: newRec.status // Important!
-        };
+        // Nhân viên thường (sau khi siết RLS) chỉ nhận event dòng của chính mình.
+        // Đổi tên/ảnh của người khác chỉ lan sang máy họ khi họ tải lại — chấp nhận.
+        const newProfile: UserProfile = mapFullProfileRow(newRec);
+        if (eventType === 'UPDATE' && currentUser.id === newProfile.id) refreshCurrentUser(newProfile.id);
 
         setEmployees(prev => {
           if (eventType === 'UPDATE') {
@@ -1830,14 +1820,14 @@ const App: React.FC = () => {
    * "Từ chối" (đơn có thật nhưng không duyệt) và "Hoàn duyệt" (đưa về chờ duyệt).
    * Chỉ Admin. Không hoàn tác được nên phải hỏi xác nhận.
    */
-  const handleDeleteRequest = async (id: string, type: 'LEAVE' | 'OT' | 'LATE' | 'ADVANCE' | 'SWAP') => {
+  const handleDeleteRequest = async (id: string, type: 'LEAVE' | 'OT' | 'LATE' | 'ADVANCE' | 'SWAP' | 'PROFILE') => {
     if (currentUser?.role !== 'Admin') {
       alert('Chỉ Admin mới được xoá đơn.');
       return;
     }
 
     const nguon: Record<string, any[]> = {
-      LEAVE: leaveRequests, OT: otRequests, LATE: lateRequests, ADVANCE: advanceRequests, SWAP: swapRequests
+      LEAVE: leaveRequests, OT: otRequests, LATE: lateRequests, ADVANCE: advanceRequests, SWAP: swapRequests, PROFILE: profileRequests
     };
     const req: any = nguon[type].find(r => r.id === id);
     if (!req) return;
@@ -1856,7 +1846,7 @@ const App: React.FC = () => {
     }
 
     const nhan: Record<string, string> = {
-      LEAVE: 'đơn nghỉ phép', OT: 'đơn tăng ca', LATE: 'đơn giải trình đi trễ', ADVANCE: 'đơn ứng lương', SWAP: 'đơn đổi ngày nghỉ'
+      LEAVE: 'đơn nghỉ phép', OT: 'đơn tăng ca', LATE: 'đơn giải trình đi trễ', ADVANCE: 'đơn ứng lương', SWAP: 'đơn đổi ngày nghỉ', PROFILE: 'đề nghị sửa thông tin'
     };
     const khoang = type === 'SWAP'
       ? describeSwapShort(req)
@@ -1875,7 +1865,7 @@ const App: React.FC = () => {
     const setter: Record<string, React.Dispatch<React.SetStateAction<any[]>>> = {
       LEAVE: setLeaveRequests as any, OT: setOtRequests as any,
       LATE: setLateRequests as any, ADVANCE: setAdvanceRequests as any,
-      SWAP: setSwapRequests as any
+      SWAP: setSwapRequests as any, PROFILE: setProfileRequests as any
     };
     setter[type](prev => prev.filter((r: any) => r.id !== id));
 
@@ -2285,6 +2275,185 @@ const App: React.FC = () => {
     }
   };
 
+  // === ĐỔI THÔNG TIN CÁ NHÂN (nhân viên đề nghị, Admin duyệt) ===
+
+  /** Chênh lệch thưởng sinh nhật theo từng tháng CHƯA chốt lương khi đổi ngày sinh. */
+  const birthdayBonusDiffs = (emp: UserProfile, oldDob: string | null, newDob: string | null) => {
+    const year = new Date().getFullYear();
+    const out: { m: Date; cu: number; moi: number }[] = [];
+    for (let i = 0; i < 12; i++) {
+      const m = new Date(year, i, 1);
+      if (isMonthLocked(m, lockedMonths)) continue;
+      const cu = getVirtualBirthdayBonus({ ...emp, dateOfBirth: oldDob }, m)?.amount ?? 0;
+      const moi = getVirtualBirthdayBonus({ ...emp, dateOfBirth: newDob }, m)?.amount ?? 0;
+      if (cu !== moi) out.push({ m, cu, moi });
+    }
+    return out;
+  };
+
+  const handleSubmitProfileRequest = async (changes: ProfileChangeSet, reason: string): Promise<boolean> => {
+    if (!currentUser) return false;
+    const today = format(new Date(), 'yyyy-MM-dd');
+
+    // Chạy lại toàn bộ ràng buộc ở phía cha — modal có thể bị bỏ qua, và dữ liệu
+    // trong state có thể đã đổi từ lúc mở modal tới lúc bấm gửi.
+    const validationError = validateProfileRequest({
+      userId: currentUser.id, changes, today,
+      contractDate: currentUser.contractDate, existingRequests: profileRequests
+    });
+    if (validationError) {
+      alert(validationError);
+      removeAvatarPath(changes.avatar?.newPath); // ảnh đã tải lên mà đơn không gửi được
+      return false;
+    }
+
+    const { data, error } = await supabase
+      .from('requests')
+      .insert(toProfileRow(currentUser.id, changes, reason, 'PENDING', today))
+      .select();
+    if (error) {
+      console.error('Error inserting profile request:', error);
+      removeAvatarPath(changes.avatar?.newPath);
+      alert((error as any).code === '23505'
+        ? '⚠️ Bạn đang có một đề nghị chờ duyệt. Chờ Admin xử lý hoặc huỷ đơn cũ rồi gửi lại.'
+        : '⚠️ Không gửi được đề nghị.\n\nNếu lỗi nhắc tới cột profile_changes hoặc ràng buộc type thì cần chạy file add_profile_request_type.sql trên Supabase trước.');
+      return false;
+    }
+    if (!data || data.length === 0) {
+      // RLS chặn im lặng: insert không báo lỗi nhưng không trả dòng nào.
+      removeAvatarPath(changes.avatar?.newPath);
+      alert('⚠️ Đề nghị không được lưu (quyền truy cập từ chối). Vui lòng báo Admin kiểm tra quyền trên bảng requests.');
+      return false;
+    }
+
+    const created: ProfileChangeRequest[] = data.map((r: any) => mapProfileRow(r, employees));
+    setProfileRequests(prev => {
+      const ids = new Set(prev.map(s => s.id));
+      return [...prev, ...created.filter(s => !ids.has(s.id))];
+    });
+    const noiDung = describeProfileChangesShort(changes);
+    triggerNotification('Đã gửi đề nghị', `Đã gửi đề nghị sửa: ${noiDung}.`);
+    sendPushToManagers('👤 Đề nghị sửa thông tin cá nhân', `${currentUser.name} đề nghị sửa: ${noiDung}.`);
+    return true;
+  };
+
+  /** Nhân viên tự huỷ đơn PROFILE đang chờ của mình (policy DELETE bó hẹp đúng ca này). */
+  const handleCancelProfileRequest = async (id: string) => {
+    const req = profileRequests.find(r => r.id === id);
+    if (!req || req.status !== 'PENDING' || req.userId !== currentUser?.id) return;
+    if (!window.confirm(`Huỷ đề nghị sửa thông tin (${describeProfileChangesShort(req.changes)})?`)) return;
+
+    setProfileRequests(prev => prev.filter(r => r.id !== id));
+    const { data, error } = await supabase.from('requests').delete().eq('id', id).select();
+    if (error || !data || data.length === 0) {
+      setProfileRequests(prev => [...prev, req]);
+      alert('⚠️ Không huỷ được đề nghị.\n\nCần chạy add_profile_request_type.sql (bước 6, quyền tự huỷ đơn chờ duyệt) trên Supabase.');
+      return;
+    }
+    removeAvatarPath(req.changes.avatar?.newPath);
+    triggerNotification('Đã huỷ', 'Đã huỷ đề nghị sửa thông tin.');
+  };
+
+  const handleUpdateProfileStatus = async (id: string, status: RequestStatus, reason?: string) => {
+    const req = profileRequests.find(r => r.id === id);
+    if (!req) return;
+    const emp = employees.find(e => e.id === req.userId);
+
+    // DUYỆT: ghi profiles TRƯỚC, đóng đơn SAU. Ghi hỏng thì đơn vẫn PENDING,
+    // Admin thấy lỗi và bấm lại được — không mất gì. Thứ tự ngược lại thì đơn
+    // "đã duyệt" mà hồ sơ không đổi, và không ai biết là hỏng.
+    if (status === 'APPROVED' && req.status !== 'APPROVED') {
+      if (!emp) { alert('Nhân viên không còn trong hệ thống.'); return; }
+      const { patch, skipped } = applyProfileChanges(emp, req.changes);
+
+      // Đổi ngày sinh → tính THẬT chênh lệch thưởng sinh nhật các tháng chưa chốt
+      if (req.changes.dateOfBirth && !skipped.includes('dateOfBirth')) {
+        const diffs = birthdayBonusDiffs(emp, req.changes.dateOfBirth.old, req.changes.dateOfBirth.new);
+        if (diffs.length > 0) {
+          const vnd = (n: number) => `${n.toLocaleString('vi-VN')}đ`;
+          const lines = diffs.map(d => `  • ${format(d.m, 'MM/yyyy')}: ${vnd(d.cu)} → ${vnd(d.moi)}`).join('\n');
+          const ok = window.confirm(
+            `⚠️ ĐỔI NGÀY SINH SẼ LÀM ĐỔI TIỀN THƯỞNG!\n\n${emp.name}: ${formatVNDate(req.changes.dateOfBirth.old) || 'chưa có'} → ${formatVNDate(req.changes.dateOfBirth.new) || 'chưa có'}\n\n` +
+            `Các tháng CHƯA chốt lương bị ảnh hưởng:\n${lines}\n\n` +
+            `Tháng đã chốt lương không đổi (tiền đã được đóng băng trong bảng lương).\n\nVẫn duyệt?`
+          );
+          if (!ok) return;
+        }
+      }
+
+      if (Object.keys(patch).length > 0) {
+        const { data, error } = await supabase.from('profiles').update(patchToColumns(patch)).eq('id', req.userId).select();
+        if (error) {
+          alert((error as any).code === '23505'
+            ? `⚠️ Số điện thoại ${req.changes.phone?.new || ''} đã thuộc về nhân viên khác. Kiểm tra lại trước khi duyệt.`
+            : `⚠️ Không áp dụng được thay đổi vào hồ sơ.\n\n${error.message}`);
+          return;
+        }
+        if (!data || data.length === 0) {
+          alert('⚠️ Không áp dụng được thay đổi (quyền truy cập từ chối). Chỉ Admin mới sửa được hồ sơ.');
+          return;
+        }
+        setEmployees(prev => prev.map(e => e.id === req.userId ? { ...e, ...patch } : e));
+        if (currentUser?.id === req.userId) setCurrentUser(prev => prev ? { ...prev, ...patch } : prev);
+      }
+    }
+
+    // HOÀN TÁC đơn đã duyệt: trả lại giá trị cũ, CHỈ với trường chưa bị sửa tiếp
+    if (status === 'PENDING' && req.status === 'APPROVED') {
+      if (!emp) { alert('Nhân viên không còn trong hệ thống.'); return; }
+      const { patch, skipped } = revertProfileChanges(emp, req.changes);
+      const lines = (Object.keys(patch) as ProfileField[]).map(f =>
+        f === 'avatar'
+          ? `  • ${PROFILE_FIELD_LABEL[f]}: ảnh mới → ảnh cũ`
+          : `  • ${PROFILE_FIELD_LABEL[f]}: ${req.changes[f]?.new ?? 'Chưa có'} → ${req.changes[f]?.old ?? 'Chưa có'}`
+      );
+      const skippedLines = skipped.map(f => `  • ${PROFILE_FIELD_LABEL[f]} — đã bị sửa tiếp sau khi duyệt, giữ giá trị hiện tại`);
+      const ok = window.confirm(
+        `HOÀN TÁC ĐƠN ĐỔI THÔNG TIN?\n\nHồ sơ của ${emp.name} sẽ được trả về:\n${lines.length ? lines.join('\n') : '  (không có gì để trả)'}` +
+        (skippedLines.length ? `\n\nKHÔNG hoàn tác được:\n${skippedLines.join('\n')}` : '') +
+        `\n\nĐơn sẽ quay về trạng thái "Chờ duyệt".`
+      );
+      if (!ok) return;
+      if (Object.keys(patch).length > 0) {
+        const { data, error } = await supabase.from('profiles').update(patchToColumns(patch)).eq('id', req.userId).select();
+        if (error || !data || data.length === 0) {
+          alert(`⚠️ Không hoàn tác được hồ sơ.\n\n${error?.message || 'Quyền truy cập từ chối.'}`);
+          return;
+        }
+        setEmployees(prev => prev.map(e => e.id === req.userId ? { ...e, ...patch } : e));
+        if (currentUser?.id === req.userId) setCurrentUser(prev => prev ? { ...prev, ...patch } : prev);
+      }
+    }
+
+    const oldStatus = req.status;
+    const oldReason = req.rejectionReason ?? null;
+    setProfileRequests(prev => prev.map(r => r.id === id ? { ...r, status, rejectionReason: reason || null } : r));
+
+    const { error } = await supabase
+      .from('requests')
+      .update({ status, rejection_reason: reason || null, processed_at: status === 'PENDING' ? null : new Date().toISOString() })
+      .eq('id', id);
+    if (error) {
+      setProfileRequests(prev => prev.map(r => r.id === id ? { ...r, status: oldStatus, rejectionReason: oldReason } : r));
+      alert(status === 'APPROVED'
+        ? '⚠️ Đã áp dụng thay đổi vào hồ sơ nhưng CHƯA đóng được đơn.\n\nBấm Duyệt lần nữa — hệ thống sẽ bỏ qua bước áp dụng vì giá trị đã trùng.'
+        : `⚠️ Không cập nhật được đơn.\n\n${error.message}`);
+      return;
+    }
+
+    // Dọn ảnh trên Storage: từ chối thì xoá ảnh chờ; duyệt thì dọn ảnh chờ khác (nếu có)
+    if (status === 'REJECTED') removeAvatarPath(req.changes.avatar?.newPath);
+    if (status === 'APPROVED' && req.changes.avatar?.newPath) removePendingAvatars(req.userId, req.changes.avatar.newPath);
+
+    if (status !== 'PENDING') {
+      const label = status === 'APPROVED' ? '✅ Đã duyệt' : '❌ Bị từ chối';
+      const body = status === 'REJECTED' && reason
+        ? `Lý do: ${reason}`
+        : `Đề nghị sửa thông tin (${describeProfileChangesShort(req.changes)}) của bạn đã được ${status === 'APPROVED' ? 'duyệt' : 'từ chối'}.`;
+      sendPushToUser(req.userId, `${label} đề nghị sửa thông tin`, body);
+    }
+  };
+
   const handleAddEmployee = async (emp: UserProfile) => {
     // 1. Optimistic Update
     setEmployees([...employees, emp]);
@@ -2297,6 +2466,7 @@ const App: React.FC = () => {
         role: emp.role,
         avatar: emp.avatar,
         email: emp.email,
+        phone: emp.phone || null,
         base_salary: emp.baseSalary,
         allowance: emp.allowance,
         work_days: emp.workDays,
@@ -2344,6 +2514,7 @@ const App: React.FC = () => {
         role: emp.role,
         avatar: emp.avatar,
         email: emp.email,
+        phone: emp.phone || null,
         // password: emp.password, // Don't save password to profile plain text unless requested
         base_salary: emp.baseSalary,
         allowance: emp.allowance,
@@ -2833,8 +3004,6 @@ const App: React.FC = () => {
     );
   }
 
-  // Find current user's actual data in the employees array to get real-time Leave Balance
-  const currentUserEmployee = employees.find(e => e.id === currentUser.id) || currentUser;
   const isAdmin = currentUser.role === 'Admin';
 
   const isAtCompany = distance !== null && distance <= companyConfig.allowedRadiusMeters;
@@ -2844,7 +3013,8 @@ const App: React.FC = () => {
     lateRequests.filter(r => r.status === 'PENDING').length +
     advanceRequests.filter(r => r.status === 'PENDING').length +
     leaveRequests.filter(r => r.status === 'PENDING').length +
-    swapRequests.filter(r => r.status === 'PENDING').length;
+    swapRequests.filter(r => r.status === 'PENDING').length +
+    profileRequests.filter(r => r.status === 'PENDING').length;
 
   return (
     <div className="min-h-screen bg-gray-50 font-sans text-gray-900 flex flex-col items-center">
@@ -2864,17 +3034,32 @@ const App: React.FC = () => {
 
         {/* Top Bar (User & Admin) */}
         <div className="z-20 px-6 pt-8 pb-4 flex items-center justify-between text-white">
-          <div className="flex items-center space-x-3">
-            <img
-              src={currentUser.avatar}
-              alt="User"
-              className="w-12 h-12 rounded-full border-2 border-white/50 shadow-md object-cover bg-white"
-            />
-            <div>
-              <p className="text-brand-100 text-xs font-medium">Xin chào, ({currentUser.role})</p>
-              <h1 className="text-lg font-bold leading-tight">{currentUser.name}</h1>
+          {/* Bấm ảnh/tên → màn Thông tin cá nhân (không tốn chỗ trên thanh điều hướng) */}
+          <button
+            type="button"
+            onClick={() => setIsProfileOpen(true)}
+            className="flex items-center space-x-3 text-left rounded-xl px-1 -ml-1 min-w-0 hover:bg-white/10 active:scale-95 transition"
+            title="Xem thông tin cá nhân"
+          >
+            <div className="relative shrink-0">
+              <img
+                src={currentUser.avatar}
+                alt="User"
+                className="w-12 h-12 rounded-full border-2 border-white/50 shadow-md object-cover bg-white"
+              />
+              {myProfileRequests.some(r => r.status === 'PENDING') && (
+                <span className="absolute -top-0.5 -right-0.5 w-3 h-3 bg-red-500 rounded-full border-2 border-white" title="Có đề nghị sửa thông tin đang chờ duyệt" />
+              )}
             </div>
-          </div>
+            <div className="min-w-0">
+              <p className="text-brand-100 text-xs font-medium">Xin chào, ({currentUser.role})</p>
+              <h1 className="text-lg font-bold leading-tight flex items-center gap-1">
+                <span className="truncate">{currentUser.name}</span>
+                <ChevronRight size={14} className="text-brand-200 shrink-0" />
+              </h1>
+              <p className="text-[10px] text-brand-100">Xem hồ sơ</p>
+            </div>
+          </button>
           <div className="flex gap-2">
             {!isManualMode && (
               <button
@@ -3095,12 +3280,15 @@ const App: React.FC = () => {
                 advanceRequests={advanceRequests}
                 leaveRequests={leaveRequests}
                 swapRequests={swapRequests}
+                profileRequests={profileRequests}
+                employees={employees}
                 holidays={holidays}
                 onUpdateOtStatus={handleUpdateOtStatus}
                 onUpdateLateStatus={handleUpdateLateStatus}
                 onUpdateAdvanceStatus={handleUpdateAdvanceStatus}
                 onUpdateLeaveStatus={handleUpdateLeaveStatus}
                 onUpdateSwapStatus={handleUpdateSwapStatus}
+                onUpdateProfileStatus={handleUpdateProfileStatus}
                 onDeleteRequest={currentUser?.role === 'Admin' ? handleDeleteRequest : undefined}
               />
             </div>
@@ -3520,6 +3708,21 @@ const App: React.FC = () => {
             />
           );
         })()}
+
+        {/* Profile Screen — mở bằng cách bấm ảnh/tên ở header */}
+        <ProfileScreen
+          isOpen={isProfileOpen}
+          onClose={() => setIsProfileOpen(false)}
+          user={currentUser}
+          requests={myProfileRequests}
+          remainingLeave={getRemainingLeave(currentUser, leaveRequests, {
+            holidays,
+            isRestDay: makeRestDayPredicate(mySwapRequests, holidays)
+          })}
+          onSubmit={handleSubmitProfileRequest}
+          onCancelPending={handleCancelProfileRequest}
+          onGoToSalary={() => { setIsProfileOpen(false); setActiveTab('salary'); }}
+        />
 
         {/* General Bonus Modal (Quick Action from HR - Admin Only) */}
         {isAdmin && (() => {

@@ -12,6 +12,7 @@ import {
   differenceInMonths,
   differenceInDays,
   subMonths,
+  parseISO,
 } from 'date-fns';
 import {
   AttendanceLog,
@@ -144,10 +145,16 @@ export const getVirtualBirthdayBonus = (
 ): BonusFine | null => {
   if (!employee.dateOfBirth || !employee.contractDate) return null;
 
-  const dob = new Date(employee.dateOfBirth);
+  // Cột DATE về dạng 'YYYY-MM-DD' → parseISO đọc theo giờ LOCAL. new Date('1995-03-01')
+  // là nửa đêm UTC nên ở múi giờ âm sẽ lùi về 28/02 và trượt sang tháng khác.
+  const dob = parseISO(employee.dateOfBirth);
+  if (isNaN(dob.getTime())) return null;
 
-  // Check if target month matches birthday month
-  if (!isSameMonth(targetDate, dob)) return null;
+  // So THÁNG, KHÔNG so năm. Trước đây dùng isSameMonth(targetDate, dob): hàm này của
+  // date-fns so cả năm, nên 03/1995 ≠ 03/2026 và thưởng sinh nhật KHÔNG BAO GIỜ được
+  // cộng tự động (lỗi có từ commit đầu, test "getVirtualBirthdayBonus" trong
+  // scripts/pure.test.ts bắt được).
+  if (dob.getMonth() !== targetDate.getMonth()) return null;
 
   // Check tenure >= 1 year
   // We compare the target month (or specifically the birthday in that year) against contract date

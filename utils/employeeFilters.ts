@@ -110,6 +110,7 @@ export const mapFullProfileRow = (
   avatar: e.avatar || fallback.avatarUrl || '',
   email: fallback.email ?? e.email,
   phone: e.phone ?? null,
+  weekendGroup: e.weekend_group ?? null,
   baseSalary: e.base_salary,
   allowance: e.allowance || 0,
   insuranceSalary: e.insurance_salary || 0,
@@ -138,5 +139,6 @@ export const mapDirectoryRow = (e: any): UserProfile => ({
   employeeCode: e.employee_code,
   dateOfBirth: e.date_of_birth ?? null,
   resignationDate: e.resignation_date ?? null,
+  weekendGroup: e.weekend_group ?? null, // view cũ 8 cột chưa có → null, không vỡ
   isDirectoryOnly: true
 });

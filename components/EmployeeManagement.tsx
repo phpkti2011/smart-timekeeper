@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { createPortal } from 'react-dom';
-import { UserProfile, UserRole, UserStatus, LeaveRequest, Holiday, SwapRequest } from '../types';
+import { UserProfile, UserRole, UserStatus, LeaveRequest, Holiday, SwapRequest, WeekendGroup } from '../types';
 import { Users, Search, Plus, Edit2, Trash2, X, Calendar, Eye, DollarSign, CheckCircle2, Lock, Undo, UserMinus, Camera } from 'lucide-react';
 import { accruesAnnualLeave, getAccruedLeaveThisYear, getPaidLeaveUsedThisYear, getRemainingLeave } from '../utils/leaveTypes';
 import { differenceInYears, format } from 'date-fns';
@@ -52,6 +52,7 @@ export const EmployeeManagement: React.FC<Props> = ({ employees, onAdd, onEdit, 
     avatar: '',
     email: '',
     phone: '',
+    weekendGroup: null,
     password: '',
     baseSalary: 0,
     allowance: 0,
@@ -136,6 +137,7 @@ export const EmployeeManagement: React.FC<Props> = ({ employees, onAdd, onEdit, 
       avatar: '', // để trống → lúc lưu tự sinh ảnh chữ cái theo tên (trước đây là ảnh phong cảnh ngẫu nhiên từ picsum)
       email: '',
       phone: '',
+      weekendGroup: null,
       password: '',
       baseSalary: 0,
       allowance: 0,
@@ -275,11 +277,18 @@ export const EmployeeManagement: React.FC<Props> = ({ employees, onAdd, onEdit, 
           <span className="text-[11px] font-bold uppercase tracking-wide text-gray-500 truncate">
             {emp.role}
           </span>
-          {emp.employeeCode && (
-            <span className="text-[10px] font-mono text-blue-600 bg-blue-50 px-1.5 py-0.5 rounded w-fit mt-0.5">
-              {emp.employeeCode}
-            </span>
-          )}
+          <div className="flex items-center gap-1 mt-0.5">
+            {emp.employeeCode && (
+              <span className="text-[10px] font-mono text-blue-600 bg-blue-50 px-1.5 py-0.5 rounded w-fit">
+                {emp.employeeCode}
+              </span>
+            )}
+            {emp.weekendGroup && (
+              <span className="text-[10px] font-bold text-amber-700 bg-amber-50 px-1.5 py-0.5 rounded w-fit" title="Nhóm làm Chủ Nhật luân phiên">
+                CN: {emp.weekendGroup}
+              </span>
+            )}
+          </div>
         </div>
       </div>
 
@@ -621,15 +630,31 @@ export const EmployeeManagement: React.FC<Props> = ({ employees, onAdd, onEdit, 
                   />
                 </div>
               </div>
-              <div>
-                <label className="block text-sm text-gray-600 mb-1.5">Ngày làm việc</label>
-                <input
-                  type="text"
-                  value={formData.workDays}
-                  onChange={(e) => setFormData({ ...formData, workDays: e.target.value })}
-                  className="w-full px-4 py-2.5 bg-white text-gray-900 border border-gray-200 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm"
-                  placeholder="1,2,3,4,5,6"
-                />
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-sm text-gray-600 mb-1.5">Ngày làm việc</label>
+                  <input
+                    type="text"
+                    value={formData.workDays}
+                    onChange={(e) => setFormData({ ...formData, workDays: e.target.value })}
+                    className="w-full px-4 py-2.5 bg-white text-gray-900 border border-gray-200 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm"
+                    placeholder="1,2,3,4,5,6"
+                  />
+                </div>
+                <div>
+                  <label className="block text-sm text-gray-600 mb-1.5">
+                    Nhóm làm Chủ Nhật <span className="text-[10px] text-gray-400">(luân phiên A/B — xếp lịch ở Cấu hình Admin)</span>
+                  </label>
+                  <select
+                    value={formData.weekendGroup || ''}
+                    onChange={(e) => setFormData({ ...formData, weekendGroup: (e.target.value || null) as WeekendGroup | null })}
+                    className="w-full px-4 py-2.5 bg-white text-gray-900 border border-gray-200 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm"
+                  >
+                    <option value="">— Chưa xếp —</option>
+                    <option value="A">Nhóm A</option>
+                    <option value="B">Nhóm B</option>
+                  </select>
+                </div>
               </div>
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4 border-t border-gray-100 pt-4">
                 <div>

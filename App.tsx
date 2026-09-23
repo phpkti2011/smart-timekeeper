@@ -51,11 +51,12 @@ import { CompanyCalendar } from './components/CompanyCalendar';
 import { HolidayAlert } from './components/HolidayAlert';
 import { LeaveAlert } from './components/LeaveAlert';
 import { BirthdayAlert } from './components/BirthdayAlert';
+import { WeekendDutyAlert } from './components/WeekendDutyAlert';
 import { AuthScreen } from './components/AuthScreen';
 import { PushNotificationToggle } from './components/PushNotificationToggle';
 import { InstallPrompt } from './components/InstallPrompt';
 import { SalaryConfirmationModal } from './components/SalaryConfirmationModal';
-import { AttendanceLog, AttendanceType, Coordinates, OTRequest, LateRequest, SalaryAdvanceRequest, RequestStatus, UserProfile, BonusFine, LeaveRequest, LeaveType, LeaveDuration, OverrideLog, Holiday, SalaryChange, SwapRequest, ProfileChangeRequest, ProfileChangeSet, ProfileField } from './types';
+import { AttendanceLog, AttendanceType, Coordinates, OTRequest, LateRequest, SalaryAdvanceRequest, RequestStatus, UserProfile, BonusFine, LeaveRequest, LeaveType, LeaveDuration, OverrideLog, Holiday, SalaryChange, SwapRequest, ProfileChangeRequest, ProfileChangeSet, ProfileField, WeekendGroup, WeekendSchedule } from './types';
 
 import { COMPANY_SETTINGS, MOCK_USER, MOCK_EMPLOYEES, MOCK_BONUSES, MOCK_ADVANCES, MOCK_HOLIDAYS } from './constants';
 import { calculateDistance, getCurrentPosition, getPublicIP } from './utils/geo';
@@ -68,6 +69,7 @@ import { validateOTRanges, toMinuteOfDay } from './utils/otRules';
 import { parseRequestDate, formatVNDate } from './utils/dateInput';
 import { mapLeaveRow } from './utils/leaveQueries';
 import { mapSwapRow, toSwapRow, validateSwapRequest, describeSwap, describeSwapShort, findSwapBlockingLeave, makeRestDayPredicate, pairedSunday, SWAP_DEFAULT_REASON } from './utils/restDay';
+import { parseWeekendSchedule, EMPTY_WEEKEND_SCHEDULE, WEEKEND_SCHEDULE_KEY, PUSH_HORIZON_WEEKS, diffSchedules, groupPushMessages, membersOf, membersWithoutSwap, swapsOfOtherGroup, sundayGroupFor, sundayOfWeek, saturdayBefore, findDutyHoliday, weekendGroupLabel, describeSundayDuty } from './utils/weekendGroups';
 import { mapProfileRow, toProfileRow, validateProfileRequest, applyProfileChanges, revertProfileChanges, patchToColumns, describeProfileChangesShort, PROFILE_FIELD_LABEL } from './utils/profileChange';
 import { removeAvatarPath, removePendingAvatars } from './utils/avatarStorage';
 import { isResignedAndHidden, isWorkingEmployee, mapFullProfileRow, mapDirectoryRow } from './utils/employeeFilters';
@@ -113,6 +115,8 @@ const App: React.FC = () => {
   const [holidays, setHolidays] = useState<Holiday[]>(MOCK_HOLIDAYS); // New State
   const [salaryChanges, setSalaryChanges] = useState<SalaryChange[]>([]); // New State: Salary History
   const [lockedMonths, setLockedMonths] = useState<string[]>([]); // New State: Locked Payroll Months
+  const [weekendSchedule, setWeekendSchedule] = useState<WeekendSchedule>(EMPTY_WEEKEND_SCHEDULE); // Lịch nhóm làm CN (settings.weekend_schedule)
+  const [swapInitialRestDate, setSwapInitialRestDate] = useState<string | null>(null); // Thứ 7 điền sẵn khi mở form từ banner nhắc nhóm
 
   // Employees "Database" - Initialize with Mock Data
   const [employees, setEmployees] = useState<UserProfile[]>(MOCK_EMPLOYEES);
@@ -609,6 +613,10 @@ const App: React.FC = () => {
         }
 
         setCompanyConfig(newConfig);
+
+        // Lịch nhóm làm CN — chưa có key thì lịch trống, tính năng im lặng
+        const schedSetting = settingsData.find(s => s.key === WEEKEND_SCHEDULE_KEY);
+        setWeekendSchedule(parseWeekendSchedule(schedSetting?.value));
       }
 
       // 8. Nạp lại hồ sơ đầy đủ của chính mình — KHÔNG lấy từ mảng employees
@@ -967,6 +975,13 @@ const App: React.FC = () => {
           });
         }
       })
+      // 7. Settings — lịch nhóm làm CN. Chỉ có sự kiện nếu bảng nằm trong
+      // publication realtime (add_weekend_groups.sql BƯỚC 5); không có thì
+      // lịch mới hiện khi tải lại — máy Admin đã set state ngay sau khi lưu.
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'settings' }, (payload) => {
+        const rec: any = payload.new;
+        if (rec?.key === WEEKEND_SCHEDULE_KEY) setWeekendSchedule(parseWeekendSchedule(rec.value));
+      })
       .subscribe();
 
     return () => { supabase.removeChannel(channel); }
@@ -1012,6 +1027,156 @@ const App: React.FC = () => {
       console.error("Failed to save settings:", err);
       triggerNotification('Lỗi', 'Không thể lưu vào database');
     }
+  };
+
+  // === NHÓM LÀM CHỦ NHẬT A/B (xếp lịch, nhắc làm đơn đổi ngày nghỉ) ===
+
+  /** Xếp / bỏ một nhân viên khỏi nhóm. Chỉ Admin; ghi thẳng cột profiles.weekend_group, không qua đơn. */
+  const handleSetWeekendGroup = async (userId: string, group: WeekendGroup | null) => {
+    const emp = employees.find(e => e.id === userId);
+    if (!emp) return;
+    const { data, error } = await supabase
+      .from('profiles')
+      .update({ weekend_group: group })
+      .eq('id', userId)
+      .select('id');
+    if (error || !data || data.length === 0) {
+      console.error('Error setting weekend group:', error);
+      alert('⚠️ Không lưu được nhóm.\n\nNếu lỗi nhắc tới cột weekend_group thì cần chạy file add_weekend_groups.sql trên Supabase trước. Không có lỗi mà vẫn không lưu → quyền ghi bảng profiles bị chặn.');
+      return;
+    }
+    setEmployees(prev => prev.map(e => (e.id === userId ? { ...e, weekendGroup: group } : e)));
+    if (currentUser?.id === userId) setCurrentUser(prev => (prev ? { ...prev, weekendGroup: group } : prev));
+    if (group) {
+      sendPushToUser(userId, '👥 Nhóm làm Chủ Nhật', `Admin đã xếp bạn vào ${weekendGroupLabel(group)} làm Chủ Nhật luân phiên. Xem lịch ở tab Lịch công ty.`);
+    } else if (emp.weekendGroup) {
+      sendPushToUser(userId, '👥 Nhóm làm Chủ Nhật', `Admin đã bỏ bạn khỏi ${weekendGroupLabel(emp.weekendGroup)}.`);
+    }
+  };
+
+  /**
+   * Lưu lịch Chủ Nhật: MỘT upsert vào settings, cảnh báo đơn của người ngoài
+   * nhóm mới (không xoá — đơn là chứng từ tính lương), rồi push cho người bị
+   * ảnh hưởng (một push mỗi người). Trả true nếu đã lưu.
+   */
+  const handleSaveWeekendSchedule = async (next: WeekendSchedule): Promise<boolean> => {
+    const today = new Date();
+    const changes = diffSchedules(weekendSchedule, next, today, PUSH_HORIZON_WEEKS);
+
+    const orphanLines = changes.flatMap(c => {
+      const orphans = swapsOfOtherGroup(c.sunday, c.after, employees, swapRequests);
+      if (orphans.length === 0) return [];
+      const names = orphans.map(s => employees.find(e => e.id === s.userId)?.name || s.userName).join(', ');
+      return [`• CN ${format(c.sunday, 'dd/MM')} (${c.before ? weekendGroupLabel(c.before) : 'chưa xếp'} → ${c.after ? weekendGroupLabel(c.after) : 'không nhóm nào'}): ${names}`];
+    });
+    if (orphanLines.length > 0) {
+      const ok = confirm(`⚠️ Có đơn đổi ngày nghỉ của người KHÔNG thuộc nhóm làm CN mới:\n\n${orphanLines.join('\n')}\n\nLịch vẫn được lưu; nếu họ không đi làm nữa, huỷ/từ chối đơn của họ trong mục Duyệt Đơn.\n\nTiếp tục lưu?`);
+      if (!ok) return false;
+    }
+
+    const { data, error } = await supabase
+      .from('settings')
+      .upsert({ key: WEEKEND_SCHEDULE_KEY, value: next })
+      .select('key');
+    if (error || !data || data.length === 0) {
+      console.error('Error saving weekend schedule:', error);
+      alert('⚠️ Không lưu được lịch nhóm làm Chủ Nhật (quyền ghi bảng settings bị chặn hoặc lỗi kết nối). Xem add_weekend_groups.sql.');
+      return false;
+    }
+    setWeekendSchedule(next); // không chờ realtime — bảng settings có thể chưa nằm trong publication
+
+    const messages = groupPushMessages(changes, employees);
+    messages.forEach((body, userId) => sendPushToUser(userId, '👥 Lịch làm Chủ Nhật', body));
+    triggerNotification('Đã lưu lịch', messages.size > 0
+      ? `Đã lưu lịch nhóm làm CN và báo cho ${messages.size} người.`
+      : 'Đã lưu lịch nhóm làm CN.');
+    return true;
+  };
+
+  /**
+   * Admin tạo đơn đổi ngày nghỉ (tự duyệt) cho mọi thành viên của nhóm làm CN
+   * đó mà chưa có đơn. Insert TỪNG NGƯỜI, không gộp: một người vừa tự tạo đơn
+   * (unique index → 23505) thì chỉ người đó bị bỏ qua, những người còn lại vẫn được tạo.
+   */
+  const handleBulkCreateGroupSwaps = async (sundayISO: string) => {
+    const sunday = sundayOfWeek(new Date(`${sundayISO}T00:00:00`));
+    const saturday = saturdayBefore(sunday);
+    const restIso = format(saturday, 'yyyy-MM-dd');
+    const { group } = sundayGroupFor(sunday, weekendSchedule);
+    if (!group) {
+      alert('Chủ Nhật này không có nhóm nào được xếp làm. Lưu lịch trước rồi bấm lại.');
+      return;
+    }
+    if (isMonthLocked(saturday, lockedMonths) || isMonthLocked(sunday, lockedMonths)) {
+      alert(LOCKED_MONTH_MSG);
+      return;
+    }
+    const holiday = findDutyHoliday(sunday, holidays);
+    if (holiday) {
+      alert(`Tuần này trùng ngày lễ "${holiday.name}" — không tạo đơn đổi ngày nghỉ.`);
+      return;
+    }
+
+    const members = membersOf(group, employees);
+    const candidates = membersWithoutSwap(sunday, members, swapRequests);
+    if (candidates.length === 0) {
+      alert(`Mọi thành viên ${weekendGroupLabel(group)} đã có đơn cho CN ${format(sunday, 'dd/MM')}.`);
+      return;
+    }
+
+    const today = format(new Date(), 'yyyy-MM-dd');
+    const valid: UserProfile[] = [];
+    const skipped: string[] = [];
+    for (const m of candidates) {
+      const err = validateSwapRequest({
+        userId: m.id, restDate: restIso, today, isAdmin: true, workDays: m.workDays,
+        holidays, existingSwaps: swapRequests, leaveRequests
+      });
+      if (err) skipped.push(`• ${m.name}: ${err}`);
+      else valid.push(m);
+    }
+    const summary = [
+      `${describeSundayDuty({ sunday, saturday, group })}.`,
+      valid.length > 0
+        ? `Sẽ tạo và DUYỆT ${valid.length} đơn cho: ${valid.map(m => m.name).join(', ')}.`
+        : 'Không có ai hợp lệ để tạo đơn.',
+      skipped.length > 0 ? `\nBỏ qua ${skipped.length} người:\n${skipped.join('\n')}` : ''
+    ].join('\n');
+    if (valid.length === 0) {
+      alert(summary);
+      return;
+    }
+    if (!confirm(`${summary}\n\nTiếp tục?`)) return;
+
+    const created: SwapRequest[] = [];
+    const failed: string[] = [];
+    for (const m of valid) {
+      const { data, error } = await supabase
+        .from('requests')
+        .insert(toSwapRow(m.id, saturday, SWAP_DEFAULT_REASON, 'APPROVED'))
+        .select();
+      if (error) {
+        failed.push(`• ${m.name}: ${(error as any).code === '23505' ? 'đã có đơn (vừa tạo)' : 'lỗi lưu'}`);
+        continue;
+      }
+      if (!data || data.length === 0) {
+        failed.push(`• ${m.name}: quyền ghi bị chặn`);
+        continue;
+      }
+      created.push(...data.map((r: any) => mapSwapRow(r, employees)));
+    }
+    if (created.length > 0) {
+      setSwapRequests(prev => {
+        const ids = new Set(prev.map(s => s.id));
+        return [...prev, ...created.filter(s => !ids.has(s.id))];
+      });
+      for (const s of created) {
+        sendPushToUser(s.userId, '🔁 Đơn đổi ngày nghỉ', `Admin đã tạo và duyệt đơn cho bạn: ${describeSwap(s)}.`);
+      }
+    }
+    alert(`Đã tạo ${created.length} đơn.`
+      + (failed.length > 0 ? `\n\nKhông tạo được ${failed.length}:\n${failed.join('\n')}` : '')
+      + (skipped.length > 0 ? `\n\nBỏ qua ${skipped.length} người không hợp lệ (xem ở trên).` : ''));
   };
 
 
@@ -2189,6 +2354,7 @@ const App: React.FC = () => {
 
     setIsSwapModalOpen(false);
     setSwapRequestTargetUser(null);
+    setSwapInitialRestDate(null);
 
     // Không optimistic: insert rồi lấy dòng thật về, tránh hiện hai đơn khi
     // realtime báo về cùng dòng vừa tạo.
@@ -2467,6 +2633,7 @@ const App: React.FC = () => {
         avatar: emp.avatar,
         email: emp.email,
         phone: emp.phone || null,
+        weekend_group: emp.weekendGroup || null,
         base_salary: emp.baseSalary,
         allowance: emp.allowance,
         work_days: emp.workDays,
@@ -2515,6 +2682,7 @@ const App: React.FC = () => {
         avatar: emp.avatar,
         email: emp.email,
         phone: emp.phone || null,
+        weekend_group: emp.weekendGroup || null,
         // password: emp.password, // Don't save password to profile plain text unless requested
         base_salary: emp.baseSalary,
         allowance: emp.allowance,
@@ -3368,6 +3536,7 @@ const App: React.FC = () => {
                 employees={visibleEmployees}
                 holidays={holidays}
                 currentUser={currentUser}
+                weekendSchedule={weekendSchedule}
               />
             </div>
           )}
@@ -3484,6 +3653,13 @@ const App: React.FC = () => {
             onDeleteHoliday={handleDeleteHoliday}
             onBackup={handleBackup}
             onImportExcel={handleImportExcel}
+            employees={sortedEmployees}
+            swapRequests={swapRequests}
+            weekendSchedule={weekendSchedule}
+            lockedMonths={lockedMonths}
+            onSaveWeekendSchedule={handleSaveWeekendSchedule}
+            onSetWeekendGroup={handleSetWeekendGroup}
+            onBulkCreateGroupSwaps={handleBulkCreateGroupSwaps}
           />
         )}
 
@@ -3580,6 +3756,17 @@ const App: React.FC = () => {
         <HolidayAlert holidays={holidays} />
         <LeaveAlert leaveRequests={leaveRequests} employees={visibleEmployees} currentUser={currentUser} />
         <BirthdayAlert user={currentUser} employees={visibleEmployees} />
+        <WeekendDutyAlert
+          currentUser={currentUser}
+          weekendSchedule={weekendSchedule}
+          swapRequests={mySwapRequests}
+          holidays={holidays}
+          onFileRequest={(restDateISO) => {
+            setSwapRequestTargetUser(null);
+            setSwapInitialRestDate(restDateISO);
+            setIsSwapModalOpen(true);
+          }}
+        />
 
         {/* OT Request Modal */}
         <OTRequestModal
@@ -3696,8 +3883,10 @@ const App: React.FC = () => {
               onClose={() => {
                 setIsSwapModalOpen(false);
                 setSwapRequestTargetUser(null);
+                setSwapInitialRestDate(null);
               }}
               onSubmit={handleSubmitSwapRequest}
+              initialRestDate={swapInitialRestDate}
               targetName={swapRequestTargetUser?.name}
               isAdmin={!!swapRequestTargetUser}
               employeeId={swapUser?.id || ''}
@@ -3722,6 +3911,8 @@ const App: React.FC = () => {
           onSubmit={handleSubmitProfileRequest}
           onCancelPending={handleCancelProfileRequest}
           onGoToSalary={() => { setIsProfileOpen(false); setActiveTab('salary'); }}
+          weekendSchedule={weekendSchedule}
+          swapRequests={mySwapRequests}
         />
 
         {/* General Bonus Modal (Quick Action from HR - Admin Only) */}

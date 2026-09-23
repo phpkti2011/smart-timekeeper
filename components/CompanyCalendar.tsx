@@ -15,8 +15,9 @@ import {
   isSunday,
   startOfDay
 } from 'date-fns';
-import { ChevronLeft, ChevronRight, Calendar as CalendarIcon, Cake } from 'lucide-react';
-import { LeaveRequest, UserProfile, Holiday, SwapRequest } from '../types';
+import { ChevronLeft, ChevronRight, Calendar as CalendarIcon, Cake, Users } from 'lucide-react';
+import { LeaveRequest, UserProfile, Holiday, SwapRequest, WeekendSchedule } from '../types';
+import { sundayGroupFor, summarizeSunday, weekendGroupLabel, EMPTY_WEEKEND_SCHEDULE } from '../utils/weekendGroups';
 import { LEAVE_TYPE_LABEL } from '../utils/leaveTypes';
 import { isWorkingEmployee } from '../utils/employeeFilters';
 import { buildShortNameMap, shortName } from '../utils/nameFormat';
@@ -28,9 +29,11 @@ interface Props {
   employees: UserProfile[];
   holidays: Holiday[];
   currentUser?: UserProfile | null;
+  /** Lịch nhóm làm Chủ Nhật (A/B luân phiên). Không truyền = không vẽ gì. */
+  weekendSchedule?: WeekendSchedule;
 }
 
-export const CompanyCalendar: React.FC<Props> = ({ leaveRequests, swapRequests = [], employees, holidays, currentUser }) => {
+export const CompanyCalendar: React.FC<Props> = ({ leaveRequests, swapRequests = [], employees, holidays, currentUser, weekendSchedule = EMPTY_WEEKEND_SCHEDULE }) => {
   const [currentMonth, setCurrentMonth] = useState(new Date());
 
   const handlePrevMonth = () => setCurrentMonth(subMonths(currentMonth, 1));
@@ -79,6 +82,20 @@ export const CompanyCalendar: React.FC<Props> = ({ leaveRequests, swapRequests =
     () => buildShortNameMap(employees.map(e => e.name)),
     [employees]
   );
+
+  // Lịch nhóm làm CN của các Chủ Nhật trong tháng đang xem — chỉ khi đã xếp lịch
+  const scheduleActive = !!weekendSchedule.anchorSunday || Object.keys(weekendSchedule.overrides).length > 0;
+  const monthSundayRows = useMemo(
+    () => scheduleActive
+      ? calendarDays
+          .filter(d => isSunday(d) && isSameMonth(d, currentMonth))
+          .map(d => summarizeSunday(d, weekendSchedule, employees, swapRequests, holidays))
+      : [],
+    [scheduleActive, calendarDays, currentMonth, weekendSchedule, employees, swapRequests, holidays]
+  );
+  const missingThisMonth = monthSundayRows
+    .filter(r => r.group && r.missing.length > 0 && !r.holiday)
+    .map(r => ({ sunday: r.sunday, names: r.missing.map(m => shortNames.get(m.name) || shortName(m.name)).join(', ') }));
 
   // Ưu tiên khi một người có nhiều đơn phủ cùng một ngày: đã duyệt hơn chờ duyệt,
   // cả ngày hơn nửa buổi. Thẻ hiện ra phải nói đúng điều thực sự xảy ra hôm đó.
@@ -213,6 +230,8 @@ export const CompanyCalendar: React.FC<Props> = ({ leaveRequests, swapRequests =
             const swaps = getSwapsForDay(day);
             const isSun = isSunday(day);
             const isToday = isSameDay(day, new Date());
+            const dutyGroup = isSun ? sundayGroupFor(day, weekendSchedule).group : null;
+            const isMyDuty = !!dutyGroup && currentUser?.weekendGroup === dutyGroup;
 
             return (
               <div
@@ -229,6 +248,16 @@ export const CompanyCalendar: React.FC<Props> = ({ leaveRequests, swapRequests =
 
                 {/* Leave Badges & Birthdays */}
                 <div className="flex-1 flex flex-col gap-1 overflow-hidden">
+                  {/* Nhóm làm Chủ Nhật (lịch luân phiên A/B) */}
+                  {dutyGroup && (
+                    <div
+                      className={`bg-amber-500 text-white text-[10px] px-1 py-0.5 rounded shadow-sm text-center leading-tight font-bold ${isMyDuty ? 'ring-2 ring-amber-800' : ''}`}
+                      title={`${weekendGroupLabel(dutyGroup)} làm Chủ Nhật (nghỉ bù Thứ 7 trước đó)${isMyDuty ? ' — nhóm của bạn' : ''}`}
+                    >
+                      👥 {weekendGroupLabel(dutyGroup)} làm
+                    </div>
+                  )}
+
                   {/* Birthdays */}
                   {birthdays.map(emp => (
                     <div key={emp.id} className="bg-pink-100 text-pink-600 text-[10px] px-1 py-0.5 rounded shadow-sm text-center leading-tight font-bold flex items-center justify-center gap-1" title={`Sinh nhật ${emp.name}`}>
@@ -308,6 +337,10 @@ export const CompanyCalendar: React.FC<Props> = ({ leaveRequests, swapRequests =
             <div className="w-3 h-3 bg-violet-500 rounded"></div>
             <span>Đổi ngày nghỉ (nghỉ T7 / làm CN)</span>
           </div>
+          <div className="flex items-center gap-1">
+            <div className="w-3 h-3 bg-amber-500 rounded"></div>
+            <span>Nhóm làm Chủ Nhật (A/B)</span>
+          </div>
         </div>
       </div>
 
@@ -329,6 +362,38 @@ export const CompanyCalendar: React.FC<Props> = ({ leaveRequests, swapRequests =
               </div>
             ))}
           </div>
+        </div>
+      )}
+
+      {/* Lịch nhóm làm Chủ Nhật tháng này */}
+      {monthSundayRows.length > 0 && (
+        <div className="mx-4 mb-4 mt-2 p-4 bg-amber-50 rounded-xl border border-amber-100">
+          <div className="flex items-center gap-2 mb-2 text-amber-700 font-bold">
+            <Users size={18} />
+            <span>Lịch làm Chủ Nhật tháng {format(currentMonth, 'MM')}</span>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            {monthSundayRows.map(row => {
+              const mine = !!row.group && currentUser?.weekendGroup === row.group;
+              return (
+                <div
+                  key={row.sunday.toISOString()}
+                  className={`text-xs px-3 py-1.5 rounded-full bg-white border shadow-sm ${mine ? 'border-amber-400 font-bold text-amber-800' : 'border-amber-100 text-gray-700'}`}
+                >
+                  CN {format(row.sunday, 'dd/MM')}: {row.group ? weekendGroupLabel(row.group) : (row.source === 'NONE' ? 'không làm' : '—')}
+                  {row.holiday ? ' · trùng lễ' : ''}
+                  {isAdminOrManager && row.group && row.members.length > 0 && (
+                    <span className="text-gray-400 font-normal"> · {row.members.length - row.missing.length}/{row.members.length} có đơn</span>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+          {isAdminOrManager && missingThisMonth.length > 0 && (
+            <div className="mt-2 text-[11px] text-amber-800">
+              Chưa có đơn đổi ngày nghỉ: {missingThisMonth.map(m => `CN ${format(m.sunday, 'dd/MM')}: ${m.names}`).join(' · ')}
+            </div>
+          )}
         </div>
       )}
     </div>

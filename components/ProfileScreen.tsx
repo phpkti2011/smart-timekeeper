@@ -2,10 +2,11 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import {
   X, Camera, Send, Pencil, Info, AlertOctagon, AlertTriangle, Clock, ChevronRight,
-  Mail, Phone, Calendar, Briefcase, IdCard, Wallet, XCircle, User, History
+  Mail, Phone, Calendar, Briefcase, IdCard, Wallet, XCircle, User, History, Users
 } from 'lucide-react';
 import { differenceInMonths, format } from 'date-fns';
-import { ProfileChangeRequest, ProfileChangeSet, UserProfile } from '../types';
+import { ProfileChangeRequest, ProfileChangeSet, UserProfile, SwapRequest, WeekendSchedule } from '../types';
+import { nextDuty, hasSwapForSunday, weekendGroupLabel, EMPTY_WEEKEND_SCHEDULE } from '../utils/weekendGroups';
 import {
   buildProfileChanges, describeProfileChanges, validateProfileRequest, warnPhonePrefix,
   affectsBirthdayBonus, findPendingProfileRequest, changedFields, AVATAR_PENDING_PLACEHOLDER,
@@ -28,6 +29,10 @@ interface Props {
   onSubmit: (changes: ProfileChangeSet, reason: string) => Promise<boolean>;
   onCancelPending: (id: string) => Promise<void>;
   onGoToSalary: () => void;
+  /** Lịch nhóm làm Chủ Nhật — để hiện "Nhóm A, lần tới CN dd/MM" */
+  weekendSchedule?: WeekendSchedule;
+  /** Đơn đổi ngày nghỉ của CHÍNH mình — để ghi "đã có đơn ✓" */
+  swapRequests?: SwapRequest[];
 }
 
 const todayStr = () => format(new Date(), 'yyyy-MM-dd');
@@ -60,9 +65,16 @@ const STATUS_LABEL: Record<string, string> = {
 };
 
 export const ProfileScreen: React.FC<Props> = ({
-  isOpen, onClose, user, requests, remainingLeave, onSubmit, onCancelPending, onGoToSalary
+  isOpen, onClose, user, requests, remainingLeave, onSubmit, onCancelPending, onGoToSalary,
+  weekendSchedule = EMPTY_WEEKEND_SCHEDULE, swapRequests = []
 }) => {
   const [activeTab, setActiveTab] = useState<'PROFILE' | 'HISTORY'>('PROFILE');
+
+  // Nhóm làm Chủ Nhật: lần làm tới trong 8 tuần và đã có đơn đổi ngày nghỉ chưa
+  const duty = nextDuty(user, new Date(), weekendSchedule);
+  const dutyHint = duty
+    ? `Lần tới: CN ${format(duty.sunday, 'dd/MM')} (nghỉ bù T7 ${format(duty.saturday, 'dd/MM')}) — ${hasSwapForSunday(user.id, duty.sunday, swapRequests) ? 'đã có đơn ✓' : 'chưa có đơn đổi ngày nghỉ'}`
+    : (user.weekendGroup ? 'Chưa có Chủ Nhật nào trong 8 tuần tới' : undefined);
   const [editing, setEditing] = useState(false);
   const [name, setName] = useState('');
   const [dobText, setDobText] = useState('');
@@ -400,6 +412,7 @@ export const ProfileScreen: React.FC<Props> = ({
                   />
                   <ReadRow icon={Calendar} label="Ngày ký HĐ chính thức" value={formatVNDate(user.officialContractDate ? String(user.officialContractDate).slice(0, 10) : '')} />
                   <ReadRow icon={Clock} label="Ngày làm việc" value={workDaysLabel(user.workDays)} />
+                  <ReadRow icon={Users} label="Nhóm làm Chủ Nhật" value={weekendGroupLabel(user.weekendGroup)} hint={dutyHint} />
                   <ReadRow icon={User} label="Trạng thái" value={STATUS_LABEL[user.status || 'ACTIVE'] || user.status} />
                 </div>
                 <div className="px-4 py-2 bg-gray-50 border-t border-gray-100 text-[11px] text-gray-500">

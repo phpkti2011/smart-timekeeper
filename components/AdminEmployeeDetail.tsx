@@ -300,6 +300,9 @@ export const AdminEmployeeDetail: React.FC<Props> = ({
                     {employee.phone && (
                       <span className="text-[10px] text-slate-300 bg-slate-700/50 px-1.5 py-0.5 rounded">📞 {employee.phone}</span>
                     )}
+                    {employee.weekendGroup && (
+                      <span className="text-[10px] text-amber-200 bg-amber-900/40 px-1.5 py-0.5 rounded" title="Nhóm làm Chủ Nhật luân phiên">👥 Nhóm {employee.weekendGroup}</span>
+                    )}
                     <span className="text-[10px] text-slate-500 bg-slate-700/50 px-1.5 py-0.5 rounded">Logs: {employeeLogs.length}</span>
                   </div>
                 </div>

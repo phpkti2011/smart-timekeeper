@@ -1,6 +1,6 @@
 # 📋 TÀI LIỆU QUY CÁCH, LOGIC & NGUYÊN TẮC PHẦN MỀM CHẤM CÔNG P&D
 
-> **Phiên bản:** 4.2 | **Cập nhật:** 23/09/2026  
+> **Phiên bản:** 4.3 | **Cập nhật:** 23/09/2026  
 > **Công nghệ:** React + TypeScript + Vite + Supabase (PostgreSQL) + Gemini AI  
 > **Tác giả:** Phạm Hồng Phúc
 
@@ -16,6 +16,7 @@
 6. [Nghỉ phép](#6-nghỉ-phép)
    - [6b. Đổi ngày nghỉ hàng tuần](#6b-đổi-ngày-nghỉ-hàng-tuần)
    - [6c. Đổi thông tin cá nhân](#6c-đổi-thông-tin-cá-nhân)
+   - [6d. Nhóm làm Chủ Nhật (A/B)](#6d-nhóm-làm-chủ-nhật-ab)
 7. [Ngày lễ](#7-ngày-lễ)
 8. [Tính lương](#8-tính-lương)
 9. [Thưởng / Phạt](#9-thưởng--phạt)
@@ -51,7 +52,7 @@
 ### Danh sách bảng DB chính:
 | Bảng | Mô tả |
 |------|-------|
-| `profiles` | Thông tin nhân viên |
+| `profiles` | Thông tin nhân viên (cột `weekend_group`: nhóm làm Chủ Nhật A/B, mục 6d) |
 | `attendance_logs` | Log chấm công |
 | `attendance_overrides` | Điều chỉnh công thủ công |
 | `requests` | Đơn OT / Trễ / Nghỉ phép / Ứng lương / Đổi ngày nghỉ (`SWAP`) / Đổi thông tin cá nhân (`PROFILE`) |
@@ -59,7 +60,7 @@
 | `holidays` | Ngày lễ |
 | `salary_changes` | Lịch sử thay đổi lương |
 | `payroll_periods` | Bảng lương đã chốt |
-| `settings` | Cấu hình GPS/IP công ty |
+| `settings` | Cấu hình GPS/IP công ty (key `company_location`, `wifi_ip`) và **lịch nhóm làm Chủ Nhật** (key `weekend_schedule`, một bản JSON — mục 6d). Chỉ Admin ghi. |
 | `employee_directory` | **VIEW** danh bạ rút gọn (8 cột: id, tên, ảnh, chức vụ, trạng thái, mã NV, ngày sinh, ngày nghỉ việc — **không** lương/email/SĐT). Nhân viên thường đọc đồng nghiệp qua đây. Xem mục 2. |
 | Storage `avatars` | Bucket **công khai** chứa ảnh đại diện: `{uid}/pending-{ts}.jpg` (chờ duyệt) và `{uid}/{ts}.jpg` (đã duyệt / Admin đổi). Xem mục 6c. |
 
@@ -103,6 +104,8 @@ Trước 4.2 mọi nhân viên đăng nhập đều tải về `profiles.select(
 | Đơn ứng lương (`requests.type = 'ADVANCE'`) | ✅ | ✅ | ❌ |
 | Đơn nghỉ / OT / trễ / đổi ngày nghỉ / đổi thông tin | ✅ | ✅ | ✅ (lịch công ty cần) |
 | Ghi `profiles` (UPDATE) | ❌ | ✅ | ❌ |
+| `settings` (GPS/IP, lịch nhóm làm CN) — đọc | ✅ | ✅ | ✅ |
+| `settings` — ghi (từ 4.3, `add_weekend_groups.sql`) | ❌ | ✅ | ❌ |
 
 - Policy dùng hàm `public.is_admin()` (`SECURITY DEFINER`) thay vì SELECT `profiles` trực
   tiếp: policy đặt trên `profiles` mà tự đọc `profiles` sẽ gây lỗi `42P17 infinite
@@ -649,10 +652,101 @@ và màn duyệt ẩn dòng lý do.
   của chính mình không bao giờ hiện; (2) `getVirtualBirthdayBonus` dùng `isSameMonth` so
   cả **năm** nên thưởng sinh nhật **chưa bao giờ** được cộng tự động (xem mục 9); (3)
   `sendPushToManagers` lọc vai trò `'Manager'` không tồn tại trong `UserRole`.
-- Kiểm thử: `npm run test:pure` — 41 test; phần đổi thông tin phủ chuẩn hoá, từng luật
+- Kiểm thử: `npm run test:pure` (54 test từ 4.3); phần đổi thông tin phủ chuẩn hoá, từng luật
   validate, diff, apply/revert idempotent, map dòng, thưởng sinh nhật đổi tháng, và test
   chống tái phát "map dòng danh bạ bằng mapper đầy đủ rồi spread lên `currentUser` làm mất
   lương".
+
+---
+
+## 6d. Nhóm làm Chủ Nhật (A/B)
+
+Công ty xếp hai nhóm làm Chủ Nhật **luân phiên**. Nhóm chỉ là lớp **lập lịch + nhắc việc**
+phía trên đơn đổi ngày nghỉ (mục 6b): ngày làm bù vẫn đi qua đơn `SWAP`, **không có luật
+tiền mới**. Admin xếp người vào nhóm, chọn nhóm nào làm Chủ Nhật nào; phần mềm nhắc người
+trong nhóm làm đơn cho tới khi có đơn; Admin có nút tạo đơn cho cả nhóm. Luật ở
+`utils/weekendGroups.ts` (module thuần, chạy được bằng node).
+
+> **Cần chạy `add_weekend_groups.sql` trên Supabase trước khi deploy** — thêm cột
+> `profiles.weekend_group` (CHECK A/B), siết ghi bảng `settings` về Admin (trước đây không
+> có policy nào trong repo → có thể ai đăng nhập cũng đổi được GPS công ty), nối cột
+> `weekend_group` vào view `employee_directory` nếu view đã có, và đưa `settings` vào
+> publication realtime. Thiếu cột thì Admin không xếp nhóm được và **sửa nhân viên bị từ
+> chối** (payload có `weekend_group`), phần mềm nhắc đúng tên file. Cuối file có khối hoàn tác.
+
+### Dữ liệu
+- **Nhóm**: `profiles.weekend_group` = `'A'` | `'B'` | `NULL` (chưa xếp). Chỉ Admin sửa (tab
+  "Nhóm làm CN" trong Cấu hình Admin, hoặc ô "Nhóm làm Chủ Nhật" ở form Nhân sự). Người nghỉ
+  việc / bị khoá vẫn giữ cột nhưng **không tính là thành viên** (`isWorkingEmployee`).
+- **Lịch**: một bản JSON ở `settings.key = 'weekend_schedule'`:
+
+```json
+{ "version": 1, "anchorSunday": "2026-09-27", "anchorGroup": "A",
+  "overrides": { "2026-10-11": "NONE", "2026-11-01": "A" } }
+```
+
+| Luật | Ý nghĩa |
+|------|---------|
+| Mốc (`anchorSunday`, `anchorGroup`) | Chủ Nhật mốc làm nhóm mốc; các Chủ Nhật **sau** xen kẽ A/B theo tuần chẵn/lẻ (`differenceInCalendarDays / 7`). Chủ Nhật **trước** mốc = không nhóm nào (mốc là ngày bắt đầu, không vẽ lịch giả vào quá khứ). |
+| Ghim (`overrides`) | Ghim tay từng Chủ Nhật: `A`, `B`, hoặc `NONE` (không nhóm nào làm, ví dụ tuần lễ). Ghim thắng luân phiên, lưu tường minh kể cả khi trùng luân phiên để đổi mốc sau này ghim vẫn giữ. Giao diện phân biệt "Tự động (A)" và "A (ghim)". |
+| Chưa có mốc | Mọi Chủ Nhật = không nhóm nào; toàn bộ tính năng **im lặng** (không banner, không push, không dòng Telegram). |
+| Đặt mốc mới | Xoá ghim từ mốc trở đi (hộp xác nhận nêu số ghim); ghim trước mốc giữ vì là lịch sử. |
+| Tuần | Thứ 2 → Chủ Nhật (`endOfWeek`, `weekStartsOn: 1`). Chủ Nhật hôm nay vẫn thuộc "tuần này" — NV còn 7 ngày khai bù. |
+
+**Nhóm làm Chủ Nhật D** ⇒ mỗi thành viên **nghỉ Thứ 7 D−1, làm bù CN D** bằng đơn `SWAP`.
+"Chưa có đơn" = không có đơn `APPROVED`/`PENDING` cho tuần đó (`REJECTED` không tính). Thứ 7
+hoặc CN trùng **ngày lễ** → không nhắc, không tạo đơn (6b đã vô hiệu đơn trùng lễ). Thành
+viên có `workDays` không chứa Thứ 7 bị `validateSwapRequest` từ chối kể cả khi Admin tạo hộ →
+tab nhóm gắn nhãn đỏ cạnh tên.
+
+### Nhắc việc (người chưa có đơn trong nhóm làm CN tuần này)
+| Kênh | Khi nào | Nội dung |
+|------|---------|----------|
+| Push ngay | Admin lưu lịch làm đổi nhóm của một CN trong 8 tuần tới; Admin xếp người vào/ra nhóm | Nhóm mới: "Bạn được xếp làm CN dd/MM, … — nhớ làm đơn đổi ngày nghỉ"; nhóm cũ: "CN dd/MM: nhóm bạn không còn làm". **Một push mỗi người**, gộp tối đa 4 ngày + "…" (`groupPushMessages`). |
+| Push sáng | Cron `api/daily-report.ts` 07:40 Thứ 2 → Thứ 7 (cron báo cáo Telegram sẵn có, **không thêm cron**) | "Nhắc: CN dd/MM nhóm A đi làm — bạn chưa có đơn đổi ngày nghỉ". Gửi trực tiếp bằng `web-push` với client service-role (không tự gọi HTTP vào `/api/send-push-notification`). |
+| Telegram | Cùng báo cáo sáng | Mục "📆 NHÓM LÀM CN dd/MM: Nhóm A (n người) — chưa làm đơn: tên, tên" / "đã đủ đơn ✅". Bỏ mục khi chưa xếp lịch hoặc CN đó không nhóm nào làm. |
+| Banner trong app | Mỗi lần mở app, tắt được theo ngày (`localStorage['weekend_duty_dismissed']`) | **Chỉ nhân viên** (`WeekendDutyAlert`, góc dưới phải): "Chủ Nhật dd/MM nhóm bạn đi làm. Nghỉ bù Thứ 7 dd/MM. Bạn chưa có đơn." + nút **"Làm đơn ngay"** mở form đổi ngày nghỉ đã điền sẵn Thứ 7 (`SwapRequestModal.initialRestDate`). Admin không có banner: đã có Telegram, số đếm trong tab nhóm và tên người thiếu đơn ở footer Lịch công ty. |
+
+### Tạo đơn cho cả nhóm (Admin, từng Chủ Nhật)
+- Chặn nếu tháng của Thứ 7 **hoặc** Chủ Nhật đã chốt lương; chặn nếu trùng lễ.
+- Với mỗi thành viên chưa có đơn: chạy `validateSwapRequest({isAdmin: true})`; hộp xác nhận
+  liệt kê người sẽ tạo và người bị bỏ qua kèm lý do. Đơn tạo ra `APPROVED` ngay (Admin tạo hộ
+  = tự duyệt, đúng 6b), `reason` = `SWAP_DEFAULT_REASON`.
+- Insert **từng người một**, không gộp một lệnh: một người vừa tự tạo đơn (unique index
+  `requests_swap_one_per_week`, mã `23505`) thì chỉ người đó bị bỏ qua "đã có đơn (vừa tạo)",
+  những người còn lại vẫn được tạo. Xong push từng người, một hộp tổng kết.
+- Nút chỉ bật khi lịch **đã lưu** (đang sửa dở thì phải lưu trước, vì đơn tạo theo lịch đã lưu).
+
+### Đổi lịch khi đã có đơn
+Chuyển CN từ nhóm A sang B/`NONE` khi thành viên A (hoặc người chưa xếp nhóm) đã có đơn cho
+CN đó → hộp xác nhận liệt kê **tên người đã có đơn** ("Lịch vẫn được lưu; huỷ/từ chối đơn
+trong Duyệt Đơn nếu họ không đi làm"). **Không xoá tự động** — đơn là chứng từ tính lương.
+Dòng lịch giữ nhãn "j đơn ngoài nhóm" cho tới khi dọn.
+
+### Hiển thị
+- **Cấu hình Admin → tab "Nhóm làm CN"** (`WeekendGroupPanel`): hai cột thành viên A | B
+  (chọn là lưu ngay), khối "Bắt đầu luân phiên" (chọn Chủ Nhật mốc + nhóm), 12 Chủ Nhật tới
+  với ô chọn "Tự động (X) / A / B / Không", nhãn trùng lễ / tháng đã chốt, dòng "n thành viên
+  · m có đơn · k chưa", nút "Tạo đơn cho k người". Lịch sửa trên bản nháp, nút "Lưu lịch" ghi
+  **một** upsert và bắn **một** đợt push.
+- **Nhân sự**: chip "CN: A" cạnh mã NV; form có ô "Nhóm làm Chủ Nhật". **Chi tiết NV**: chip
+  "👥 Nhóm A".
+- **Lịch công ty**: ô Chủ Nhật có thẻ hổ phách "👥 Nhóm A làm" (viền đậm nếu là nhóm của
+  mình); footer "Lịch làm Chủ Nhật tháng MM" liệt kê từng CN, Admin/QLSX thấy thêm "m/n có
+  đơn" và tên người chưa có đơn.
+- **Hồ sơ cá nhân**: dòng "Nhóm làm Chủ Nhật: Nhóm A — Lần tới: CN dd/MM (nghỉ bù T7 dd/MM)
+  — đã có đơn ✓ / chưa có đơn".
+
+### Ghi chú
+- `api/daily-report.ts` **chép tay** hàm `sundayGroupFor` (serverless không import được
+  `utils/`) — sửa luật luân phiên ở `utils/weekendGroups.ts` thì sửa cả bên đó. Cron đọc
+  lịch và nhóm bằng truy vấn **tách riêng**; chưa chạy SQL thì chỉ mất mục nhóm, báo cáo còn
+  lại vẫn gửi.
+- Realtime: `settings` được thêm vào channel; nếu bảng chưa nằm trong publication thì lịch
+  mới hiện khi tải lại, riêng máy Admin đã set state ngay sau khi lưu.
+- Kiểm thử: `npm run test:pure` — 54 test; phần nhóm phủ parse phòng thủ, luân phiên / trước
+  mốc / ghim, đặt mốc lại, tuần, thành viên, "chưa có đơn", đơn ngoài nhóm, nhiệm vụ tuần,
+  diff lịch + gộp push, và cột `weekendGroup` qua cả hai mapper.
 
 ---
 
@@ -865,6 +959,7 @@ Lắng nghe thay đổi realtime trên 6 bảng:
 | `attendance_overrides` | Cập nhật override |
 | `profiles` | Cập nhật khi có nhân viên mới đăng ký / Admin sửa hồ sơ. **Sau khi siết RLS (mục 2)** nhân viên thường chỉ còn nhận sự kiện trên dòng của **chính mình** (→ `refreshCurrentUser`); tên/ảnh mới của đồng nghiệp chỉ hiện khi tải lại trang. |
 | `payroll_periods` | Cập nhật khi chốt/mở lương |
+| `settings` | Lịch nhóm làm Chủ Nhật (`weekend_schedule`) — chỉ có sự kiện nếu bảng nằm trong publication (`add_weekend_groups.sql` BƯỚC 5) |
 
 ### Thông báo
 1. **Browser Notification** (nếu được cấp quyền).
@@ -880,6 +975,8 @@ Lắng nghe thay đổi realtime trên 6 bảng:
 | Thưởng/Phạt mới | ❌ | ✅ (của mình) |
 | Nhân viên mới đăng ký | ✅ | ❌ |
 | Chốt lương | ❌ | ✅ |
+| Xếp vào / bỏ khỏi nhóm làm CN; đổi lịch CN của nhóm | ❌ | ✅ (push, một lần mỗi người) |
+| Sáng T2–T7: chưa có đơn đổi ngày nghỉ cho CN tuần này | Telegram (danh sách tên) | ✅ (push từ cron) |
 
 ---
 
@@ -924,6 +1021,7 @@ Lắng nghe thay đổi realtime trên 6 bảng:
 | `resignationDate` | string | Ngày nghỉ việc |
 | `phone` | string \| null | Số điện thoại, 10 số bắt đầu bằng 0; **không trùng** (unique index `profiles_phone_unique`); null = chưa khai |
 | `isDirectoryOnly` | boolean | `true` = hồ sơ rút gọn từ view `employee_directory` — không có lương/email/SĐT, **không** đưa vào tính lương |
+| `weekendGroup` | 'A' \| 'B' \| null | Nhóm làm Chủ Nhật luân phiên (cột `weekend_group`); null = chưa xếp. Chỉ Admin sửa. Xem mục 6d. |
 
 ### Loại hợp đồng (`contractType`)
 | Giá trị | Mô tả |

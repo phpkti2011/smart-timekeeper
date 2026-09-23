@@ -88,7 +88,8 @@ $$;
 REVOKE ALL ON FUNCTION public.is_admin() FROM PUBLIC, anon;
 GRANT EXECUTE ON FUNCTION public.is_admin() TO authenticated;
 
--- BƯỚC 2: VIEW danh bạ — 8 cột, cố ý KHÔNG có base_salary / allowance /
+-- BƯỚC 2: VIEW danh bạ — 8 cột (+ weekend_group nếu đã chạy add_weekend_groups.sql),
+-- cố ý KHÔNG có base_salary / allowance /
 -- insurance_salary / used_leave_legacy / email / phone / contract_date.
 -- ⚠️ CỐ Ý KHÔNG đặt security_invoker = true. View này PHẢI bỏ qua RLS của
 --   profiles thì nhân viên mới đọc được dòng của đồng nghiệp. Supabase
@@ -96,10 +97,21 @@ GRANT EXECUTE ON FUNCTION public.is_admin() TO authenticated;
 --   "sửa cho hết warning": sửa là Lịch công ty trống trơn ngay.
 --   Bù lại: WHERE auth.uid() IS NOT NULL chặn người chưa đăng nhập, và
 --   REVOKE khỏi anon chặn ai cầm anon key trần.
-CREATE OR REPLACE VIEW public.employee_directory AS
-  SELECT id, name, avatar, role, status, employee_code, date_of_birth, resignation_date
-  FROM   public.profiles
-  WHERE  auth.uid() IS NOT NULL;
+-- Cột weekend_group (add_weekend_groups.sql) chỉ đưa vào nếu đã có, để file này
+-- chạy được ở cả hai thứ tự. CREATE OR REPLACE VIEW chỉ cho NỐI cột ở cuối.
+DO $$
+DECLARE extra TEXT := '';
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE  table_schema = 'public' AND table_name = 'profiles' AND column_name = 'weekend_group'
+  ) THEN
+    extra := ', weekend_group';
+  END IF;
+  EXECUTE 'CREATE OR REPLACE VIEW public.employee_directory AS '
+       || 'SELECT id, name, avatar, role, status, employee_code, date_of_birth, resignation_date' || extra
+       || ' FROM public.profiles WHERE auth.uid() IS NOT NULL';
+END $$;
 
 REVOKE ALL ON public.employee_directory FROM PUBLIC, anon;
 GRANT SELECT ON public.employee_directory TO authenticated;

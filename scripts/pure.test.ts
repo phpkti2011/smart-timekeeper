@@ -9,8 +9,14 @@ import assert from 'node:assert/strict';
 import { eachDayOfInterval, endOfMonth, format, startOfMonth } from 'date-fns';
 import {
   resolveRestDay, validateSwapRequest, findOverlappingSwap, findSwapBlockingLeave,
-  pairedSunday, isSwapVoidedByHoliday, makeRestDayPredicate, toSwapRow, mapSwapRow, SWAP_DEFAULT_REASON
+  pairedSunday, isSwapVoidedByHoliday, makeRestDayPredicate, toSwapRow, mapSwapRow, SWAP_DEFAULT_REASON, dayKeyOf
 } from '../utils/restDay';
+import {
+  parseWeekendSchedule, sundayGroupFor, autoGroupFor, setSundayGroup, startRotation, pinsFrom,
+  sundayOfWeek, saturdayBefore, upcomingSundays, membersOf, unassignedWorking, hasSaturdayInWorkDays,
+  hasSwapForSunday, membersWithoutSwap, swapsOfOtherGroup, dutyForWeek, nextDuty, diffSchedules,
+  groupPushMessages, findDutyHoliday, summarizeSunday, describeSundayDuty, EMPTY_WEEKEND_SCHEDULE
+} from '../utils/weekendGroups';
 import { calculateDailyStats } from '../utils/attendanceCalculator';
 import { calculateMonthlySalary, getVirtualBirthdayBonus } from '../utils/salaryCalculator';
 import { countLeaveDays, leaveDayMap, findOverlappingLeave } from '../utils/leaveTypes';
@@ -21,7 +27,7 @@ import {
   computeCoverCrop, PROFILE_DEFAULT_REASON
 } from '../utils/profileChange';
 import { mapDirectoryRow, mapFullProfileRow } from '../utils/employeeFilters';
-import { AttendanceLog, AttendanceType, Holiday, LeaveRequest, SwapRequest, UserProfile, ProfileChangeRequest, ProfileChangeSet } from '../types';
+import { AttendanceLog, AttendanceType, Holiday, LeaveRequest, SwapRequest, UserProfile, ProfileChangeRequest, ProfileChangeSet, WeekendSchedule } from '../types';
 
 // calculateMonthlySalary in ra console.log debug — tắt cho gọn
 console.log = () => { };
@@ -516,4 +522,153 @@ test('chống tái phát: map dòng danh bạ bằng mapper ĐẦY ĐỦ rồi s
   assert.equal(wrong.baseSalary, undefined);
   const right = { ...me, ...mapDirectoryRow(dirRow) };                   // mapDirectoryRow KHÔNG tạo key lương → không ghi đè
   assert.equal(right.baseSalary, 26000000);
+});
+
+// === NHÓM LÀM CHỦ NHẬT A/B ===
+// Chủ Nhật năm 2025: 28/09, 05/10, 12/10, 19/10, 26/10, 02/11 ...
+const SCHED: WeekendSchedule = { version: 1, anchorSunday: '2025-10-05', anchorGroup: 'A', overrides: {} };
+const GA1: UserProfile = { ...EMP, id: 'a1', name: 'An A', weekendGroup: 'A' };
+const GA2: UserProfile = { ...EMP, id: 'a2', name: 'Bình A', weekendGroup: 'A' };
+const GB1: UserProfile = { ...EMP, id: 'b1', name: 'Cúc B', weekendGroup: 'B' };
+const GA_RESIGNED: UserProfile = { ...EMP, id: 'a9', name: 'Đã nghỉ', weekendGroup: 'A', resignationDate: '2025-06-30' };
+const GA_LOCKED: UserProfile = { ...EMP, id: 'a8', name: 'Bị khoá', weekendGroup: 'A', status: 'LOCKED' };
+const NOGROUP: UserProfile = { ...EMP, id: 'n1', name: 'Chưa xếp', weekendGroup: null };
+const STAFF = [GA1, GA2, GB1, GA_RESIGNED, GA_LOCKED, NOGROUP];
+const swapFor = (userId: string, restIso: string, status: SwapRequest['status'] = 'APPROVED'): SwapRequest =>
+  ({ ...mkSwap(restIso, status, `${userId}-${restIso}`), userId });
+
+test('parseWeekendSchedule: chịu được chuỗi JSON, rác, key không phải Chủ Nhật, giá trị lạ', () => {
+  const ok = parseWeekendSchedule(JSON.stringify({
+    anchorSunday: '2025-10-05', anchorGroup: 'B',
+    overrides: { '2025-10-12': 'NONE', '2025-10-13': 'A', '2025-10-19': 'C' }
+  }));
+  assert.equal(ok.anchorSunday, '2025-10-05');
+  assert.equal(ok.anchorGroup, 'B');
+  assert.deepEqual(ok.overrides, { '2025-10-12': 'NONE' });        // 13/10 là Thứ 2, 'C' không hợp lệ → bỏ
+  assert.deepEqual(parseWeekendSchedule(null), EMPTY_WEEKEND_SCHEDULE);
+  assert.deepEqual(parseWeekendSchedule('{oops'), EMPTY_WEEKEND_SCHEDULE);
+  assert.deepEqual(parseWeekendSchedule(42), EMPTY_WEEKEND_SCHEDULE);
+  assert.equal(parseWeekendSchedule({ anchorSunday: '2025-10-06', anchorGroup: 'A' }).anchorSunday, null); // mốc là Thứ 2 → bỏ
+  assert.equal(parseWeekendSchedule({ anchorGroup: 'X' }).anchorGroup, 'A');
+});
+
+test('sundayGroupFor: luân phiên sau mốc, trước mốc = không ai, chưa có mốc = không ai', () => {
+  const g = (iso: string) => sundayGroupFor(D(iso), SCHED);
+  assert.deepEqual(g('2025-10-05'), { group: 'A', source: 'AUTO' });
+  assert.equal(g('2025-10-12').group, 'B');
+  assert.equal(g('2025-10-19').group, 'A');
+  assert.equal(g('2025-10-26').group, 'B');
+  assert.equal(g('2025-11-02').group, 'A');
+  assert.deepEqual(g('2025-09-28'), { group: null, source: 'UNSET' });
+  assert.equal(g('2025-10-08').group, 'B');                          // Thứ 4 → theo CN 12/10 của tuần đó
+  assert.deepEqual(sundayGroupFor(D('2025-10-05'), EMPTY_WEEKEND_SCHEDULE), { group: null, source: 'UNSET' });
+});
+
+test('ghim thắng luân phiên; NONE = không nhóm nào; AUTO bỏ ghim; autoGroupFor bỏ qua ghim', () => {
+  let s = setSundayGroup(SCHED, D('2025-10-12'), 'A');               // luân phiên là B
+  assert.deepEqual(sundayGroupFor(D('2025-10-12'), s), { group: 'A', source: 'PIN' });
+  assert.equal(autoGroupFor(D('2025-10-12'), s), 'B');
+  s = setSundayGroup(s, D('2025-10-19'), 'NONE');
+  assert.deepEqual(sundayGroupFor(D('2025-10-19'), s), { group: null, source: 'NONE' });
+  s = setSundayGroup(s, D('2025-10-15'), 'AUTO');                    // Thứ 4 → CN 19/10
+  assert.equal(s.overrides['2025-10-19'], undefined);
+  assert.equal(sundayGroupFor(D('2025-10-19'), s).source, 'AUTO');
+  assert.deepEqual(SCHED.overrides, {});                              // không đụng bản gốc
+});
+
+test('startRotation: ép về Chủ Nhật, xoá ghim từ mốc trở đi, giữ ghim trước mốc', () => {
+  const s: WeekendSchedule = { ...SCHED, overrides: { '2025-09-28': 'B', '2025-10-12': 'NONE', '2025-10-19': 'A' } };
+  assert.deepEqual(pinsFrom(s, D('2025-10-15')), ['2025-10-19']);
+  const next = startRotation(s, D('2025-10-15'), 'B');              // Thứ 4 → mốc CN 19/10
+  assert.equal(next.anchorSunday, '2025-10-19');
+  assert.equal(next.anchorGroup, 'B');
+  assert.deepEqual(next.overrides, { '2025-09-28': 'B', '2025-10-12': 'NONE' });
+  assert.equal(sundayGroupFor(D('2025-10-26'), next).group, 'A');
+});
+
+test('sundayOfWeek / saturdayBefore / upcomingSundays: tuần Thứ 2 → Chủ Nhật', () => {
+  assert.equal(dayKeyOf(sundayOfWeek(D('2025-10-06'))), '2025-10-12');   // Thứ 2
+  assert.equal(dayKeyOf(sundayOfWeek(D('2025-10-11'))), '2025-10-12');   // Thứ 7
+  assert.equal(dayKeyOf(sundayOfWeek(D('2025-10-12'))), '2025-10-12');   // chính Chủ Nhật
+  assert.equal(dayKeyOf(saturdayBefore(D('2025-10-12'))), '2025-10-11');
+  assert.deepEqual(upcomingSundays(D('2025-10-12'), 3).map(dayKeyOf), ['2025-10-12', '2025-10-19', '2025-10-26']);
+});
+
+test('membersOf: đúng nhóm và đang làm việc; loại nghỉ việc, bị khoá, chưa xếp', () => {
+  assert.deepEqual(membersOf('A', STAFF).map(e => e.id), ['a1', 'a2']);
+  assert.deepEqual(membersOf('B', STAFF).map(e => e.id), ['b1']);
+  assert.deepEqual(unassignedWorking(STAFF).map(e => e.id), ['n1']);
+  assert.equal(hasSaturdayInWorkDays('1,2,3,4,5'), false);
+  assert.equal(hasSaturdayInWorkDays(undefined), true);
+});
+
+test('membersWithoutSwap: đơn PENDING cũng tính là "đã có", REJECTED thì không', () => {
+  const swaps = [swapFor('a1', '2025-10-04', 'PENDING'), swapFor('a2', '2025-10-04', 'REJECTED')];
+  assert.deepEqual(membersWithoutSwap(D('2025-10-05'), membersOf('A', STAFF), swaps).map(e => e.id), ['a2']);
+  assert.equal(hasSwapForSunday('a1', D('2025-10-05'), swaps), true);
+  assert.equal(hasSwapForSunday('a1', D('2025-10-12'), swaps), false);
+});
+
+test('swapsOfOtherGroup: đơn của người ngoài nhóm làm CN đó (nhóm cũ / chưa xếp)', () => {
+  const swaps = [swapFor('a1', '2025-10-04'), swapFor('b1', '2025-10-04'), swapFor('n1', '2025-10-04'), swapFor('b1', '2025-10-11')];
+  assert.deepEqual(swapsOfOtherGroup(D('2025-10-05'), 'A', STAFF, swaps).map(s => s.userId), ['b1', 'n1']);
+  assert.deepEqual(swapsOfOtherGroup(D('2025-10-05'), null, STAFF, swaps).map(s => s.userId), ['a1', 'b1', 'n1']);
+});
+
+test('dutyForWeek / nextDuty: theo nhóm của NV và tuần chứa hôm nay', () => {
+  const d = dutyForWeek(GA1, D('2025-10-01'), SCHED);                // Thứ 4 tuần có CN 05/10 (A)
+  assert.ok(d);
+  assert.equal(dayKeyOf(d!.sunday), '2025-10-05');
+  assert.equal(dayKeyOf(d!.saturday), '2025-10-04');
+  assert.equal(d!.group, 'A');
+  assert.equal(dutyForWeek(GA1, D('2025-10-05'), SCHED)?.group, 'A');  // chính Chủ Nhật vẫn là tuần này
+  assert.equal(dutyForWeek(GB1, D('2025-10-01'), SCHED), null);
+  assert.equal(dutyForWeek(GA_RESIGNED, D('2025-10-01'), SCHED), null);
+  assert.equal(dutyForWeek(NOGROUP, D('2025-10-01'), SCHED), null);
+  assert.equal(dutyForWeek(GA1, D('2025-10-01'), EMPTY_WEEKEND_SCHEDULE), null);
+  assert.equal(dayKeyOf(nextDuty(GB1, D('2025-10-06'), SCHED)!.sunday), '2025-10-12');
+  assert.equal(nextDuty(GB1, D('2025-10-06'), EMPTY_WEEKEND_SCHEDULE), null);
+});
+
+test('diffSchedules + groupPushMessages: một push mỗi người, tối đa 4 ngày, báo cả "không còn làm"', () => {
+  const changes = diffSchedules(EMPTY_WEEKEND_SCHEDULE, SCHED, D('2025-10-01'), 10);
+  assert.equal(changes.length, 10);
+  assert.deepEqual(changes.slice(0, 2).map(c => [dayKeyOf(c.sunday), c.before, c.after]),
+    [['2025-10-05', null, 'A'], ['2025-10-12', null, 'B']]);
+  const msgs = groupPushMessages(changes, STAFF);
+  assert.deepEqual([...msgs.keys()].sort(), ['a1', 'a2', 'b1']);     // không gửi người nghỉ việc / khoá / chưa xếp
+  assert.match(msgs.get('a1')!, /05\/10, 19\/10, 02\/11, 16\/11…/);  // 5 Chủ Nhật của A → cắt còn 4
+  assert.doesNotMatch(msgs.get('a1')!, /không còn làm/);
+  // Ghim CN 05/10 thành NONE → chỉ nhóm A bị "không còn làm"
+  const off = groupPushMessages(
+    diffSchedules(SCHED, setSundayGroup(SCHED, D('2025-10-05'), 'NONE'), D('2025-10-01'), 8), STAFF);
+  assert.deepEqual([...off.keys()].sort(), ['a1', 'a2']);
+  assert.match(off.get('a1')!, /05\/10.*không còn làm/);
+  assert.deepEqual(diffSchedules(SCHED, SCHED, D('2025-10-01'), 8), []);
+});
+
+test('findDutyHoliday: lễ rơi vào Thứ 7 hoặc Chủ Nhật của tuần đó', () => {
+  const h: Holiday[] = [{ id: 'h', date: D('2025-10-04'), name: 'Lễ thử' }];
+  assert.equal(findDutyHoliday(D('2025-10-05'), h)?.name, 'Lễ thử');
+  assert.equal(findDutyHoliday(D('2025-10-12'), h), null);
+});
+
+test('summarizeSunday + describeSundayDuty: dữ liệu cho một dòng lịch', () => {
+  const swaps = [swapFor('a1', '2025-10-04'), swapFor('b1', '2025-10-04')];
+  const row = summarizeSunday(D('2025-10-05'), SCHED, STAFF, swaps);
+  assert.equal(row.group, 'A');
+  assert.equal(row.source, 'AUTO');
+  assert.deepEqual(row.members.map(e => e.id), ['a1', 'a2']);
+  assert.deepEqual(row.missing.map(e => e.id), ['a2']);
+  assert.deepEqual(row.otherSwaps.map(s => s.userId), ['b1']);
+  assert.equal(row.holiday, null);
+  assert.equal(describeSundayDuty({ sunday: D('2025-10-05'), saturday: D('2025-10-04'), group: 'A' }),
+    'Nhóm A làm CN 05/10 — nghỉ bù T7 04/10');
+});
+
+test('weekendGroup đi qua cả hai mapper; view cũ thiếu cột → null', () => {
+  assert.equal(mapFullProfileRow({ id: 'u1', name: 'A', role: 'Admin', weekend_group: 'B' }).weekendGroup, 'B');
+  assert.equal(mapFullProfileRow({ id: 'u1', name: 'A', role: 'Admin' }).weekendGroup, null);
+  assert.equal(mapDirectoryRow({ id: 'u1', name: 'A', role: 'Admin', weekend_group: 'A' }).weekendGroup, 'A');
+  assert.equal(mapDirectoryRow({ id: 'u1', name: 'A', role: 'Admin' }).weekendGroup, null);
 });

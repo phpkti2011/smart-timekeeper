@@ -69,6 +69,7 @@ export interface UserProfile {
   dateOfBirth?: string | null; // ISO Date YYYY-MM-DD
   email?: string;
   phone?: string | null; // Số di động, chuẩn hoá 10 số bắt đầu bằng 0. NULL = chưa khai.
+  weekendGroup?: WeekendGroup | null; // Nhóm làm Chủ Nhật luân phiên (cột profiles.weekend_group). NULL = chưa xếp.
   password?: string; // Replaced managerEmail
   baseSalary?: number;
   allowance?: number;
@@ -198,6 +199,31 @@ export interface SwapRequest extends BaseRequestInfo {
   workDate: Date;   // Chủ Nhật làm bù = restDate + 1 (cột requests.swap_work_date)
   reason: string;
   status: RequestStatus;
+}
+
+// --- NHÓM LÀM CHỦ NHẬT (A/B) ---
+/**
+ * Công ty xếp hai nhóm làm Chủ Nhật luân phiên. Nhóm chỉ là lớp LẬP LỊCH +
+ * NHẮC VIỆC: ngày làm bù vẫn đi qua đơn SWAP ở trên, không có luật tiền riêng.
+ * Xem utils/weekendGroups.ts.
+ */
+export type WeekendGroup = 'A' | 'B';
+
+/** Giá trị ghim cho một Chủ Nhật: nhóm A/B, hoặc NONE = không nhóm nào làm. */
+export type SundayAssignment = WeekendGroup | 'NONE';
+
+/**
+ * Lịch Chủ Nhật, lưu nguyên một bản JSON ở settings.key = 'weekend_schedule'.
+ * - anchorSunday: Chủ Nhật mốc ('yyyy-MM-dd'), làm nhóm anchorGroup; các Chủ Nhật
+ *   SAU mốc xen kẽ A/B. Trước mốc = không nhóm nào (mốc là ngày bắt đầu).
+ * - overrides: ghim tay từng Chủ Nhật, thắng luân phiên. Lưu tường minh kể cả
+ *   khi trùng luân phiên, để đổi mốc sau này ghim vẫn giữ.
+ */
+export interface WeekendSchedule {
+  version: 1;
+  anchorSunday: string | null;
+  anchorGroup: WeekendGroup;
+  overrides: Record<string, SundayAssignment>;
 }
 
 // --- ĐỔI THÔNG TIN CÁ NHÂN ---

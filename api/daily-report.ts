@@ -1,4 +1,5 @@
 import { createClient } from '@supabase/supabase-js';
+import webpush from 'web-push';
 
 // === CONFIG ===
 const SUPABASE_URL = process.env.VITE_SUPABASE_URL || '';
@@ -10,6 +11,18 @@ const CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, {
   auth: { persistSession: false, autoRefreshToken: false }
 });
+
+// Push nhắc nhóm làm CN: gửi thẳng bằng web-push (cùng VAPID với
+// api/send-push-notification.ts) thay vì tự gọi HTTP vào endpoint đó —
+// domain *.vercel.app có thể bị Deployment Protection chặn.
+const PUSH_READY = !!(process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY);
+if (PUSH_READY) {
+  webpush.setVapidDetails(
+    process.env.VAPID_SUBJECT || 'mailto:admin@smarttimekeeper.com',
+    process.env.VAPID_PUBLIC_KEY || '',
+    process.env.VAPID_PRIVATE_KEY || ''
+  );
+}
 
 // === HELPERS ===
 function formatDate(d: Date): string {
@@ -75,8 +88,123 @@ function getLastWorkingDay(): Date {
 // cửa sổ truy vấn log theo ngày UTC bên dưới.
 const ymd = (v: any): string => (v ? String(v).slice(0, 10) : '');
 
+// === NHÓM LÀM CHỦ NHẬT A/B ===
+// CHÉP TAY từ utils/weekendGroups.ts (serverless không import được utils/):
+// ghim thắng luân phiên; trước mốc = không ai; sau mốc xen kẽ theo tuần chẵn/lẻ.
+// Sửa luật bên đó thì sửa cả đây.
+type WeekendGroup = 'A' | 'B';
+
+interface WeekendReminder {
+  configured: boolean;                      // đã có lịch (mốc hoặc ghim) chưa
+  sunday: string | null;                    // 'yyyy-MM-dd' Chủ Nhật sắp tới
+  group: WeekendGroup | null;               // nhóm làm CN đó
+  holiday: boolean;                         // T7 hoặc CN trùng lễ → không nhắc
+  members: { id: string; name: string }[];  // thành viên đang làm việc
+  missing: { id: string; name: string }[];  // chưa có đơn đổi ngày nghỉ
+}
+const EMPTY_REMINDER: WeekendReminder = { configured: false, sunday: null, group: null, holiday: false, members: [], missing: [] };
+
+const isoToUtcMs = (iso: string) => Date.UTC(+iso.slice(0, 4), +iso.slice(5, 7) - 1, +iso.slice(8, 10));
+const shiftIso = (iso: string, days: number) => new Date(isoToUtcMs(iso) + days * 86400000).toISOString().slice(0, 10);
+const ddmm = (iso: string) => `${iso.slice(8, 10)}/${iso.slice(5, 7)}`;
+
+function sundayGroupFor(sundayISO: string, schedule: any): WeekendGroup | null {
+  const pin = schedule?.overrides?.[sundayISO];
+  if (pin === 'NONE') return null;
+  if (pin === 'A' || pin === 'B') return pin;
+  const anchor = typeof schedule?.anchorSunday === 'string' ? schedule.anchorSunday : null;
+  if (!anchor) return null;
+  const anchorGroup: WeekendGroup = schedule?.anchorGroup === 'B' ? 'B' : 'A';
+  const weeks = Math.round((isoToUtcMs(sundayISO) - isoToUtcMs(anchor)) / (7 * 86400000));
+  if (weeks < 0) return null;
+  return weeks % 2 === 0 ? anchorGroup : (anchorGroup === 'A' ? 'B' : 'A');
+}
+
+/**
+ * Ai trong nhóm làm CN sắp tới chưa có đơn đổi ngày nghỉ. Truy vấn TÁCH RIÊNG
+ * (settings, profiles.weekend_group, holidays): chưa chạy add_weekend_groups.sql
+ * thì chỉ mất mục này, báo cáo còn lại vẫn gửi.
+ */
+async function buildWeekendReminder(employees: any[], swapRows: any[], today: Date): Promise<WeekendReminder> {
+  try {
+    const { data: setting, error } = await supabase
+      .from('settings').select('value').eq('key', 'weekend_schedule').maybeSingle();
+    if (error) return EMPTY_REMINDER;
+    let schedule: any = setting?.value ?? null;
+    if (typeof schedule === 'string') {
+      try { schedule = JSON.parse(schedule); } catch { schedule = null; }
+    }
+    const configured = !!schedule && (!!schedule.anchorSunday || Object.keys(schedule.overrides || {}).length > 0);
+    if (!configured) return EMPTY_REMINDER;
+
+    // Cron chạy T2–T7 nên CN sắp tới luôn ở phía trước; chạy tay đúng Chủ Nhật thì lấy hôm nay.
+    const dow = today.getDay();
+    const sundayISO = formatDateISO(getVNDate(dow === 0 ? 0 : 7 - dow));
+    const saturdayISO = shiftIso(sundayISO, -1);
+    const group = sundayGroupFor(sundayISO, schedule);
+    if (!group) return { ...EMPTY_REMINDER, configured: true, sunday: sundayISO };
+
+    const { data: hol } = await supabase.from('holidays').select('date');
+    const holiday = (hol || []).some((h: any) => ymd(h.date) === sundayISO || ymd(h.date) === saturdayISO);
+
+    const { data: groupRows, error: gErr } = await supabase
+      .from('profiles').select('id').eq('weekend_group', group);
+    if (gErr) return { ...EMPTY_REMINDER, configured: true, sunday: sundayISO, group, holiday };
+    const ids = new Set((groupRows || []).map((r: any) => r.id));
+    // `employees` đã lọc ACTIVE; loại thêm người đã nghỉ việc
+    const members = employees
+      .filter((e: any) => ids.has(e.id) && !e.resignation_date)
+      .map((e: any) => ({ id: e.id, name: e.name }));
+    // Đã có đơn = APPROVED hoặc PENDING có swap_work_date đúng CN đó (swapRows đã lọc 2 status này)
+    const hasSwap = (uid: string) => swapRows.some((s: any) => s.user_id === uid && ymd(s.swap_work_date) === sundayISO);
+    const missing = holiday ? [] : members.filter(m => !hasSwap(m.id));
+    return { configured: true, sunday: sundayISO, group, holiday, members, missing };
+  } catch (err) {
+    console.error('Weekend reminder error:', err);
+    return EMPTY_REMINDER;
+  }
+}
+
+async function pushToUser(userId: string, title: string, body: string): Promise<{ sent: number; failed: number }> {
+  const { data: subs } = await supabase.from('push_subscriptions').select('*').eq('user_id', userId);
+  if (!subs?.length) return { sent: 0, failed: 0 };
+  const payload = JSON.stringify({ title, body, url: '/' });
+  let sent = 0;
+  let failed = 0;
+  const stale: string[] = [];
+  await Promise.allSettled(subs.map(async (sub: any) => {
+    try {
+      await webpush.sendNotification({ endpoint: sub.endpoint, keys: { p256dh: sub.p256dh, auth: sub.auth } }, payload);
+      sent++;
+    } catch (err: any) {
+      failed++;
+      if (err?.statusCode === 410 || err?.statusCode === 404) stale.push(sub.endpoint);
+    }
+  }));
+  if (stale.length > 0) {
+    await supabase.from('push_subscriptions').delete().eq('user_id', userId).in('endpoint', stale);
+  }
+  return { sent, failed };
+}
+
+/** Push nhắc từng người chưa có đơn. Song song (Promise.allSettled) — hàm Vercel Hobby chỉ có 10 giây. */
+async function sendWeekendReminders(r: WeekendReminder): Promise<{ pushSent: number; pushFailed: number; skipped?: string }> {
+  if (!r.sunday || !r.group || r.holiday || r.missing.length === 0) return { pushSent: 0, pushFailed: 0 };
+  if (!PUSH_READY) return { pushSent: 0, pushFailed: 0, skipped: 'Thiếu VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY' };
+  const title = '🔁 Nhắc làm đơn đổi ngày nghỉ';
+  const body = `CN ${ddmm(r.sunday)} nhóm ${r.group} đi làm (nghỉ bù T7 ${ddmm(shiftIso(r.sunday, -1))}). Bạn chưa có đơn đổi ngày nghỉ — chưa có đơn thì Thứ 7 vẫn tính là ngày làm việc.`;
+  const results = await Promise.allSettled(r.missing.map(m => pushToUser(m.id, title, body)));
+  let pushSent = 0;
+  let pushFailed = 0;
+  for (const res of results) {
+    if (res.status === 'fulfilled') { pushSent += res.value.sent; pushFailed += res.value.failed; }
+    else pushFailed++;
+  }
+  return { pushSent, pushFailed };
+}
+
 // === MAIN LOGIC ===
-async function generateReport(): Promise<string> {
+async function generateReport(): Promise<{ text: string; reminders: WeekendReminder }> {
   const yesterday = getLastWorkingDay();
   const today = getVNDate(0);
   const tomorrow = getVNDate(1);
@@ -118,7 +246,7 @@ async function generateReport(): Promise<string> {
     .eq('status', 'ACTIVE');
 
   if (!employees || employees.length === 0) {
-    return '📋 Không có nhân viên nào trong hệ thống.';
+    return { text: '📋 Không có nhân viên nào trong hệ thống.', reminders: EMPTY_REMINDER };
   }
 
   // 2. Fetch attendance logs cho ngày báo cáo (và Chủ Nhật làm bù, nếu có).
@@ -399,6 +527,9 @@ async function generateReport(): Promise<string> {
     swapThisWeek.push(`  • ${emp.name} - nghỉ T7 ${formatDate(new Date(restISO))}, làm bù CN ${formatDate(new Date(workISO))}${statusLabel}`);
   }
 
+  // === NHÓM LÀM CHỦ NHẬT A/B ===
+  const weekend = await buildWeekendReminder(employees, swapRows || [], today);
+
   // === BUILD MESSAGE ===
   const sections: string[] = [];
 
@@ -466,10 +597,26 @@ async function generateReport(): Promise<string> {
     sections.push([...new Set(swapThisWeek)].join('\n'));
   }
 
+  // Nhóm làm Chủ Nhật — chỉ khi đã xếp lịch (mục 6d PHAN_MEM_QUY_CACH.md)
+  if (weekend.configured && weekend.sunday) {
+    sections.push('');
+    const cn = ddmm(weekend.sunday);
+    if (!weekend.group) {
+      sections.push(`📆 <b>NHÓM LÀM CN ${cn}</b>: không nhóm nào làm`);
+    } else if (weekend.holiday) {
+      sections.push(`📆 <b>NHÓM LÀM CN ${cn}</b>: Nhóm ${weekend.group} — trùng ngày lễ, không cần đơn`);
+    } else {
+      sections.push(`📆 <b>NHÓM LÀM CN ${cn}</b>: Nhóm ${weekend.group} (${weekend.members.length} người)`);
+      sections.push(weekend.missing.length > 0
+        ? `  ⚠️ Chưa làm đơn đổi ngày nghỉ: ${weekend.missing.map(m => m.name).join(', ')}`
+        : '  ✅ Tất cả đã có đơn đổi ngày nghỉ');
+    }
+  }
+
   sections.push('');
   sections.push('⏳ = Chờ duyệt');
 
-  return sections.join('\n');
+  return { text: sections.join('\n'), reminders: weekend };
 }
 
 // === VERCEL HANDLER ===
@@ -494,10 +641,11 @@ export default async function handler(req: any, res: any) {
     hasServiceRole: !!process.env.SUPABASE_SERVICE_ROLE_KEY,
     hasSupabaseUrl: !!process.env.VITE_SUPABASE_URL,
     hasCronSecret: !!process.env.CRON_SECRET,
+    hasVapid: PUSH_READY,
   };
 
   try {
-    const report = await generateReport();
+    const { text: report, reminders } = await generateReport();
 
     // Split if message too long (Telegram limit: 4096 chars)
     let results: Array<{ ok: boolean; status: number; body: string }> = [];
@@ -521,11 +669,22 @@ export default async function handler(req: any, res: any) {
       });
     }
 
+    // Push nhắc người chưa có đơn — SAU Telegram, để lỗi push không chặn báo cáo
+    const pushResult = await sendWeekendReminders(reminders);
+
     return res.status(200).json({
       success: true,
       message: 'Report sent to Telegram',
       timestamp: new Date().toISOString(),
       reportLength: report.length,
+      weekendReminder: {
+        sunday: reminders.sunday,
+        group: reminders.group,
+        holiday: reminders.holiday,
+        members: reminders.members.length,
+        missing: reminders.missing.length,
+        ...pushResult,
+      },
       env: envCheck,
     });
   } catch (error: any) {

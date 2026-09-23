@@ -26,6 +26,8 @@ interface Props {
   existingSwaps: SwapRequest[];
   /** Toàn bộ đơn nghỉ phép — validate tự lọc theo employeeId */
   leaveRequests: LeaveRequest[];
+  /** Thứ 7 điền sẵn ('yyyy-MM-dd') khi mở từ banner nhắc nhóm làm CN */
+  initialRestDate?: string | null;
 }
 
 const todayStr = () => format(new Date(), 'yyyy-MM-dd');
@@ -38,7 +40,7 @@ const nextSaturdayStr = () => {
 };
 
 export const SwapRequestModal: React.FC<Props> = ({
-  isOpen, onClose, onSubmit, targetName, isAdmin, employeeId, workDays, holidays, existingSwaps, leaveRequests
+  isOpen, onClose, onSubmit, targetName, isAdmin, employeeId, workDays, holidays, existingSwaps, leaveRequests, initialRestDate
 }) => {
   const [activeTab, setActiveTab] = useState<'REQUEST' | 'HISTORY'>('REQUEST');
   const [restDate, setRestDate] = useState(nextSaturdayStr());
@@ -47,8 +49,8 @@ export const SwapRequestModal: React.FC<Props> = ({
   useEffect(() => {
     if (!isOpen) return;
     setActiveTab('REQUEST');
-    setRestDate(nextSaturdayStr());
-  }, [isOpen, employeeId]);
+    setRestDate(initialRestDate || nextSaturdayStr());
+  }, [isOpen, employeeId, initialRestDate]);
 
   if (!isOpen) return null;
 

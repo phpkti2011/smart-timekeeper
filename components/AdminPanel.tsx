@@ -1,9 +1,11 @@
 
 import React, { useState, useEffect } from 'react';
-import { Coordinates, Holiday } from '../types';
+import { Coordinates, Holiday, SwapRequest, UserProfile, WeekendGroup, WeekendSchedule } from '../types';
 import { getCurrentPosition, getPublicIP } from '../utils/geo';
 import { MapPin, Globe, Save, X, RefreshCw, Server, Calendar, Trash2, Plus, ArrowRight } from 'lucide-react';
 import { format } from 'date-fns';
+import { WeekendGroupPanel } from './WeekendGroupPanel';
+import { EMPTY_WEEKEND_SCHEDULE } from '../utils/weekendGroups';
 
 interface Props {
   isOpen: boolean;
@@ -14,6 +16,14 @@ interface Props {
   holidays: Holiday[];
   onAddHoliday: (startDate: string, endDate: string, name: string, duration: 'FULL' | 'MORNING' | 'AFTERNOON') => void;
   onDeleteHoliday: (id: string) => void;
+  // Tab "Nhóm làm CN" — xem utils/weekendGroups.ts
+  employees?: UserProfile[];
+  swapRequests?: SwapRequest[];
+  weekendSchedule?: WeekendSchedule;
+  lockedMonths?: string[];
+  onSaveWeekendSchedule?: (next: WeekendSchedule) => Promise<boolean>;
+  onSetWeekendGroup?: (userId: string, group: WeekendGroup | null) => Promise<void>;
+  onBulkCreateGroupSwaps?: (sundayISO: string) => Promise<void>;
 }
 
 export const AdminPanel: React.FC<Props> = ({
@@ -24,9 +34,16 @@ export const AdminPanel: React.FC<Props> = ({
   initialIp,
   holidays,
   onAddHoliday,
-  onDeleteHoliday
+  onDeleteHoliday,
+  employees = [],
+  swapRequests = [],
+  weekendSchedule = EMPTY_WEEKEND_SCHEDULE,
+  lockedMonths = [],
+  onSaveWeekendSchedule,
+  onSetWeekendGroup,
+  onBulkCreateGroupSwaps
 }) => {
-  const [activeTab, setActiveTab] = useState<'CONFIG' | 'HOLIDAYS'>('CONFIG');
+  const [activeTab, setActiveTab] = useState<'CONFIG' | 'HOLIDAYS' | 'GROUPS'>('CONFIG');
 
   // Config State
   const [lat, setLat] = useState('');
@@ -107,7 +124,7 @@ export const AdminPanel: React.FC<Props> = ({
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm animate-fade-in">
-      <div className="bg-white rounded-2xl w-full max-w-sm overflow-hidden shadow-2xl flex flex-col max-h-[85vh]">
+      <div className={`bg-white rounded-2xl w-full ${activeTab === 'GROUPS' ? 'max-w-md' : 'max-w-sm'} overflow-hidden shadow-2xl flex flex-col max-h-[85vh]`}>
         <div className="bg-slate-800 p-4 flex justify-between items-center text-white shrink-0">
           <div className="flex items-center gap-2">
             <Server size={20} />
@@ -131,6 +148,12 @@ export const AdminPanel: React.FC<Props> = ({
             className={`flex-1 py-2 text-xs font-bold rounded-lg transition-all ${activeTab === 'HOLIDAYS' ? 'bg-white shadow text-slate-800' : 'text-slate-500 hover:text-slate-700'}`}
           >
             Quản lý Ngày Lễ
+          </button>
+          <button
+            onClick={() => setActiveTab('GROUPS')}
+            className={`flex-1 py-2 text-xs font-bold rounded-lg transition-all ${activeTab === 'GROUPS' ? 'bg-white shadow text-slate-800' : 'text-slate-500 hover:text-slate-700'}`}
+          >
+            Nhóm làm CN
           </button>
         </div>
 
@@ -336,6 +359,19 @@ export const AdminPanel: React.FC<Props> = ({
                 ))}
               </div>
             </div>
+          )}
+
+          {activeTab === 'GROUPS' && onSaveWeekendSchedule && onSetWeekendGroup && onBulkCreateGroupSwaps && (
+            <WeekendGroupPanel
+              employees={employees}
+              swapRequests={swapRequests}
+              holidays={holidays}
+              weekendSchedule={weekendSchedule}
+              lockedMonths={lockedMonths}
+              onSaveSchedule={onSaveWeekendSchedule}
+              onSetGroup={onSetWeekendGroup}
+              onBulkCreate={onBulkCreateGroupSwaps}
+            />
           )}
         </div>
       </div>

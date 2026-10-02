@@ -51,7 +51,7 @@ interface Props {
   leaveRequests: LeaveRequest[];
   swapRequests: SwapRequest[];
   onDeleteSalaryChange: (id: string, userId: string) => void;
-  onAddSalaryChange: (data: { baseSalary: number; allowance: number; insuranceSalary: number; effectiveDate: string; reason: string }) => void;
+  onAddSalaryChange: (data: { baseSalary: number; allowance: number; insuranceSalary: number; effectiveDate: string; reason: string }) => Promise<boolean>;
   onRequestCreate: (type: 'LEAVE' | 'ADVANCE' | 'OT' | 'SWAP', targetEmployee: UserProfile) => void;
   lockedMonths: string[]; // New prop
 }

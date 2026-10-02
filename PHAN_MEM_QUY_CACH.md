@@ -579,16 +579,20 @@ nhân viên không tự sửa được gì. Các trường công ty quản lý (
 ngày vào làm, ngày ký HĐ chính thức, ngày làm việc, lương) chỉ đọc — sai thì liên hệ Admin.
 Toàn bộ luật nằm ở `utils/profileChange.ts` (module thuần, chạy được bằng node).
 
-> **Cần chạy 3 file SQL trên Supabase, theo thứ tự:**
+> **Cần chạy 4 file SQL trên Supabase, theo thứ tự:**
 > 1. `add_profile_request_type.sql` — **trước khi deploy**: thêm `PROFILE` vào CHECK của
 >    cột `type`; cột `requests.profile_changes` (JSONB); cột `profiles.phone` + unique index
 >    chống trùng số; unique index "mỗi người một đơn PROFILE đang chờ"; policy cho nhân viên
 >    tự xoá đơn PROFILE `PENDING` của mình. Thiếu thì insert bị từ chối và phần mềm nhắc
 >    đúng tên file.
-> 2. `setup_avatar_storage.sql` — **trước khi deploy**: bucket `avatars` (công khai, 2 MB,
+> 2. `add_processed_at.sql` — **trước khi deploy**: cột `requests.processed_at` (giờ Admin
+>    duyệt/từ chối). App đọc cột này từ lâu nhưng nó **chưa bao giờ có trong DB**; từ bản này
+>    MỌI loại đơn đều ghi nó khi đổi trạng thái. Thiếu thì mọi nút Duyệt/Từ chối báo lỗi nêu
+>    đúng tên file (không hỏng dữ liệu, nhưng Admin bị kẹt) — vì vậy phải chạy TRƯỚC khi push.
+> 3. `setup_avatar_storage.sql` — **trước khi deploy**: bucket `avatars` (công khai, 2 MB,
 >    jpeg/png/webp) và 4 policy "đọc công khai; ghi/sửa/xoá trong thư mục của mình hoặc là
 >    Admin".
-> 3. `restrict_profile_salary_access.sql` — **sau khi deploy**, xem mục 2 "Ai đọc được gì".
+> 4. `restrict_profile_salary_access.sql` — **sau khi deploy**, xem mục 2 "Ai đọc được gì".
 
 ### Dữ liệu đơn
 Cột `date` = ngày gửi (để lọc tháng / sắp xếp như đơn khác). Cột `profile_changes` chỉ chứa
@@ -628,7 +632,16 @@ và màn duyệt ẩn dòng lý do.
   trường mà giá trị hiện tại vẫn bằng giá trị mới** — ai sửa tay sau đó thì bỏ qua và nói
   rõ; đơn về `PENDING`. Thứ tự cũng là `profiles` trước, status sau.
 - Admin sửa trực tiếp trong tab Nhân sự (kể cả số điện thoại, ảnh) → ghi thẳng, không cần
-  đơn. Ghi `processed_at` khi duyệt/từ chối.
+  đơn.
+- **Đổi trạng thái đơn — MỌI loại** (nghỉ phép, tăng ca, đi trễ, ứng lương, đổi ngày nghỉ, đổi
+  thông tin) đi qua `updateRequestStatus` (`utils/requestPersistence.ts`): ghi `status`,
+  `rejection_reason`, `processed_at` (giờ xử lý; hoàn duyệt về `PENDING` thì xoá về NULL) và
+  **chỉ coi là xong khi máy chủ trả về dòng đã ghi** — RLS chặn lặng lẽ (0 dòng) hay thiếu cột
+  đều hiện lỗi gốc rồi hoàn tác trạng thái trên màn hình. Màn Duyệt đơn và Lịch sử nghỉ phép
+  hiện "Duyệt lúc" từ cột này.
+  Bài học (lỗi 02/10/2026): mapper đọc cột kiểu `r.processed_at ? … : undefined` nên cột chưa
+  tồn tại **không lộ khi đọc, chỉ lộ khi ghi** — và thông báo lỗi khi đó lại giấu
+  `error.message`. Cột mới phải có file SQL kèm (`add_processed_at.sql`) và alert phải in lỗi gốc.
 - Sau khi duyệt, hồ sơ của chính nhân viên được nạp lại (`refreshCurrentUser`) nên header
   đổi tên/ảnh ngay; đồng nghiệp thấy tên/ảnh mới khi tải lại (xem mục 15).
 

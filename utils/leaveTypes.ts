@@ -1,4 +1,4 @@
-import { addDays, differenceInMonths, eachDayOfInterval, isSameDay, isSunday, startOfDay, startOfYear } from 'date-fns';
+import { addDays, differenceInMonths, eachDayOfInterval, isSameDay, isSunday, isValid, parseISO, startOfDay, startOfYear } from 'date-fns';
 import { Holiday, LeaveRequest, LeaveType, RequestStatus, UserProfile } from '../types';
 
 // === LUẬT PHÉP NĂM ===
@@ -17,8 +17,26 @@ export const MONTHLY_PAID_LEAVE_QUOTA = 2;
 export type RestDayPredicate = (d: Date) => boolean;
 const defaultRestDay: RestDayPredicate = isSunday;
 
+export const MATERNITY_LEAVE_REASON = 'Nghỉ thai sản (sinh con)';
+type LeaveDayRange = Pick<LeaveRequest, 'startDate' | 'endDate' | 'duration'>
+  & Partial<Pick<LeaveRequest, 'leaveType' | 'reason'>>;
+
+export const isMaternityLeave = (req: Partial<Pick<LeaveRequest, 'leaveType' | 'reason'>>): boolean =>
+  req.leaveType === 'INSURANCE' && req.reason === MATERNITY_LEAVE_REASON;
+
+/** Ngày đi làm lại không thuộc kỳ nghỉ; số ngày nghỉ chỉ loại Chủ nhật. */
+export const maternityLeaveFromReturnDate = (startDate: string, returnDate: string) => {
+  const start = parseISO(startDate);
+  const returning = parseISO(returnDate);
+  if (!isValid(start) || !isValid(returning) || returning <= start) return null;
+  const endDate = addDays(returning, -1);
+  const days = eachDayOfInterval({ start, end: endDate });
+  return { endDate, days: days.filter(d => !isSunday(d)).length };
+};
+
 // Ngày kết thúc để kỳ nghỉ phủ đúng `workingDays` ngày làm việc (bỏ qua ngày nghỉ tuần)
 export const deriveLeaveEndDate = (start: Date, workingDays: number, isRestDay: RestDayPredicate = defaultRestDay): Date => {
+  if (!isValid(start) || !Number.isFinite(workingDays) || workingDays <= 0) return start;
   let counted = 0;
   let cursor = start;
   let end = start;
@@ -117,10 +135,15 @@ export interface LeaveDayBreakdown {
 // công nên cũng không trừ phép). Đây là nguồn công thức duy nhất — countLeaveDays
 // gọi lại hàm này để con số và phần giải thích không bao giờ lệch nhau.
 export const explainLeaveDays = (
-  req: Pick<LeaveRequest, 'startDate' | 'endDate' | 'duration'>,
+  req: LeaveDayRange,
   holidays: Holiday[] = [],
   isRestDay: RestDayPredicate = defaultRestDay
 ): LeaveDayBreakdown => {
+  // Kỳ nghỉ thai sản đếm T2–T7, kể cả ngày lễ; không dùng lịch đổi ngày nghỉ.
+  if (isMaternityLeave(req)) {
+    holidays = [];
+    isRestDay = defaultRestDay;
+  }
   const start = startOfDay(new Date(req.startDate));
   const end = startOfDay(new Date(req.endDate));
 
@@ -128,7 +151,7 @@ export const explainLeaveDays = (
     calendarDays: 0, sundayDays: 0, holidayDays: 0, holidayNames: [],
     countedDays: 0, isHalfDay: false, isCrossYear: false
   };
-  if (end < start) return empty;
+  if (!isValid(start) || !isValid(end) || end < start) return empty;
 
   const isCrossYear = start.getFullYear() !== end.getFullYear();
 
@@ -181,7 +204,7 @@ export const explainLeaveDays = (
 
 // Số ngày phép thực bị trừ của 1 đơn
 export const countLeaveDays = (
-  req: Pick<LeaveRequest, 'startDate' | 'endDate' | 'duration'>,
+  req: LeaveDayRange,
   holidays: Holiday[] = [],
   isRestDay: RestDayPredicate = defaultRestDay
 ): number => explainLeaveDays(req, holidays, isRestDay).countedDays;
@@ -201,14 +224,18 @@ export const dayKey = (d: Date): string =>
  * tốt hơn là để explainLeaveDays gọi vào đây.
  */
 export const leaveDayMap = (
-  req: Pick<LeaveRequest, 'startDate' | 'endDate' | 'duration'>,
+  req: LeaveDayRange,
   holidays: Holiday[] = [],
   isRestDay: RestDayPredicate = defaultRestDay
 ): Map<string, number> => {
+  if (isMaternityLeave(req)) {
+    holidays = [];
+    isRestDay = defaultRestDay;
+  }
   const map = new Map<string, number>();
   const start = startOfDay(new Date(req.startDate));
   const end = startOfDay(new Date(req.endDate));
-  if (end < start) return map;
+  if (!isValid(start) || !isValid(end) || end < start) return map;
 
   if (isSameDay(start, end)) {
     if (isRestDay(start) || isFullHoliday(start, holidays)) return map;
@@ -286,7 +313,7 @@ const OCCUPYING_STATUSES: RequestStatus[] = ['APPROVED', 'PENDING'];
  */
 export const findOverlappingLeave = (
   userId: string,
-  range: Pick<LeaveRequest, 'startDate' | 'endDate' | 'duration'>,
+  range: LeaveDayRange,
   existing: LeaveRequest[],
   opts: { holidays?: Holiday[]; excludeId?: string; isRestDay?: RestDayPredicate } = {}
 ): LeaveRequest | null => {
@@ -515,7 +542,7 @@ export const SPECIAL_LEAVE_REASONS: SpecialLeaveReason[] = [
   { value: 'Nghỉ tang cha/mẹ (hai bên), vợ/chồng, con', suggestedDays: 3, leaveType: 'SPECIAL', group: 'Hiếu hỉ', basis: 'Điều 115.1 BLLĐ — 3 ngày hưởng nguyên lương' },
 
   // --- Chế độ BHXH: công ty KHÔNG trả lương những ngày này ---
-  { value: 'Nghỉ thai sản (sinh con)', suggestedDays: null, leaveType: 'INSURANCE', group: 'Thai sản (BHXH)', basis: 'Luật BHXH — 6 tháng, BHXH chi trả. Nhập số ngày làm việc thực tế của kỳ nghỉ.' },
+  { value: MATERNITY_LEAVE_REASON, suggestedDays: null, leaveType: 'INSURANCE', group: 'Thai sản (BHXH)', basis: 'BHXH chi trả. Chọn ngày đi làm lại để tự tính số ngày nghỉ, không tính Chủ nhật.' },
   { value: 'Nghỉ khám thai', suggestedDays: 1, leaveType: 'INSURANCE', group: 'Thai sản (BHXH)', basis: 'Luật BHXH — 5 lần, mỗi lần 1 ngày, BHXH chi trả' },
   { value: 'Nghỉ sẩy thai / nạo, hút thai', suggestedDays: null, leaveType: 'INSURANCE', group: 'Thai sản (BHXH)', basis: 'Luật BHXH — theo tuổi thai, BHXH chi trả' },
   { value: 'Nghỉ do vợ sinh con (lao động nam)', suggestedDays: 5, leaveType: 'INSURANCE', group: 'Thai sản (BHXH)', basis: 'Luật BHXH — 5 đến 14 ngày tuỳ trường hợp, BHXH chi trả' },

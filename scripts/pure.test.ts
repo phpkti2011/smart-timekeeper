@@ -5,6 +5,11 @@
 // validate, tính công ngày, tính lương tháng và đếm ngày phép. Dùng các tháng
 // năm 2025 (đã qua) vì calculator bỏ qua ngày tương lai.
 import { test } from 'node:test';
+import { saveSalaryChange, salarySaveErrorMessage } from '../utils/salaryChanges';
+import {
+  persistLeaveRequest, leaveSubmitErrorMessage, fetchRecentAndPendingRequests, LeaveSubmission,
+  requestStatusPatch, updateRequestStatus, requestStatusErrorMessage
+} from '../utils/requestPersistence';
 import assert from 'node:assert/strict';
 import { eachDayOfInterval, endOfMonth, format, startOfMonth } from 'date-fns';
 import {
@@ -19,7 +24,7 @@ import {
 } from '../utils/weekendGroups';
 import { calculateDailyStats } from '../utils/attendanceCalculator';
 import { calculateMonthlySalary, getVirtualBirthdayBonus } from '../utils/salaryCalculator';
-import { countLeaveDays, leaveDayMap, findOverlappingLeave } from '../utils/leaveTypes';
+import { countLeaveDays, leaveDayMap, findOverlappingLeave, maternityLeaveFromReturnDate, MATERNITY_LEAVE_REASON, explainLeaveDays } from '../utils/leaveTypes';
 import {
   normalizeName, normalizePhone, validateName, validateDateOfBirth, validatePhone, warnPhonePrefix,
   validateAvatarUrl, buildProfileChanges, describeProfileChanges, validateProfileRequest,
@@ -40,6 +45,217 @@ const EMP: UserProfile = {
 };
 
 const D = (iso: string) => new Date(`${iso}T00:00:00`);
+
+test('Gửi đơn thai sản: nhân viên chờ duyệt, giữ khoảng nghỉ sang năm sau và ID máy chủ', async () => {
+  let payload: any;
+  const client: any = { from: () => ({ insert: (row: any) => {
+    payload = row;
+    return { select: () => ({ single: async () => ({ data: { ...row, id: 'stored-leave' }, error: null }) }) };
+  } }) };
+  const input: LeaveSubmission = { startDate: '2026-10-01', endDate: '2027-03-31', type: 'INSURANCE', duration: 'FULL', reason: MATERNITY_LEAVE_REASON };
+  const saved = await persistLeaveRequest(client, { id: 'employee', role: EMP.role }, 'employee', input, true);
+  assert.equal(saved.id, 'stored-leave');
+  assert.equal(payload.status, 'PENDING');
+  assert.equal(payload.leave_type, 'INSURANCE');
+  assert.equal(payload.end_date.slice(0, 10), '2027-03-31');
+  await assert.rejects(persistLeaveRequest(client, { id: 'employee', role: EMP.role }, 'someone-else', input, false));
+  await persistLeaveRequest(client, { id: 'admin', role: 'Admin' }, 'employee', input, true);
+  assert.equal(payload.status, 'APPROVED');
+});
+
+test('Gửi đơn: lỗi ràng buộc/RLS hoặc không có xác nhận không được coi là thành công', async () => {
+  const input: LeaveSubmission = { startDate: '2026-10-01', endDate: '2027-03-31', type: 'INSURANCE', duration: 'FULL', reason: MATERNITY_LEAVE_REASON };
+  for (const error of [
+    { code: '23514', message: 'violates check constraint requests_leave_type_check' },
+    { code: '42501', message: 'row-level security policy' }, null
+  ]) {
+    const client: any = { from: () => ({ insert: () => ({ select: () => ({ single: async () => ({ data: null, error }) }) }) }) };
+    await assert.rejects(persistLeaveRequest(client, { id: 'employee', role: EMP.role }, 'employee', input, false));
+  }
+  assert.match(leaveSubmitErrorMessage({ code: '23514', message: 'requests_leave_type_check' }), /add_insurance_leave_type.sql/);
+  assert.match(leaveSubmitErrorMessage({ code: '42501' }), /quyền truy cập/);
+});
+
+test('Đổi trạng thái đơn: ghi processed_at khi duyệt/từ chối, xoá khi hoàn duyệt', () => {
+  const now = new Date('2026-10-02T03:47:00.000Z');
+  assert.deepEqual(requestStatusPatch('APPROVED', '', now),
+    { status: 'APPROVED', rejection_reason: null, processed_at: '2026-10-02T03:47:00.000Z' });
+  assert.deepEqual(requestStatusPatch('REJECTED', 'Thiếu giấy tờ', now),
+    { status: 'REJECTED', rejection_reason: 'Thiếu giấy tờ', processed_at: '2026-10-02T03:47:00.000Z' });
+  assert.deepEqual(requestStatusPatch('PENDING', undefined, now),
+    { status: 'PENDING', rejection_reason: null, processed_at: null });
+});
+
+test('Đổi trạng thái đơn: chỉ coi là xong khi máy chủ trả dòng đã ghi; lỗi phải nêu đúng file SQL', async () => {
+  const calls: any[] = [];
+  const makeClient = (result: { data: any; error: any }): any => ({ from: (table: string) => {
+    calls.push(['from', table]);
+    const query: any = {
+      update: (patch: any) => { calls.push(['update', patch]); return query; },
+      eq: (col: string, val: any) => { calls.push(['eq', col, val]); return query; },
+      select: async () => result
+    };
+    return query;
+  } });
+
+  const row = await updateRequestStatus(
+    makeClient({ data: [{ id: 'r1', status: 'APPROVED', processed_at: '2026-10-02T03:47:00.000Z' }], error: null }),
+    'r1', 'APPROVED', undefined, 'PROFILE'
+  );
+  assert.equal(row.id, 'r1');
+  assert.deepEqual(calls.filter(c => c[0] === 'eq'), [['eq', 'id', 'r1'], ['eq', 'type', 'PROFILE']]);
+  const patch = calls.find(c => c[0] === 'update')[1];
+  assert.equal(patch.status, 'APPROVED');
+  assert.ok(typeof patch.processed_at === 'string' && patch.processed_at.length > 0);
+
+  // Không truyền type thì không khoá theo type
+  calls.length = 0;
+  await updateRequestStatus(makeClient({ data: [{ id: 'r2' }], error: null }), 'r2', 'REJECTED', 'Trùng đơn');
+  assert.deepEqual(calls.filter(c => c[0] === 'eq'), [['eq', 'id', 'r2']]);
+
+  // RLS chặn lặng lẽ → 0 dòng → phải báo lỗi, không coi là thành công
+  await assert.rejects(updateRequestStatus(makeClient({ data: [], error: null }), 'r1', 'APPROVED'), /không xác nhận/);
+  // Lỗi PostgREST được ném nguyên vẹn để nơi gọi dịch mã lỗi
+  const pgError = { code: 'PGRST204', message: "Could not find the 'processed_at' column of 'requests' in the schema cache" };
+  await assert.rejects(updateRequestStatus(makeClient({ data: null, error: pgError }), 'r1', 'APPROVED'), (e: any) => e === pgError);
+
+  assert.match(requestStatusErrorMessage(pgError), /add_processed_at\.sql/);
+  assert.match(requestStatusErrorMessage({ code: '42703', message: 'column "processed_at" does not exist' }), /add_processed_at\.sql/);
+  assert.match(requestStatusErrorMessage({ code: '42501', message: 'new row violates row-level security policy' }), /quyền/);
+  assert.match(requestStatusErrorMessage({ message: 'network failed' }), /network failed/);
+});
+
+test('Danh sách duyệt: lấy đơn PENDING không giới hạn thời gian và đọc đủ các trang', async () => {
+  const ranges: number[][] = [];
+  const client: any = { from: () => {
+    const query: any = {
+      select: () => query,
+      or: (filter: string) => { assert.equal(filter, 'created_at.gte.2026-06-28T00:00:00.000Z,status.eq.PENDING'); return query; },
+      order: () => query,
+      range: async (from: number, to: number) => {
+        ranges.push([from, to]);
+        return { data: from === 0 ? Array.from({ length: 200 }, (_, i) => ({ id: i })) : [{ id: 'pending-old' }], error: null };
+      }
+    };
+    return query;
+  } };
+  const rows = await fetchRecentAndPendingRequests(client, '2026-06-28T00:00:00.000Z');
+  assert.equal(rows.length, 201);
+  assert.equal(rows[200].id, 'pending-old');
+  assert.deepEqual(ranges, [[0, 199], [200, 399]]);
+});
+
+test('Danh sách duyệt: lỗi tải phải được báo, không trả danh sách trống giả', async () => {
+  const query: any = { select: () => query, or: () => query, order: () => query,
+    range: async () => ({ data: null, error: new Error('network failed') }) };
+  await assert.rejects(fetchRecentAndPendingRequests({ from: () => query } as any, '2026-06-28'), /network failed/);
+});
+
+// Máy chủ giả lập trả lỗi/quyền ghi; không chạm dữ liệu lương thực tế.
+const salarySaveFixture = (opts: { historyError?: any; profileError?: any; future?: boolean; latestSalary?: number } = {}) => {
+  const operations: string[] = [];
+  const row = { id: 'server-id', user_id: 'employee-k', base_salary: 7500000, allowance: 0,
+    insurance_salary: 0, effective_date: opts.future ? '2027-01-01' : '2026-09-07', reason: 'Cập nhật lương' };
+  let profilePayload: any = null;
+  const client: any = {
+    from(table: string) {
+      let operation = '';
+      const query: any = {
+        upsert() { operation = 'save-history'; operations.push(operation); return query; },
+        select() { return query; },
+        eq() { return query; }, lte() { return query; }, order() { return query; }, limit() { return query; },
+        update(payload: any) { operation = 'update-profile'; operations.push(operation); profilePayload = payload; return query; },
+        async single() {
+          if (operation === 'save-history') return { data: opts.historyError ? null : row, error: opts.historyError };
+          if (table === 'profiles') return { data: opts.profileError ? null : { id: row.user_id }, error: opts.profileError };
+          operations.push('read-active');
+          return { data: { ...row, base_salary: opts.latestSalary ?? row.base_salary }, error: null };
+        }
+      };
+      return query;
+    }
+  };
+  return { client, operations, payload: () => profilePayload, input: {
+    baseSalary: row.base_salary, allowance: 0, insuranceSalary: 0, effectiveDate: row.effective_date, reason: row.reason
+  } };
+};
+
+test('Lưu lương: RLS từ chối thì báo thất bại, không ghi hồ sơ', async () => {
+  const error = { code: '42501', message: 'new row violates row-level security policy' };
+  const f = salarySaveFixture({ historyError: error });
+  await assert.rejects(saveSalaryChange(f.client, 'employee-k', f.input, '2026-09-28'), e => e === error);
+  assert.deepEqual(f.operations, ['save-history']);
+  assert.match(salarySaveErrorMessage(error), /quyền lưu lịch sử lương/);
+});
+
+test('Lưu lương: dùng ID máy chủ, đồng bộ hồ sơ sau khi lưu lịch sử', async () => {
+  const f = salarySaveFixture();
+  const result = await saveSalaryChange(f.client, 'employee-k', f.input, '2026-09-28');
+  assert.equal(result.change.id, 'server-id');
+  assert.equal(result.profileSalary?.baseSalary, 7500000);
+  assert.equal(result.profileSyncError, null);
+  assert.deepEqual(f.operations, ['save-history', 'read-active', 'update-profile']);
+});
+
+test('Lưu lương: lỗi cập nhật hồ sơ phải báo trạng thái lưu một phần', async () => {
+  const f = salarySaveFixture({ profileError: { message: 'Không có quyền sửa hồ sơ' } });
+  const result = await saveSalaryChange(f.client, 'employee-k', f.input, '2026-09-28');
+  assert.equal(result.change.id, 'server-id');
+  assert.equal(result.profileSalary, null);
+  assert.equal(result.profileSyncError, 'Không có quyền sửa hồ sơ');
+});
+
+test('Lưu lương: mốc tương lai không đổi lương hiện tại; sửa mốc cũ giữ mốc mới nhất', async () => {
+  const future = salarySaveFixture({ future: true });
+  const scheduled = await saveSalaryChange(future.client, 'employee-k', future.input, '2026-09-28');
+  assert.equal(scheduled.profileSalary, null);
+  assert.deepEqual(future.operations, ['save-history']);
+  const old = salarySaveFixture({ latestSalary: 9000000 });
+  await saveSalaryChange(old.client, 'employee-k', old.input, '2026-09-28');
+  assert.equal(old.payload().base_salary, 9000000);
+});
+
+test('Lưu lương: ngày hoặc số tiền sai không gửi đến máy chủ', async () => {
+  const f = salarySaveFixture();
+  await assert.rejects(saveSalaryChange(f.client, 'employee-k', { ...f.input, effectiveDate: '2026-02-30' }));
+  await assert.rejects(saveSalaryChange(f.client, 'employee-k', { ...f.input, baseSalary: -1 }));
+  assert.deepEqual(f.operations, []);
+});
+
+test('Thai sản: bỏ Chủ nhật và không tính ngày đi làm lại', () => {
+  const range = maternityLeaveFromReturnDate('2026-09-05', '2026-09-08')!;
+  assert.equal(format(range.endDate, 'yyyy-MM-dd'), '2026-09-07');
+  assert.equal(range.days, 2);
+  assert.equal(maternityLeaveFromReturnDate('2026-09-05', '2026-09-06')!.days, 1);
+  assert.equal(maternityLeaveFromReturnDate('2026-09-06', '2026-09-07')!.days, 0);
+});
+
+test('Thai sản: kiểm tra ngày trống, sai, bằng nhau hoặc đi làm lại trước ngày nghỉ', () => {
+  for (const [start, returning] of [
+    ['', '2026-09-08'], ['2026-09-05', ''], ['invalid', '2026-09-08'],
+    ['2026-02-30', '2026-03-08'], ['2026-09-08', '2026-09-08'], ['2026-09-09', '2026-09-08']
+  ]) assert.equal(maternityLeaveFromReturnDate(start, returning), null);
+});
+
+test('Thai sản: kỳ nghỉ nhiều tháng, qua năm và ngày nhuận', () => {
+  assert.equal(maternityLeaveFromReturnDate('2026-04-01', '2026-10-01')!.days, 157);
+  assert.equal(maternityLeaveFromReturnDate('2026-12-31', '2027-01-04')!.days, 3);
+  assert.equal(maternityLeaveFromReturnDate('2024-02-28', '2024-03-02')!.days, 3);
+});
+
+test('Thai sản: số ngày trên đơn và lịch sử khớp nhau, chỉ loại Chủ nhật', () => {
+  const range = maternityLeaveFromReturnDate('2026-09-01', '2026-09-08')!;
+  const req = { startDate: D('2026-09-01'), endDate: range.endDate, duration: 'FULL' as const,
+    leaveType: 'INSURANCE' as const, reason: MATERNITY_LEAVE_REASON };
+  const holidays: Holiday[] = [{ id: 'h', date: D('2026-09-02'), name: 'Quốc khánh', duration: 'FULL' }];
+  const swappedRestDay = (day: Date) => day.getDay() === 6;
+  assert.equal(range.days, 6);
+  assert.equal(countLeaveDays(req, holidays, swappedRestDay), range.days);
+  assert.equal(leaveDayMap(req, holidays, swappedRestDay).size, range.days);
+  assert.equal(explainLeaveDays(req, holidays, swappedRestDay).holidayDays, 0);
+  // Phép năm vẫn loại cả ngày lễ và ngày nghỉ tuần như trước.
+  assert.equal(countLeaveDays({ ...req, leaveType: 'PAID' }, holidays), 5);
+});
 
 const mkSwap = (restIso: string, status: SwapRequest['status'] = 'APPROVED', id = 's1'): SwapRequest => ({
   id, userId: 'u1', userName: EMP.name, userAvatar: '', userRole: EMP.role,

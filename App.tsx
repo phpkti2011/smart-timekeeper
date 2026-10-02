@@ -68,6 +68,8 @@ import { accruesAnnualLeave, countLeaveDays, getPaidLeaveUsedThisMonth, getRemai
 import { validateOTRanges, toMinuteOfDay } from './utils/otRules';
 import { parseRequestDate, formatVNDate } from './utils/dateInput';
 import { mapLeaveRow } from './utils/leaveQueries';
+import { fetchRecentAndPendingRequests, persistLeaveRequest, leaveSubmitErrorMessage, LeaveSubmission, updateRequestStatus, requestStatusErrorMessage } from './utils/requestPersistence';
+import { mapSalaryChangeRow, saveSalaryChange, salarySaveErrorMessage, SalaryChangeInput } from './utils/salaryChanges';
 import { mapSwapRow, toSwapRow, validateSwapRequest, describeSwap, describeSwapShort, findSwapBlockingLeave, makeRestDayPredicate, pairedSunday, SWAP_DEFAULT_REASON } from './utils/restDay';
 import { parseWeekendSchedule, EMPTY_WEEKEND_SCHEDULE, WEEKEND_SCHEDULE_KEY, PUSH_HORIZON_WEEKS, diffSchedules, groupPushMessages, membersOf, membersWithoutSwap, swapsOfOtherGroup, sundayGroupFor, sundayOfWeek, saturdayBefore, findDutyHoliday, weekendGroupLabel, describeSundayDuty } from './utils/weekendGroups';
 import { mapProfileRow, toProfileRow, validateProfileRequest, applyProfileChanges, revertProfileChanges, patchToColumns, describeProfileChangesShort, PROFILE_FIELD_LABEL } from './utils/profileChange';
@@ -109,6 +111,7 @@ const App: React.FC = () => {
   const [lateRequests, setLateRequests] = useState<LateRequest[]>([]);
   const [advanceRequests, setAdvanceRequests] = useState<SalaryAdvanceRequest[]>(MOCK_ADVANCES);
   const [leaveRequests, setLeaveRequests] = useState<LeaveRequest[]>([]);
+  const [requestLoadError, setRequestLoadError] = useState('');
   const [swapRequests, setSwapRequests] = useState<SwapRequest[]>([]); // Đơn đổi ngày nghỉ tuần
   const [profileRequests, setProfileRequests] = useState<ProfileChangeRequest[]>([]); // Đơn đổi thông tin cá nhân
   const [overrides, setOverrides] = useState<OverrideLog[]>([]); // New State
@@ -435,16 +438,7 @@ const App: React.FC = () => {
       // 3. Fetch Salary Changes (History)
       const { data: salaryData } = await supabase.from('salary_changes').select('*');
       if (salaryData) {
-        setSalaryChanges(salaryData.map((s: any) => ({
-          id: s.id,
-          userId: s.user_id,
-          baseSalary: s.base_salary,
-          allowance: s.allowance,
-          insuranceSalary: s.insurance_salary,
-          effectiveDate: s.effective_date,
-          reason: s.reason,
-          createdAt: s.created_at
-        })));
+        setSalaryChanges(salaryData.map(mapSalaryChangeRow));
       }
 
       // 8. Fetch Locked Months
@@ -454,8 +448,12 @@ const App: React.FC = () => {
         setLockedMonths(periodData.map((p: any) => format(new Date(p.month), 'MM-yyyy')));
       }
 
-      // 3. Fetch Requests (only recent)
-      const { data: reqData } = await supabase.from('requests').select('*').gte('created_at', cutoffISO);
+      // Nạp cả đơn chờ duyệt ngoài cửa sổ lịch sử, có phân trang.
+      const reqData = await fetchRecentAndPendingRequests(supabase, cutoffISO).catch((error: any) => {
+        setRequestLoadError(`Không tải được danh sách đơn. Vui lòng tải lại. Chi tiết: ${error.message}`);
+        throw error;
+      });
+      setRequestLoadError('');
       if (reqData) {
         // Filter into specific categories
         const ots = reqData.filter((r: any) => r.type === 'OT').map((r: any) => ({
@@ -511,7 +509,7 @@ const App: React.FC = () => {
           .from('requests')
           .select('*')
           .eq('type', 'LEAVE')
-          .gte('start_date', yearStartISO);
+          .gte('end_date', yearStartISO);
 
         const seenLeaveIds = new Set(leaves.map((l: LeaveRequest) => l.id));
         const extraLeaves = (yearLeaveData || [])
@@ -861,7 +859,11 @@ const App: React.FC = () => {
           userName: user?.name || 'Unknown',
           userAvatar: user?.avatar || '',
           userRole: user?.role || 'Employee',
-          status: newRec.status
+          status: newRec.status,
+          // Giữ mốc giờ và lý do khi realtime dựng lại object — thiếu thì "Tạo lúc" thành N/A và "Duyệt lúc" vừa hiện đã mất
+          rejectionReason: newRec.rejection_reason ?? null,
+          createdAt: newRec.created_at ? new Date(newRec.created_at) : undefined,
+          processedAt: newRec.processed_at ? new Date(newRec.processed_at) : undefined
         };
 
         if (newRec.type === 'OT') {
@@ -871,8 +873,8 @@ const App: React.FC = () => {
           const req = { ...baseReq, id: newRec.id, date: new Date(newRec.date), minutesLate: newRec.minutes_late, reason: newRec.reason } as LateRequest;
           setLateRequests(prev => eventType === 'UPDATE' ? prev.map(r => r.id === req.id ? req : r) : [...prev, req]);
         } else if (newRec.type === 'LEAVE') {
-          const req = { ...baseReq, id: newRec.id, startDate: new Date(newRec.start_date), endDate: new Date(newRec.end_date), leaveType: newRec.leave_type, duration: newRec.leave_duration, reason: newRec.reason } as LeaveRequest;
-          setLeaveRequests(prev => eventType === 'UPDATE' ? prev.map(r => r.id === req.id ? req : r) : [...prev, req]);
+          const req = mapLeaveRow(newRec, employees);
+          setLeaveRequests(prev => [...prev.filter(r => r.id !== req.id), req]);
         } else if (newRec.type === 'ADVANCE') {
           const req = { ...baseReq, id: newRec.id, date: new Date(newRec.created_at), amount: newRec.amount, reason: newRec.reason } as SalaryAdvanceRequest;
           setAdvanceRequests(prev => eventType === 'UPDATE' ? prev.map(r => r.id === req.id ? req : r) : [...prev, req]);
@@ -1717,23 +1719,28 @@ const App: React.FC = () => {
     }
   };
 
-  const handleSubmitLeaveRequest = async (data: { startDate: string, endDate: string, type: LeaveType, duration: LeaveDuration, reason: string }) => {
+  const handleSubmitLeaveRequest = async (data: LeaveSubmission): Promise<boolean> => {
     // Use target user if set (Admin mode), otherwise current user
     const target = leaveRequestTargetUser || currentUser;
-    const isAdminAction = !!leaveRequestTargetUser; // True if creating for someone else (Admin)
+    const isAdminAction = currentUser?.role === 'Admin' && !!leaveRequestTargetUser; // True if creating for someone else (Admin)
 
-    if (target) {
+    if (target && currentUser) {
+      if (!data.startDate || !data.endDate || !Number.isFinite(new Date(data.startDate).getTime())
+        || !Number.isFinite(new Date(data.endDate).getTime()) || data.endDate < data.startDate) {
+        alert('Vui lòng chọn khoảng ngày nghỉ hợp lệ.');
+        return false;
+      }
       // Guard: Tháng đã chốt lương (kiểm tra cả tháng bắt đầu và kết thúc)
       if (isMonthLocked(new Date(data.startDate), lockedMonths)) {
         alert(LOCKED_MONTH_MSG);
-        return;
+        return false;
       }
       if (data.startDate !== data.endDate && isMonthLocked(new Date(data.endDate), lockedMonths)) {
         alert(LOCKED_MONTH_MSG);
-        return;
+        return false;
       }
 
-      const status = isAdminAction ? 'APPROVED' : 'PENDING';
+
 
       // Ngày nghỉ tuần của NV này (CN, hoặc T7 đã đổi) — dùng chung cho mọi phép
       // đếm ngày phép bên dưới để khớp với calculator.
@@ -1744,7 +1751,7 @@ const App: React.FC = () => {
       // Muốn sửa một kỳ nghỉ thì huỷ đơn cũ rồi tạo lại.
       const clash = findOverlappingLeave(
         target.id,
-        { startDate: new Date(data.startDate), endDate: new Date(data.endDate), duration: data.duration },
+        { startDate: new Date(data.startDate), endDate: new Date(data.endDate), duration: data.duration, leaveType: data.type, reason: data.reason },
         leaveRequests,
         { holidays, isRestDay: restDayOf }
       );
@@ -1753,7 +1760,7 @@ const App: React.FC = () => {
           ? format(new Date(clash.startDate), 'dd/MM/yyyy')
           : `${format(new Date(clash.startDate), 'dd/MM/yyyy')} – ${format(new Date(clash.endDate), 'dd/MM/yyyy')}`;
         alert(`🚫 KHÔNG THỂ GỬI ĐƠN!\n\n${target.name} đã có đơn nghỉ trùng ngày:\n• ${LEAVE_TYPE_LABEL[clash.leaveType]} — ${khoang} (${getRequestStatusText(clash.status)})\n\nMột ngày chỉ nghỉ được một lần. Nếu đơn cũ nhập sai, hãy huỷ đơn đó trong mục Duyệt Đơn rồi tạo lại.`);
-        return;
+        return false;
       }
 
       // Guard: đè lên Thứ 7 đã đổi thành ngày nghỉ bù. Chặn cả Admin — ngày đó
@@ -1765,24 +1772,30 @@ const App: React.FC = () => {
       );
       if (swapClash) {
         alert(`🚫 KHÔNG THỂ GỬI ĐƠN!\n\n${target.name} đã có đơn đổi ngày nghỉ (${getRequestStatusText(swapClash.status)}):\n• ${describeSwap(swapClash)}\n\nNgày ${format(swapClash.restDate, 'dd/MM')} đã là ngày nghỉ bù nên không cần xin nghỉ phép — chọn ngày khác, hoặc huỷ đơn đổi ngày nghỉ trước.`);
-        return;
+        return false;
       }
 
-      const finalLeaveType = data.type;
+
       const paidUsedThisMonth = getPaidLeaveUsedThisMonth(target.id, leaveRequests, new Date(data.startDate), holidays, restDayOf);
 
       // Số ngày thực bị trừ (bỏ ngày nghỉ tuần và ngày lễ)
       const requestedDays = countLeaveDays({
         startDate: new Date(data.startDate),
         endDate: new Date(data.endDate),
-        duration: data.duration
+        duration: data.duration,
+        leaveType: data.type,
+        reason: data.reason
       }, holidays, restDayOf);
+      if (requestedDays <= 0) {
+        alert('Khoảng đã chọn không có ngày nghỉ được tính. Vui lòng chọn lại ngày.');
+        return false;
+      }
 
       // Chưa ký HĐ chính thức thì không có phép năm. Chặn trước 2 guard bên dưới
       // để thông báo nói đúng nguyên nhân, thay vì "quỹ chỉ còn 0 ngày".
       if (data.type === 'PAID' && !accruesAnnualLeave(target)) {
         alert(`🚫 KHÔNG THỂ GỬI ĐƠN!\n\n${target.name} đang là "${target.contractType}" nên chưa có phép năm.\nChỉ nhân viên đã ký hợp đồng chính thức mới được nghỉ phép năm.\n\nVui lòng chọn "Không lương" nếu vẫn muốn xin nghỉ.`);
-        return;
+        return false;
       }
 
       if (data.type === 'PAID') {
@@ -1793,7 +1806,7 @@ const App: React.FC = () => {
 
           if (remainingQuota <= 0 || requestedDays > remainingQuota) {
             alert(`🚫 KHÔNG THỂ GỬI ĐƠN!\n\nĐã dùng ${paidUsedThisMonth}/${MONTHLY_PAID_LEAVE_QUOTA} ngày phép năm trong tháng này.\nMỗi tháng chỉ được nghỉ tối đa ${MONTHLY_PAID_LEAVE_QUOTA} ngày phép năm.\n\nVui lòng chọn "Không lương" nếu vẫn muốn xin nghỉ.`);
-            return;
+            return false;
           }
         }
 
@@ -1801,53 +1814,32 @@ const App: React.FC = () => {
         const remainingLeave = getRemainingLeave(target, leaveRequests, { holidays, isRestDay: restDayOf });
         if (requestedDays > remainingLeave) {
           alert(`🚫 KHÔNG THỂ GỬI ĐƠN!\n\nQuỹ phép năm chỉ còn ${remainingLeave} ngày, đơn này cần ${requestedDays} ngày.\n\nVui lòng chọn "Không lương" nếu vẫn muốn xin nghỉ.`);
-          return;
+          return false;
         }
       }
 
-      const payload = {
-        user_id: target.id,
-        type: 'LEAVE',
-        start_date: new Date(data.startDate).toISOString(),
-        end_date: new Date(data.endDate).toISOString(),
-        leave_type: finalLeaveType, // Use converted type
-        leave_duration: data.duration,
-        reason: data.reason,
-        status: status
-      };
-
-      const newRequest: LeaveRequest = {
-        id: Date.now().toString(),
-        startDate: new Date(data.startDate),
-        endDate: new Date(data.endDate),
-        leaveType: finalLeaveType, // Use converted type
-        duration: data.duration,
-        reason: data.reason,
-        status: status as RequestStatus,
-        userId: target.id,
-        userName: target.name,
-        userAvatar: target.avatar,
-        userRole: target.role
-      };
-      setLeaveRequests(prev => [...prev, newRequest]);
-      setIsLeaveModalOpen(false);
-      setLeaveRequestTargetUser(null); // Reset after submit
-
-      const { error } = await supabase.from('requests').insert(payload);
-
-      if (!error) {
+      try {
+        const row = await persistLeaveRequest(supabase, currentUser, target.id, data, isAdminAction);
+        const saved = mapLeaveRow(row, [target]);
+        setLeaveRequests(prev => [...prev.filter(req => req.id !== saved.id), saved]);
+        setIsLeaveModalOpen(false);
+        setLeaveRequestTargetUser(null);
         if (isAdminAction) {
           triggerNotification('Đã tạo đơn nghỉ phép', `Đã tạo và duyệt đơn cho ${target.name}`);
-          // Notify employee
-          sendPushToUser(target.id, '📋 Đơn nghỉ phép', `Admin đã tạo và duyệt đơn nghỉ phép cho bạn.`);
+          sendPushToUser(target.id, '📋 Đơn nghỉ phép', 'Admin đã tạo và duyệt đơn nghỉ phép cho bạn.');
         } else {
-          // Notify managers/admin
+          triggerNotification('Đã gửi đơn thành công', 'Đơn đã được lưu và đang chờ Admin duyệt.');
           sendPushToManagers('📋 Đơn nghỉ phép mới', `${target.name} đã gửi đơn xin nghỉ phép.`);
         }
+        return true;
+      } catch (error: any) {
+        console.error('Error submitting leave request:', error);
+        alert(leaveSubmitErrorMessage(error));
+        return false;
       }
     }
+    return false;
   };
-
   // Bonus/Penalty Handlers
   const handleAddBonus = async (bonus: Omit<BonusFine, 'id'>) => {
     // Guard: Tháng đã chốt lương
@@ -2203,10 +2195,17 @@ const App: React.FC = () => {
 
     // Optimistic Update
     setOtRequests(prev => prev.map(req =>
-      req.id === id ? { ...req, status } : req
+      req.id === id ? { ...req, status, rejectionReason: reason || null } : req
     ));
-    // Persist
-    await supabase.from('requests').update({ status, rejection_reason: reason || null }).eq('id', id);
+    // Persist — chỉ giữ trạng thái mới khi máy chủ xác nhận có dòng được ghi
+    try {
+      const row = await updateRequestStatus(supabase, id, status, reason, 'OT');
+      setOtRequests(prev => prev.map(req => req.id === id ? { ...req, processedAt: row.processed_at ? new Date(row.processed_at) : undefined } : req));
+    } catch (error: any) {
+      if (otReq) setOtRequests(prev => prev.map(req => req.id === id ? { ...req, status: otReq.status, rejectionReason: otReq.rejectionReason ?? null } : req));
+      alert(`⚠️ ${requestStatusErrorMessage(error)}`);
+      return;
+    }
     // Push notification
     if (otReq) {
       const label = status === 'APPROVED' ? '✅ Đã duyệt' : '❌ Bị từ chối';
@@ -2225,10 +2224,17 @@ const App: React.FC = () => {
 
     // Optimistic Update
     setLateRequests(prev => prev.map(req =>
-      req.id === id ? { ...req, status } : req
+      req.id === id ? { ...req, status, rejectionReason: reason || null } : req
     ));
-    // Persist
-    await supabase.from('requests').update({ status, rejection_reason: reason || null }).eq('id', id);
+    // Persist — chỉ giữ trạng thái mới khi máy chủ xác nhận có dòng được ghi
+    try {
+      const row = await updateRequestStatus(supabase, id, status, reason, 'LATE');
+      setLateRequests(prev => prev.map(req => req.id === id ? { ...req, processedAt: row.processed_at ? new Date(row.processed_at) : undefined } : req));
+    } catch (error: any) {
+      if (lateReq) setLateRequests(prev => prev.map(req => req.id === id ? { ...req, status: lateReq.status, rejectionReason: lateReq.rejectionReason ?? null } : req));
+      alert(`⚠️ ${requestStatusErrorMessage(error)}`);
+      return;
+    }
     // Push notification
     if (lateReq) {
       const label = status === 'APPROVED' ? '✅ Đã duyệt' : '❌ Bị từ chối';
@@ -2247,10 +2253,17 @@ const App: React.FC = () => {
 
     // Optimistic Update
     setAdvanceRequests(prev => prev.map(req =>
-      req.id === id ? { ...req, status } : req
+      req.id === id ? { ...req, status, rejectionReason: reason || null } : req
     ));
-    // Persist
-    await supabase.from('requests').update({ status, rejection_reason: reason || null }).eq('id', id);
+    // Persist — chỉ giữ trạng thái mới khi máy chủ xác nhận có dòng được ghi
+    try {
+      const row = await updateRequestStatus(supabase, id, status, reason, 'ADVANCE');
+      setAdvanceRequests(prev => prev.map(req => req.id === id ? { ...req, processedAt: row.processed_at ? new Date(row.processed_at) : undefined } : req));
+    } catch (error: any) {
+      if (advReq) setAdvanceRequests(prev => prev.map(req => req.id === id ? { ...req, status: advReq.status, rejectionReason: advReq.rejectionReason ?? null } : req));
+      alert(`⚠️ ${requestStatusErrorMessage(error)}`);
+      return;
+    }
     // Push notification
     if (advReq) {
       const label = status === 'APPROVED' ? '✅ Đã duyệt' : '❌ Bị từ chối';
@@ -2299,13 +2312,15 @@ const App: React.FC = () => {
       }
     }
 
-    // 1. Optimistic Update Request State
-    setLeaveRequests(prev => prev.map(req =>
-      req.id === id ? { ...req, status } : req
-    ));
-
-    // 2. Persist Request Status
-    await supabase.from('requests').update({ status, rejection_reason: reason || null }).eq('id', id);
+    // Chỉ đổi trạng thái sau khi máy chủ xác nhận đã duyệt/từ chối (kèm processed_at).
+    try {
+      const saved = await updateRequestStatus(supabase, id, status, reason, 'LEAVE');
+      const updated = mapLeaveRow(saved, employees);
+      setLeaveRequests(prev => [...prev.filter(req => req.id !== updated.id), updated]);
+    } catch (error: any) {
+      alert(`⚠️ Đơn nghỉ phép: ${requestStatusErrorMessage(error)}`);
+      return;
+    }
 
     // Push notification to employee
     const label = status === 'APPROVED' ? '✅ Đã duyệt' : '❌ Bị từ chối';
@@ -2423,12 +2438,14 @@ const App: React.FC = () => {
     const oldReason = req.rejectionReason ?? null;
     setSwapRequests(prev => prev.map(r => r.id === id ? { ...r, status, rejectionReason: reason || null } : r));
 
-    const { error } = await supabase.from('requests').update({ status, rejection_reason: reason || null }).eq('id', id);
-    if (error) {
+    try {
+      const row = await updateRequestStatus(supabase, id, status, reason, 'SWAP');
+      setSwapRequests(prev => prev.map(r => r.id === id ? { ...r, processedAt: row.processed_at ? new Date(row.processed_at) : undefined } : r));
+    } catch (error: any) {
       setSwapRequests(prev => prev.map(r => r.id === id ? { ...r, status: oldStatus, rejectionReason: oldReason } : r));
-      alert((error as any).code === '23505'
+      alert(error?.code === '23505'
         ? '⚠️ Không đổi được trạng thái: tuần này đã có đơn đổi ngày nghỉ khác còn hiệu lực.'
-        : `⚠️ Không cập nhật được đơn.\n\n${error.message}`);
+        : `⚠️ ${requestStatusErrorMessage(error)}`);
       return;
     }
 
@@ -2524,6 +2541,7 @@ const App: React.FC = () => {
     const req = profileRequests.find(r => r.id === id);
     if (!req) return;
     const emp = employees.find(e => e.id === req.userId);
+    let daGhiHoSo = false; // để thông báo lỗi nói đúng: hồ sơ đã đổi hay chưa
 
     // DUYỆT: ghi profiles TRƯỚC, đóng đơn SAU. Ghi hỏng thì đơn vẫn PENDING,
     // Admin thấy lỗi và bấm lại được — không mất gì. Thứ tự ngược lại thì đơn
@@ -2559,6 +2577,7 @@ const App: React.FC = () => {
           alert('⚠️ Không áp dụng được thay đổi (quyền truy cập từ chối). Chỉ Admin mới sửa được hồ sơ.');
           return;
         }
+        daGhiHoSo = true;
         setEmployees(prev => prev.map(e => e.id === req.userId ? { ...e, ...patch } : e));
         if (currentUser?.id === req.userId) setCurrentUser(prev => prev ? { ...prev, ...patch } : prev);
       }
@@ -2595,15 +2614,17 @@ const App: React.FC = () => {
     const oldReason = req.rejectionReason ?? null;
     setProfileRequests(prev => prev.map(r => r.id === id ? { ...r, status, rejectionReason: reason || null } : r));
 
-    const { error } = await supabase
-      .from('requests')
-      .update({ status, rejection_reason: reason || null, processed_at: status === 'PENDING' ? null : new Date().toISOString() })
-      .eq('id', id);
-    if (error) {
+    try {
+      const row = await updateRequestStatus(supabase, id, status, reason, 'PROFILE');
+      setProfileRequests(prev => prev.map(r => r.id === id ? { ...r, processedAt: row.processed_at ? new Date(row.processed_at) : undefined } : r));
+    } catch (error: any) {
       setProfileRequests(prev => prev.map(r => r.id === id ? { ...r, status: oldStatus, rejectionReason: oldReason } : r));
+      // Phải hiện LỖI GỐC: bản trước giấu error.message nên không ai biết vì sao
+      // đơn không đóng được (thực tế là CSDL thiếu cột processed_at).
+      const chiTiet = requestStatusErrorMessage(error);
       alert(status === 'APPROVED'
-        ? '⚠️ Đã áp dụng thay đổi vào hồ sơ nhưng CHƯA đóng được đơn.\n\nBấm Duyệt lần nữa — hệ thống sẽ bỏ qua bước áp dụng vì giá trị đã trùng.'
-        : `⚠️ Không cập nhật được đơn.\n\n${error.message}`);
+        ? `⚠️ ${daGhiHoSo ? 'Đã áp dụng thay đổi vào hồ sơ nhưng ' : ''}CHƯA đóng được đơn.\n\n${chiTiet}\n\nXử lý xong bấm Duyệt lần nữa — bước áp dụng tự bỏ qua trường nào giá trị đã trùng.`
+        : `⚠️ ${chiTiet}`);
       return;
     }
 
@@ -2716,88 +2737,43 @@ const App: React.FC = () => {
     }
   };
 
-  const handleSalaryChange = async (data: { baseSalary: number; allowance: number; insuranceSalary: number; effectiveDate: string; reason: string }) => {
-    if (!viewingEmployee) return;
+  const handleSalaryChange = async (data: SalaryChangeInput): Promise<boolean> => {
+    if (!viewingEmployee) return false;
+    const target = viewingEmployee;
 
     // Guard: Tháng đã chốt lương
     if (isMonthLocked(new Date(data.effectiveDate), lockedMonths)) {
       alert(LOCKED_MONTH_MSG);
-      return;
+      return false;
     }
 
     try {
-      // 1. Insert into history
-      const newChange: SalaryChange = {
-        id: Date.now().toString(),
-        userId: viewingEmployee.id,
-        baseSalary: data.baseSalary,
-        allowance: data.allowance,
-        insuranceSalary: data.insuranceSalary,
-        effectiveDate: data.effectiveDate,
-        reason: data.reason,
-        createdAt: new Date().toISOString()
-      };
-
-      // Optimistic Update History (Handle Add or Edit)
+      const { change: saved, profileSalary, profileSyncError } = await saveSalaryChange(supabase, target.id, data);
+      // Chỉ hiện dữ liệu sau khi máy chủ xác nhận, dùng đúng ID để sửa/xoá tiếp.
       setSalaryChanges(prev => {
-        const index = prev.findIndex(c => c.userId === newChange.userId && c.effectiveDate === newChange.effectiveDate);
-        if (index >= 0) {
-          // Update existing
-          const updated = [...prev];
-          updated[index] = newChange;
-          return updated;
-        }
-        // Add new
-        return [...prev, newChange];
+        const others = prev.filter(c => c.id !== saved.id && !(c.userId === saved.userId && c.effectiveDate === saved.effectiveDate));
+        return [...others, saved];
       });
 
-      // DB Insert or Update (Upsert)
-      const { error } = await supabase.from('salary_changes').upsert({
-        user_id: newChange.userId,
-        base_salary: newChange.baseSalary,
-        allowance: newChange.allowance,
-        insurance_salary: newChange.insuranceSalary,
-        effective_date: newChange.effectiveDate,
-        reason: newChange.reason
-      }, { onConflict: 'user_id,effective_date' });
-
-      if (error) throw error;
-
-      // 2. Check if Effective Immediately (<= Today)
-      // Comparison: effectiveDate (YYYY-MM-DD string) vs today
-      // Logic: If effective date is in the past or today, we update the current profile values to be consistent.
-      // But simpler: just compare Date objects.
-      const isEffectiveNow = new Date(data.effectiveDate) <= new Date();
-
-      if (isEffectiveNow) {
-        // Update Profile
-        const updatedProfile = {
-          ...viewingEmployee,
-          baseSalary: data.baseSalary,
-          allowance: data.allowance,
-          insuranceSalary: data.insuranceSalary
-        };
-
-        // Optimistic Update Employees
-        setEmployees(prev => prev.map(e => e.id === viewingEmployee.id ? updatedProfile : e));
-        if (currentUser?.id === viewingEmployee.id) setCurrentUser(updatedProfile);
-        setViewingEmployee(updatedProfile); // Update view as well
-
-        // DB Update
-        await supabase.from('profiles').update({
-          base_salary: data.baseSalary,
-          allowance: data.allowance,
-          insurance_salary: data.insuranceSalary
-        }).eq('id', viewingEmployee.id);
-
-        triggerNotification('Đã cập nhật lương', `Lương mới đã được áp dụng ngay lập tức.`);
+      if (profileSalary) {
+        setEmployees(prev => prev.map(e => e.id === target.id ? { ...e, ...profileSalary } : e));
+        setCurrentUser(prev => prev?.id === target.id ? { ...prev, ...profileSalary } : prev);
+        setViewingEmployee(prev => prev?.id === target.id ? { ...prev, ...profileSalary } : prev);
+      }
+      if (profileSyncError) {
+        alert(`Đã lưu lịch sử lương cho ${target.name}, nhưng chưa cập nhật được mức lương trong hồ sơ: ${profileSyncError}\nVui lòng thử lưu lại cùng ngày áp dụng để đồng bộ.`);
+        return false;
+      }
+      if (profileSalary) {
+        triggerNotification('Đã cập nhật lương', `Đã lưu lịch sử và đồng bộ mức lương đang áp dụng cho ${target.name}.`);
       } else {
         triggerNotification('Đã lên lịch tăng lương', `Lương mới sẽ áp dụng từ ngày ${format(new Date(data.effectiveDate), 'dd/MM/yyyy')}`);
       }
-
+      return true;
     } catch (err: any) {
       console.error("Error saving salary change:", err);
-      alert("Lỗi lưu thay đổi lương: " + err.message);
+      alert(salarySaveErrorMessage(err));
+      return false;
     }
   };
 
@@ -3346,16 +3322,16 @@ const App: React.FC = () => {
               </div>
 
               {/* Request Leave / Swap Rest Day Buttons */}
-              <div className="flex justify-end gap-2 mb-4">
+              <div className="flex flex-wrap justify-end gap-2 mb-4">
                 <button
-                  onClick={() => { setSwapRequestTargetUser(null); setIsSwapModalOpen(true); }}
+                  onClick={() => { setSwapRequestTargetUser(null); setSwapInitialRestDate(null); setIsSwapModalOpen(true); }}
                   className="flex items-center gap-1 text-xs font-bold bg-violet-500 text-white px-3 py-2 rounded-lg shadow hover:bg-violet-600 active:scale-95 transition-all"
                   title="Nghỉ Thứ 7, đi làm bù Chủ Nhật"
                 >
                   <Repeat size={14} /> Đổi ngày nghỉ
                 </button>
                 <button
-                  onClick={() => setIsLeaveModalOpen(true)}
+                  onClick={() => { setLeaveRequestTargetUser(null); setIsLeaveModalOpen(true); }}
                   className="flex items-center gap-1 text-xs font-bold bg-green-500 text-white px-3 py-2 rounded-lg shadow hover:bg-green-600 active:scale-95 transition-all"
                 >
                   <Calendar size={14} /> Xin nghỉ phép
@@ -3443,6 +3419,8 @@ const App: React.FC = () => {
           {activeTab === 'requests' && isAdmin && (
             <div className="animate-fade-in pt-4">
               <RequestApproval
+                onRefresh={fetchAllData}
+                loadError={requestLoadError}
                 otRequests={otRequests}
                 lateRequests={lateRequests}
                 advanceRequests={advanceRequests}
@@ -3601,7 +3579,7 @@ const App: React.FC = () => {
           {isAdmin && (
             <>
               <button
-                onClick={() => setActiveTab('requests')}
+                onClick={() => { setActiveTab('requests'); void fetchAllData(); }}
                 className={`flex-1 min-w-[60px] flex flex-col items-center gap-0.5 transition-colors relative ${activeTab === 'requests' ? 'text-brand-600' : 'text-gray-400 hover:text-gray-600'}`}
               >
                 <div className="relative">
@@ -3866,7 +3844,13 @@ const App: React.FC = () => {
               employeeId={finalLeaveUser?.id}
               holidays={holidays}
               swapRequests={swapRequests.filter(s => s.userId === finalLeaveUser?.id)}
-              allowSpecialLeave={isAdmin}
+              onRequestSwap={() => {
+                setSwapRequestTargetUser(leaveRequestTargetUser);
+                setSwapInitialRestDate(null);
+                setIsLeaveModalOpen(false);
+                setLeaveRequestTargetUser(null);
+                setIsSwapModalOpen(true);
+              }}
               // Chỉ bỏ trần tháng khi Admin tạo HỘ người khác. Admin tự xin nghỉ
               // cho chính mình thì leaveRequestTargetUser = null nên vẫn chịu trần.
               enforceMonthlyQuota={!leaveRequestTargetUser}

@@ -1,30 +1,31 @@
-import React, { useState, useEffect } from 'react';
-import { X, Calendar, Send, Info, AlertOctagon, Clock, CheckCircle, XCircle } from 'lucide-react';
+import React, { useState, useEffect, useRef } from 'react';
+import { LeaveSubmission, leaveSubmitErrorMessage } from '../utils/requestPersistence';
+import { X, Calendar, Send, Info, AlertOctagon, Clock, CheckCircle, XCircle, Repeat } from 'lucide-react';
 import { LeaveType, LeaveDuration, LeaveRequest, Holiday, SwapRequest } from '../types';
-import { startOfDay, format, isSameDay } from 'date-fns';
+import { addDays, startOfDay, format, isSameDay, isValid } from 'date-fns';
+import { MATERNITY_LEAVE_REASON, maternityLeaveFromReturnDate, isMaternityLeave } from '../utils/leaveTypes';
 import { LEAVE_TYPE_LABEL, LEAVE_PAYER_TEXT, getLeaveBadgeClass, SPECIAL_LEAVE_REASONS, SPECIAL_LEAVE_GROUPS, findSpecialLeaveReason, leaveTypeForSpecialReason, findOverlappingLeave, deriveLeaveEndDate, countLeaveDays, getPaidLeaveUsedThisMonth, MONTHLY_PAID_LEAVE_QUOTA, getRequestStatusClass, getRequestStatusText } from '../utils/leaveTypes';
 import { makeRestDayPredicate, findSwapBlockingLeave, describeSwap } from '../utils/restDay';
 
 interface Props {
   isOpen: boolean;
   onClose: () => void;
-  onSubmit: (data: { startDate: string, endDate: string, type: LeaveType, duration: LeaveDuration, reason: string }) => void;
+  onSubmit: (data: LeaveSubmission) => Promise<boolean>;
   currentBalance: number;
   leaveHistory: LeaveRequest[]; // NEW: History data
   userName?: string; // NEW: Display name
   employeeId?: string; // Để tự tính số ngày đã dùng theo THÁNG ĐANG CHỌN
   holidays?: Holiday[]; // Để không trừ phép vào ngày lễ
   swapRequests?: SwapRequest[]; // Đơn đổi ngày nghỉ CỦA NV này — bỏ qua T7 đã đổi và chặn xin nghỉ đè lên
-  allowSpecialLeave?: boolean; // NEW: Cho phép tạo nghỉ chế độ có lương (Admin)
+  onRequestSwap?: () => void;
   canUseAnnualLeave?: boolean; // false = chưa ký HĐ chính thức, không có phép năm
   contractTypeLabel?: string;  // để câu thông báo nói đúng loại hợp đồng
   // false = Admin đang tạo đơn HỘ người khác → không áp trần tháng.
-  // Cố ý tách khỏi allowSpecialLeave (theo vai trò): Admin tự xin nghỉ cho
-  // chính mình vẫn phải chịu trần.
+  // Admin tự xin nghỉ cho chính mình vẫn phải chịu trần.
   enforceMonthlyQuota?: boolean;
 }
 
-export const LeaveRequestModal: React.FC<Props> = ({ isOpen, onClose, onSubmit, currentBalance, leaveHistory, userName, employeeId, holidays = [], swapRequests = [], allowSpecialLeave = false, canUseAnnualLeave = true, contractTypeLabel, enforceMonthlyQuota = true }) => {
+export const LeaveRequestModal: React.FC<Props> = ({ isOpen, onClose, onSubmit, currentBalance, leaveHistory, userName, employeeId, holidays = [], swapRequests = [], onRequestSwap, canUseAnnualLeave = true, contractTypeLabel, enforceMonthlyQuota = true }) => {
   const [activeTab, setActiveTab] = useState<'REQUEST' | 'HISTORY'>('REQUEST');
   const [historyFilter, setHistoryFilter] = useState<'ALL' | 'PAID' | 'SPECIAL' | 'UNPAID'>('ALL'); // NEW: Filter state
 
@@ -49,8 +50,12 @@ export const LeaveRequestModal: React.FC<Props> = ({ isOpen, onClose, onSubmit, 
   const [specialDays, setSpecialDays] = useState<number>(SPECIAL_LEAVE_REASONS[0].suggestedDays || 1);
   const [specialReason, setSpecialReason] = useState<string>(SPECIAL_LEAVE_REASONS[0].value);
   const [customReason, setCustomReason] = useState('');
+  const [returnDate, setReturnDate] = useState('');
+  const [sending, setSending] = useState(false);
+  const sendingRef = useRef(false);
 
   const isSpecial = type === 'SPECIAL';
+  const isMaternity = isSpecial && specialReason === MATERNITY_LEAVE_REASON;
   const isOtherReason = specialReason === 'Khác';
 
   // Loại nghỉ THỰC TẾ lấy từ lý do đã chọn, không phải từ tab đang mở. Thai sản do
@@ -73,8 +78,9 @@ export const LeaveRequestModal: React.FC<Props> = ({ isOpen, onClose, onSubmit, 
   const start = startOfDay(new Date(startDate));
   const end = startOfDay(new Date(endDate));
   const isSameDate = startDate === endDate;
+  const maternityRange = isMaternity ? maternityLeaveFromReturnDate(startDate, returnDate) : null;
 
-  const requestedDays = isSpecial
+  const requestedDays = isMaternity ? (maternityRange?.days ?? 0) : isSpecial
     ? (specialDays > 0 ? specialDays : 0)
     : countLeaveDays({ startDate: start, endDate: end, duration }, holidays, isRestDay);
 
@@ -90,9 +96,10 @@ export const LeaveRequestModal: React.FC<Props> = ({ isOpen, onClose, onSubmit, 
   // Cảnh báo sớm nếu đè lên đơn nghỉ đã có. Chỉ là trải nghiệm — chốt chặn thật
   // nằm ở handleSubmitLeaveRequest trong App.tsx.
   // Nghỉ chế độ suy ngày kết thúc từ số ngày Admin nhập, nên phải tính lại mốc đó.
-  const effectiveEnd = isSpecial && specialDays > 0 ? deriveLeaveEndDate(start, specialDays, isRestDay) : end;
+  const effectiveEnd = isMaternity ? (maternityRange?.endDate ?? start)
+    : isSpecial && specialDays > 0 ? deriveLeaveEndDate(start, specialDays, isRestDay) : end;
   const overlapWith = employeeId
-    ? findOverlappingLeave(employeeId, { startDate: start, endDate: effectiveEnd, duration }, leaveHistory, { holidays, isRestDay })
+    ? findOverlappingLeave(employeeId, { startDate: start, endDate: effectiveEnd, duration: isSpecial ? 'FULL' : duration, leaveType: isSpecial ? effectiveSpecialType : type, reason: finalReason }, leaveHistory, { holidays, isRestDay })
     : null;
   // Đè lên Thứ 7 đã đổi thành ngày nghỉ bù → ngày đó đã nghỉ, không có gì để xin
   const swapClash = employeeId
@@ -104,7 +111,8 @@ export const LeaveRequestModal: React.FC<Props> = ({ isOpen, onClose, onSubmit, 
   const isOverBalance = type === 'PAID' && canUseAnnualLeave && requestedDays > currentBalance;
   const isExceedingMonthlyQuota = enforceMonthlyQuota && type === 'PAID' && canUseAnnualLeave
     && (paidLeaveUsedThisMonth + requestedDays) > MONTHLY_PAID_LEAVE_QUOTA;
-  const isDisabled = isBlockedAnnualLeave || isOverBalance || isExceedingMonthlyQuota || requestedDays <= 0 || !finalReason.trim() || !!overlapWith || !!swapClash;
+  const invalidDates = !isValid(start) || (isMaternity ? !maternityRange : !isSpecial && (!isValid(end) || end < start));
+  const isDisabled = invalidDates || isBlockedAnnualLeave || isOverBalance || isExceedingMonthlyQuota || requestedDays <= 0 || !finalReason.trim() || !!overlapWith || !!swapClash;
 
   // Đổi lý do chế độ → gợi ý điền sẵn số ngày (Admin sửa được)
   const handleSpecialReasonChange = (value: string) => {
@@ -113,38 +121,28 @@ export const LeaveRequestModal: React.FC<Props> = ({ isOpen, onClose, onSubmit, 
     if (found?.suggestedDays) setSpecialDays(found.suggestedDays);
   };
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!finalReason.trim()) {
-      alert(isSpecial ? "Vui lòng nhập lý do nghỉ" : "Vui lòng nhập lý do nghỉ");
-      return;
-    }
-    if (isSpecial) {
-      if (!specialDays || specialDays < 1) {
-        alert("Số ngày nghỉ phải từ 1 trở lên");
-        return;
+    if (isDisabled || sendingRef.current) return;
+    const payload: LeaveSubmission = isSpecial
+      ? { startDate, endDate: format(effectiveEnd, 'yyyy-MM-dd'), type: effectiveSpecialType, duration: 'FULL', reason: finalReason }
+      : { startDate, endDate, type, duration, reason };
+    sendingRef.current = true;
+    setSending(true);
+    try {
+      const saved = await onSubmit(payload);
+      if (saved) {
+        setCustomReason('');
+        setReason('');
+        setActiveTab('HISTORY');
       }
-      // Suy ra endDate từ số ngày công Admin nhập (bỏ qua ngày nghỉ tuần)
-      const derivedEnd = format(deriveLeaveEndDate(start, specialDays, isRestDay), 'yyyy-MM-dd');
-      onSubmit({ startDate, endDate: derivedEnd, type: effectiveSpecialType, duration: 'FULL', reason: finalReason });
-      setCustomReason('');
-      setActiveTab('HISTORY');
-      return;
+    } catch (error: any) {
+      alert(leaveSubmitErrorMessage(error));
+    } finally {
+      sendingRef.current = false;
+      setSending(false);
     }
-    if (endDate < startDate) {
-      alert("Ngày kết thúc không được nhỏ hơn ngày bắt đầu");
-      return;
-    }
-    if (isOverBalance) {
-      alert("Số phép còn lại không đủ!");
-      return;
-    }
-    onSubmit({ startDate, endDate, type, duration, reason });
-    setReason('');
-    setActiveTab('HISTORY'); // Switch to history after submit
   };
-
-
   return (
     <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/60 backdrop-blur-sm animate-fade-in">
       <div className="bg-white w-full max-w-sm sm:rounded-2xl rounded-t-3xl shadow-2xl overflow-hidden transform transition-all flex flex-col h-[650px] max-h-[90vh]">
@@ -155,7 +153,7 @@ export const LeaveRequestModal: React.FC<Props> = ({ isOpen, onClose, onSubmit, 
             <Calendar size={20} />
             <h2 className="font-bold text-lg">Xin nghỉ phép: {userName || 'Của bạn'}</h2>
           </div>
-          <button onClick={onClose} className="p-1 hover:bg-white/20 rounded-full transition">
+          <button onClick={onClose} disabled={sending} className="p-1 hover:bg-white/20 rounded-full transition disabled:opacity-50">
             <X size={20} />
           </button>
         </div>
@@ -164,12 +162,14 @@ export const LeaveRequestModal: React.FC<Props> = ({ isOpen, onClose, onSubmit, 
         <div className="flex border-b border-gray-100 shrink-0">
           <button
             onClick={() => setActiveTab('REQUEST')}
+            disabled={sending}
             className={`flex-1 py-3 text-sm font-bold transition-all border-b-2 ${activeTab === 'REQUEST' ? 'border-emerald-500 text-emerald-600 bg-emerald-50/50' : 'border-transparent text-gray-500 hover:bg-gray-50'}`}
           >
             Gửi đơn
           </button>
           <button
             onClick={() => setActiveTab('HISTORY')}
+            disabled={sending}
             className={`flex-1 py-3 text-sm font-bold transition-all border-b-2 ${activeTab === 'HISTORY' ? 'border-emerald-500 text-emerald-600 bg-emerald-50/50' : 'border-transparent text-gray-500 hover:bg-gray-50'}`}
           >
             Lịch sử ({leaveHistory.length})
@@ -180,6 +180,17 @@ export const LeaveRequestModal: React.FC<Props> = ({ isOpen, onClose, onSubmit, 
         <div className="overflow-y-auto p-6 scrollbar-hide flex-1">
           {activeTab === 'REQUEST' ? (
             <form onSubmit={handleSubmit} className="space-y-4">
+              <fieldset disabled={sending} className="space-y-4 min-w-0">
+
+              {onRequestSwap && (
+                <button
+                  type="button"
+                  onClick={onRequestSwap}
+                  className="w-full flex items-center justify-center gap-2 px-3 py-2.5 rounded-xl border border-violet-200 bg-violet-50 text-violet-700 text-sm font-bold hover:bg-violet-100"
+                >
+                  <Repeat size={16} /> Đổi ngày nghỉ (Thứ 7 / Chủ nhật)
+                </button>
+              )}
 
               {/* Info / Warning Box */}
               {isSpecial ? (
@@ -188,8 +199,9 @@ export const LeaveRequestModal: React.FC<Props> = ({ isOpen, onClose, onSubmit, 
                     <Info size={16} />
                   </div>
                   <div className="text-xs text-teal-800 leading-relaxed">
-                    <p className="font-bold text-sm">Nghỉ chế độ (có lương)</p>
-                    <p className="opacity-90 mt-0.5">Tính đủ ngày công, <span className="font-bold">không trừ phép năm</span> và không bị giới hạn {MONTHLY_PAID_LEAVE_QUOTA} ngày/tháng.</p>
+                    <p className="font-bold text-sm">{LEAVE_TYPE_LABEL[effectiveSpecialType]}</p>
+                    <p className="opacity-90 mt-0.5">{LEAVE_PAYER_TEXT[effectiveSpecialType]}. Không bị giới hạn {MONTHLY_PAID_LEAVE_QUOTA} ngày/tháng.</p>
+                    {enforceMonthlyQuota && <p className="mt-1">Đơn nghỉ chế độ sẽ được gửi đến Admin và chờ duyệt.</p>}
                   </div>
                 </div>
               ) : !canUseAnnualLeave ? (
@@ -204,7 +216,7 @@ export const LeaveRequestModal: React.FC<Props> = ({ isOpen, onClose, onSubmit, 
                       chưa được tích luỹ phép năm. Chỉ nhân viên đã ký <span className="font-bold">hợp đồng chính thức</span> mới
                       được nghỉ phép năm.
                     </p>
-                    <p className="mt-1 font-bold">Vẫn có thể xin nghỉ "Không lương".</p>
+                    <p className="mt-1 font-bold">Vẫn có thể gửi đơn "Không lương" hoặc "Nghỉ chế độ" phù hợp với lý do nghỉ.</p>
                   </div>
                 </div>
               ) : isExceedingMonthlyQuota && type === 'PAID' ? (
@@ -249,8 +261,10 @@ export const LeaveRequestModal: React.FC<Props> = ({ isOpen, onClose, onSubmit, 
 
               <div className="grid grid-cols-2 gap-4">
                 <div className="space-y-1">
-                  <label className="text-sm font-semibold text-gray-700">Từ ngày</label>
+                  <label htmlFor="leave-start-date" className="text-sm font-semibold text-gray-700">{isMaternity ? 'Ngày bắt đầu nghỉ' : 'Từ ngày'}</label>
                   <input
+                    id="leave-start-date"
+                    required
                     type={startDate ? "date" : "text"}
                     lang="en-GB"
                     value={startDate}
@@ -261,7 +275,20 @@ export const LeaveRequestModal: React.FC<Props> = ({ isOpen, onClose, onSubmit, 
                     className="w-full px-3 py-2 bg-white border border-gray-300 rounded-xl focus:ring-2 focus:ring-green-500 outline-none text-sm placeholder-gray-400"
                   />
                 </div>
-                {isSpecial ? (
+                {isMaternity ? (
+                  <div className="space-y-1">
+                    <label htmlFor="leave-return-date" className="text-sm font-semibold text-gray-700">Ngày đi làm lại</label>
+                    <input
+                      id="leave-return-date"
+                      type="date"
+                      required
+                      value={returnDate}
+                      min={isValid(start) ? format(addDays(start, 1), 'yyyy-MM-dd') : undefined}
+                      onChange={(e) => setReturnDate(e.target.value)}
+                      className="w-full px-3 py-2 bg-white border border-gray-300 rounded-xl focus:ring-2 focus:ring-teal-500 outline-none text-sm"
+                    />
+                  </div>
+                ) : isSpecial ? (
                   <div className="space-y-1">
                     <label className="text-sm font-semibold text-gray-700">Số ngày nghỉ</label>
                     <input
@@ -289,7 +316,16 @@ export const LeaveRequestModal: React.FC<Props> = ({ isOpen, onClose, onSubmit, 
                   </div>
                 )}
               </div>
-              {isSpecial && specialDays >= 1 && (
+              {isMaternity && (
+                <div className="bg-sky-50 border border-sky-100 rounded-xl p-3 text-xs text-sky-800" aria-live="polite">
+                  <p className="font-bold text-sm">Số ngày nghỉ: {requestedDays} ngày</p>
+                  <p className="mt-1">Tính từ ngày bắt đầu nghỉ đến hết ngày liền trước ngày đi làm lại, không tính Chủ nhật.</p>
+                  {maternityRange && <p className="mt-1">Ngày nghỉ cuối: {format(maternityRange.endDate, 'dd/MM/yyyy')}.</p>}
+                  {returnDate && !maternityRange && <p className="mt-1 text-red-600">Ngày đi làm lại phải sau ngày bắt đầu nghỉ.</p>}
+                  {maternityRange?.days === 0 && <p className="mt-1 text-red-600">Khoảng đã chọn chỉ có Chủ nhật. Vui lòng chọn lại ngày.</p>}
+                </div>
+              )}
+              {isSpecial && !isMaternity && isValid(start) && specialDays >= 1 && (
                 <p className="text-[11px] text-gray-500 -mt-2">
                   Nghỉ từ <span className="font-bold">{format(start, 'dd/MM/yyyy')}</span> đến <span className="font-bold">{format(deriveLeaveEndDate(start, specialDays, isRestDay), 'dd/MM/yyyy')}</span> ({specialDays} ngày công, đã bỏ qua ngày nghỉ tuần).
                 </p>
@@ -316,15 +352,13 @@ export const LeaveRequestModal: React.FC<Props> = ({ isOpen, onClose, onSubmit, 
                   >
                     Không lương
                   </button>
-                  {allowSpecialLeave && (
-                    <button
-                      type="button"
-                      onClick={() => setType('SPECIAL')}
-                      className={`flex-1 py-2 rounded-lg text-xs font-bold transition-all border ${type === 'SPECIAL' ? 'bg-teal-100 border-teal-300 text-teal-700' : 'bg-white border-gray-200 text-gray-500'}`}
-                    >
-                      Nghỉ chế độ
-                    </button>
-                  )}
+                  <button
+                    type="button"
+                    onClick={() => setType('SPECIAL')}
+                    className={`flex-1 py-2 rounded-lg text-xs font-bold transition-all border ${type === 'SPECIAL' ? 'bg-teal-100 border-teal-300 text-teal-700' : 'bg-white border-gray-200 text-gray-500'}`}
+                  >
+                    Nghỉ chế độ
+                  </button>
                 </div>
               </div>
 
@@ -375,7 +409,7 @@ export const LeaveRequestModal: React.FC<Props> = ({ isOpen, onClose, onSubmit, 
                   </div>
 
                   {selectedReasonInfo?.suggestedDays ? (
-                    <p className="text-[11px] text-teal-600">Gợi ý theo quy định: <span className="font-bold">{selectedReasonInfo.suggestedDays} ngày</span> (Admin tự thiết lập).</p>
+                    <p className="text-[11px] text-teal-600">Gợi ý theo quy định: <span className="font-bold">{selectedReasonInfo.suggestedDays} ngày</span>. Nhập số ngày thực tế cần nghỉ để gửi duyệt.</p>
                   ) : null}
                   {isOtherReason && (
                     <textarea
@@ -424,15 +458,16 @@ export const LeaveRequestModal: React.FC<Props> = ({ isOpen, onClose, onSubmit, 
 
               <button
                 type="submit"
-                disabled={isDisabled}
-                className={`w-full py-3.5 rounded-xl font-bold shadow-lg flex items-center justify-center gap-2 transition-all ${isDisabled
+                disabled={isDisabled || sending}
+                className={`w-full py-3.5 rounded-xl font-bold shadow-lg flex items-center justify-center gap-2 transition-all ${isDisabled || sending
                   ? 'bg-gray-300 text-gray-500 cursor-not-allowed shadow-none'
                   : 'bg-green-600 text-white hover:bg-green-700 active:scale-95'
                   }`}
               >
                 <Send size={18} />
-                {overlapWith ? '🚫 Trùng ngày với đơn đã có' : swapClash ? '🚫 Trùng ngày nghỉ bù' : isSpecial ? 'Gửi đơn nghỉ chế độ' : isExceedingMonthlyQuota ? '🚫 Đã hết phép tháng này' : isOverBalance ? 'Không đủ phép' : 'Gửi đơn xin nghỉ'}
+                {sending ? 'Đang gửi đơn...' : overlapWith ? '🚫 Trùng ngày với đơn đã có' : swapClash ? '🚫 Trùng ngày nghỉ bù' : isSpecial ? 'Gửi đơn nghỉ chế độ' : isExceedingMonthlyQuota ? '🚫 Đã hết phép tháng này' : isOverBalance ? 'Không đủ phép' : 'Gửi đơn xin nghỉ'}
               </button>
+              </fieldset>
             </form>
           ) : (
             <div className="flex flex-col h-full">
@@ -473,6 +508,9 @@ export const LeaveRequestModal: React.FC<Props> = ({ isOpen, onClose, onSubmit, 
                               ({countLeaveDays(req, holidays, isRestDay)} ngày)
                             </span>
                           </p>
+                          {isMaternityLeave(req) && (
+                            <p className="text-xs text-sky-700 mt-1">Đi làm lại: {format(addDays(new Date(req.endDate), 1), 'dd/MM/yyyy')}</p>
+                          )}
                           <div className="flex items-center gap-2 mt-1">
                             <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded border ${getLeaveBadgeClass(req.leaveType)}`}>
                               {LEAVE_TYPE_LABEL[req.leaveType]}

@@ -1,12 +1,12 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { X, Calendar, DollarSign, FileText } from 'lucide-react';
-import { UserProfile } from '../types';
+import { SalaryChangeInput, salarySaveErrorMessage } from '../utils/salaryChanges';
 import { format, parse, isValid } from 'date-fns';
 
 interface Props {
     isOpen: boolean;
     onClose: () => void;
-    onSubmit: (data: { baseSalary: number; allowance: number; insuranceSalary: number; effectiveDate: string; reason: string }) => void;
+    onSubmit: (data: SalaryChangeInput) => Promise<boolean>;
     currentUserSalary: { baseSalary: number; allowance: number; insuranceSalary: number };
     initialData?: {
         baseSalary: number;
@@ -18,13 +18,22 @@ interface Props {
 }
 
 export const SalaryChangeModal: React.FC<Props> = ({ isOpen, onClose, onSubmit, currentUserSalary, initialData }) => {
-    if (!isOpen) return null;
-
     const [baseSalary, setBaseSalary] = useState(initialData?.baseSalary ?? currentUserSalary.baseSalary);
     const [allowance, setAllowance] = useState(initialData?.allowance ?? currentUserSalary.allowance);
     const [insuranceSalary, setInsuranceSalary] = useState(initialData?.insuranceSalary ?? currentUserSalary.insuranceSalary);
     const [effectiveDate, setEffectiveDate] = useState(initialData?.effectiveDate ?? '');
     const [reason, setReason] = useState(initialData?.reason ?? '');
+    const [saving, setSaving] = useState(false);
+    const savingRef = useRef(false);
+
+    useEffect(() => {
+        if (!isOpen) return;
+        setBaseSalary(initialData?.baseSalary ?? currentUserSalary.baseSalary);
+        setAllowance(initialData?.allowance ?? currentUserSalary.allowance);
+        setInsuranceSalary(initialData?.insuranceSalary ?? currentUserSalary.insuranceSalary);
+        setEffectiveDate(initialData?.effectiveDate ?? '');
+        setReason(initialData?.reason ?? '');
+    }, [isOpen, initialData]);
 
     // Hybrid Date Input Logic
     const dateInputRef = useRef<HTMLInputElement>(null);
@@ -36,8 +45,12 @@ export const SalaryChangeModal: React.FC<Props> = ({ isOpen, onClose, onSubmit, 
             if (!isNaN(dateObj.getTime())) {
                 setDateText(format(dateObj, 'dd/MM/yyyy'));
             }
+        } else {
+            setDateText('');
         }
     }, [effectiveDate]);
+
+    if (!isOpen) return null;
 
     const handleDatePick = (e: React.ChangeEvent<HTMLInputElement>) => {
         const val = e.target.value; // yyyy-mm-dd
@@ -57,20 +70,25 @@ export const SalaryChangeModal: React.FC<Props> = ({ isOpen, onClose, onSubmit, 
         }
     };
 
-    const handleSubmit = (e: React.FormEvent) => {
+    const handleSubmit = async (e: React.FormEvent) => {
         e.preventDefault();
-        if (!effectiveDate) {
-            alert("Vui lòng chọn ngày áp dụng");
+        if (savingRef.current) return;
+        const parsed = parse(dateText, 'dd/MM/yyyy', new Date());
+        if (!isValid(parsed) || format(parsed, 'dd/MM/yyyy') !== dateText) {
+            alert("Vui lòng chọn ngày áp dụng hợp lệ");
             return;
         }
-        onSubmit({
-            baseSalary,
-            allowance,
-            insuranceSalary,
-            effectiveDate,
-            reason
-        });
-        onClose();
+        savingRef.current = true;
+        setSaving(true);
+        try {
+            const saved = await onSubmit({ baseSalary, allowance, insuranceSalary, effectiveDate: format(parsed, 'yyyy-MM-dd'), reason });
+            if (saved) onClose();
+        } catch (error: any) {
+            alert(salarySaveErrorMessage(error));
+        } finally {
+            savingRef.current = false;
+            setSaving(false);
+        }
     };
 
     const formatCurrency = (val: number) => new Intl.NumberFormat('vi-VN').format(val);
@@ -83,12 +101,13 @@ export const SalaryChangeModal: React.FC<Props> = ({ isOpen, onClose, onSubmit, 
                         <DollarSign size={20} />
                         <h2 className="font-bold text-lg">{initialData ? "Chỉnh sửa lương" : "Cập nhật lương"}</h2>
                     </div>
-                    <button onClick={onClose} className="p-1 hover:bg-white/10 rounded-full transition">
+                    <button onClick={onClose} disabled={saving} className="p-1 hover:bg-white/10 rounded-full transition disabled:opacity-50">
                         <X size={20} />
                     </button>
                 </div>
 
                 <form onSubmit={handleSubmit} className="p-5 space-y-4">
+                    <fieldset disabled={saving} className="space-y-4">
 
                     <div className="bg-blue-50 p-3 rounded-xl border border-blue-100 flex items-start gap-2">
                         <Calendar
@@ -188,9 +207,10 @@ export const SalaryChangeModal: React.FC<Props> = ({ isOpen, onClose, onSubmit, 
                             className="w-full bg-slate-900 hover:bg-slate-800 text-white font-bold py-3 rounded-xl transition shadow-lg active:scale-95 flex items-center justify-center gap-2"
                         >
                             <DollarSign size={18} />
-                            Lưu thay đổi lương
+                            {saving ? 'Đang lưu...' : 'Lưu thay đổi lương'}
                         </button>
                     </div>
+                    </fieldset>
 
                 </form>
             </div>

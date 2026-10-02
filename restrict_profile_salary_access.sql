@@ -208,16 +208,21 @@ CREATE POLICY "Own salary history or admin"
   ON public.salary_changes FOR SELECT TO authenticated
   USING (user_id = auth.uid() OR public.is_admin());
 
+-- Gỡ policy ALL ở trên cũng gỡ quyền ghi nếu trước đó nằm chung trong ALL.
+-- Phải khôi phục INSERT + UPDATE cho luồng upsert lịch sử lương của Admin.
+GRANT SELECT, INSERT, UPDATE ON public.salary_changes TO authenticated;
+DROP POLICY IF EXISTS "Admin can insert salary changes" ON public.salary_changes;
+CREATE POLICY "Admin can insert salary changes"
+  ON public.salary_changes FOR INSERT TO authenticated
+  WITH CHECK (public.is_admin());
+DROP POLICY IF EXISTS "Admin can update salary changes" ON public.salary_changes;
+CREATE POLICY "Admin can update salary changes"
+  ON public.salary_changes FOR UPDATE TO authenticated
+  USING (public.is_admin()) WITH CHECK (public.is_admin());
+
 CREATE POLICY "Own bonuses or admin"
   ON public.bonuses FOR SELECT TO authenticated
   USING (user_id = auth.uid() OR public.is_admin());
-
--- BƯỚC 7b (CHỈ nếu BƯỚC 0b cho thấy UPDATE requests đang mở cho mọi người):
--- Không cho nhân viên tự đổi status đơn của chính mình.
--- Bỏ dấu -- ở 3 dòng dưới để chạy.
--- DROP POLICY IF EXISTS "Admin can update requests" ON public.requests;
--- CREATE POLICY "Admin can update requests" ON public.requests
---   FOR UPDATE TO authenticated USING (public.is_admin()) WITH CHECK (public.is_admin());
 
 -- BƯỚC 7c: requests — giấu số tiền ứng lương của đồng nghiệp.
 -- Lịch công ty VẪN thấy đơn nghỉ / đổi ngày nghỉ của mọi người (cố ý).
@@ -236,6 +241,24 @@ END $$;
 CREATE POLICY "Requests visible except others advances"
   ON public.requests FOR SELECT TO authenticated
   USING (type <> 'ADVANCE' OR user_id = auth.uid() OR public.is_admin());
+
+-- BƯỚC 7d: Khôi phục quyền ghi sau khi gỡ policy ALL ở 7c.
+-- Nếu không làm bước này, đơn chỉ hiện tạm ở client rồi mất khi tải lại.
+-- Policy ghi cũ có tên khác cần đối chiếu ở BƯỚC 0b; không xoá mù.
+ALTER TABLE public.requests ENABLE ROW LEVEL SECURITY;
+GRANT SELECT, INSERT, UPDATE ON public.requests TO authenticated;
+DROP POLICY IF EXISTS "Users can submit own pending requests" ON public.requests;
+CREATE POLICY "Users can submit own pending requests"
+  ON public.requests FOR INSERT TO authenticated
+  WITH CHECK (user_id = auth.uid() AND status = 'PENDING');
+DROP POLICY IF EXISTS "Admin can insert requests" ON public.requests;
+CREATE POLICY "Admin can insert requests"
+  ON public.requests FOR INSERT TO authenticated
+  WITH CHECK (public.is_admin());
+DROP POLICY IF EXISTS "Admin can update requests" ON public.requests;
+CREATE POLICY "Admin can update requests"
+  ON public.requests FOR UPDATE TO authenticated
+  USING (public.is_admin()) WITH CHECK (public.is_admin());
 
 -- BƯỚC 8: KIỂM TRA SAU. Đối chiếu với ảnh chụp ở BƯỚC 0b.
 SELECT tablename, policyname, cmd, qual

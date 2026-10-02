@@ -8,8 +8,11 @@ import { OT_LOCATION_LABEL } from '../utils/otDisplay';
 import { LEAVE_TYPE_LABEL, getLeaveBadgeClass } from '../utils/leaveTypes';
 import { isSwapVoidedByHoliday } from '../utils/restDay';
 import { describeProfileChanges, PROFILE_DEFAULT_REASON } from '../utils/profileChange';
+import { RefreshCw } from 'lucide-react';
 
 interface Props {
+  onRefresh?: () => Promise<void>;
+  loadError?: string;
   otRequests: OTRequest[];
   lateRequests: LateRequest[];
   advanceRequests?: SalaryAdvanceRequest[];
@@ -55,11 +58,23 @@ export const RequestApproval: React.FC<Props> = ({
   onUpdateLeaveStatus,
   onUpdateSwapStatus,
   onUpdateProfileStatus,
-  onDeleteRequest
+  onDeleteRequest,
+  onRefresh,
+  loadError
 }) => {
   const [filter, setFilter] = useState<'PENDING' | 'PROCESSED'>('PENDING');
   const [activeTypeTab, setActiveTypeTab] = useState<RequestTypeFilter>('ALL');
   const [historyMonth, setHistoryMonth] = useState(new Date());
+  const [refreshing, setRefreshing] = useState(false);
+  const [refreshError, setRefreshError] = useState('');
+  const refresh = async () => {
+    if (!onRefresh || refreshing) return;
+    setRefreshing(true);
+    setRefreshError('');
+    try { await onRefresh(); }
+    catch { setRefreshError('Không tải được danh sách đơn. Vui lòng thử lại.'); }
+    finally { setRefreshing(false); }
+  };
 
   // Batch Selection State
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
@@ -176,7 +191,16 @@ export const RequestApproval: React.FC<Props> = ({
             <h2 className="text-xl font-bold text-gray-800 leading-none">Duyệt Đơn</h2>
             <span className="text-sm text-gray-500">Quản lý yêu cầu nhân sự</span>
           </div>
+          {onRefresh && (
+            <button onClick={refresh} disabled={refreshing} className="ml-auto flex items-center gap-1 rounded-lg bg-indigo-50 px-3 py-2 text-xs font-bold text-indigo-700 disabled:opacity-50">
+              <RefreshCw size={15} className={refreshing ? 'animate-spin' : ''} />
+              {refreshing ? 'Đang tải...' : 'Tải lại'}
+            </button>
+          )}
         </div>
+        {(loadError || refreshError) && (
+          <p role="alert" className="mb-3 rounded-lg bg-red-50 p-3 text-xs text-red-700">{loadError || refreshError}</p>
+        )}
 
         {/* 2. Main Tabs (Pending vs History) */}
         <div className="flex bg-gray-100 p-1 rounded-xl mb-4">
@@ -615,4 +639,3 @@ export const RequestApproval: React.FC<Props> = ({
     </div>
   );
 };
-

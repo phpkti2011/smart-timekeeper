@@ -2833,8 +2833,16 @@ const App: React.FC = () => {
       setSalaryChanges(prev => prev.filter(c => c.id !== id));
 
       // DB Delete
-      const { error } = await supabase.from('salary_changes').delete().eq('id', id);
+      const { data, error } = await supabase.from('salary_changes').delete().eq('id', id).select();
       if (error) throw error;
+
+      // RLS chặn im lặng: không báo lỗi nhưng cũng không xoá dòng nào. Phải bắt ca này,
+      // nếu không Admin thấy báo đã xoá mà tải lại là mốc lương quay về y nguyên.
+      if (!data || data.length === 0) {
+        alert('⚠️ KHÔNG XOÁ ĐƯỢC MỐC LỊCH SỬ LƯƠNG.\n\nCơ sở dữ liệu từ chối quyền xoá (RLS).\nCần chạy file add_delete_salary_change_policy.sql trên Supabase → SQL Editor, rồi thử lại.');
+        fetchAllData();
+        return;
+      }
 
       triggerNotification('Đã xóa', 'Đã xóa bản ghi lịch sử lương.');
 

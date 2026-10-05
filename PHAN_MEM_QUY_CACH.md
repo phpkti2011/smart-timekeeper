@@ -116,10 +116,13 @@ Trước 4.2 mọi nhân viên đăng nhập đều tải về `profiles.select(
   vòng lặp "xoá policy đọc cũ" trong `restrict_profile_salary_access.sql` (lọc
   `polcmd IN ('r','*')`) lấy đi cả quyền ghi. Mỗi lần siết RLS một bảng **phải cấp lại**
   `GRANT` + policy ghi, nếu không: `INSERT` báo `42501`, còn `UPDATE`/`DELETE` hỏng **im
-  lặng** (PostgREST trả về "thành công, 0 dòng"). Bẫy này đã vấp **3 lần**:
-  `salary_changes` và `requests` (vá 02/10/2026), rồi `bonuses` (vá 05/10/2026 bằng
-  `fix_bonuses_write_policies.sql`). BƯỚC 9 của file đó có truy vấn quét mọi bảng đang bật
-  RLS — bảng nào "có đọc, trống ghi" là ứng viên hỏng tiếp theo.
+  lặng** (PostgREST trả về "thành công, 0 dòng"). Bẫy này đã vấp **4 lần**:
+  `salary_changes` INSERT/UPDATE và `requests` (vá 02/10/2026), `bonuses` (vá 05/10/2026 bằng
+  `fix_bonuses_write_policies.sql`), rồi `salary_changes` DELETE (vá cùng ngày bằng
+  `add_delete_salary_change_policy.sql`). BƯỚC 9 của `fix_bonuses_write_policies.sql` có
+  truy vấn quét mọi bảng đang bật RLS, đếm policy theo từng lệnh — chính nó tìm ra ca thứ
+  tư. Bảng nào "có đọc, trống ghi" là ứng viên hỏng tiếp theo; chạy lại truy vấn đó sau
+  mỗi lần siết RLS.
 - Trong 8 vai trò ở `types.ts`, **chỉ `'Admin'`** là đặc quyền (`is_admin()` so chuỗi chính
   xác). `'Quản Lý Sản Xuất'` và `'Nhân Viên Kế Toán'` nghe như cấp quản lý nhưng với CSDL
   vẫn là nhân viên thường. Cần thêm người nhập thưởng thì **đặt role `'Admin'`** cho họ —
@@ -976,6 +979,13 @@ insuranceDeduction = insuranceSalary × 10.5%
 
 ### Upsert
 - Cùng `user_id` + `effective_date` → Cập nhật (không tạo bản ghi trùng).
+
+### Quyền ghi
+- Thêm / sửa: chỉ Admin (`fix_salary_changes_rls.sql`).
+- **Xoá mốc: chỉ Admin** (`add_delete_salary_change_policy.sql`, từ 4.4). Lịch sử lương là
+  căn cứ tính lương ngược về quá khứ nên nhân viên không đụng được, kể cả dòng của mình.
+- `handleDeleteSalaryChange` phải `.select()` rồi đếm số dòng: RLS chặn xoá thì **không**
+  báo lỗi, chỉ xoá 0 dòng — Admin sẽ thấy "Đã xóa" trong khi mốc lương vẫn còn sau F5.
 
 ---
 

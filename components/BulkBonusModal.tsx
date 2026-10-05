@@ -9,7 +9,7 @@ interface Props {
     employees: UserProfile[]; // Active employees
     onSave: (data: Omit<BonusFine, 'id'>[]) => Promise<void>;
     existingBonuses: BonusFine[]; // Needed for history
-    onDeleteBatch: (ids: string[]) => Promise<void>;
+    onDeleteBatch: (ids: string[]) => Promise<boolean>; // false = CSDL không xoá được, đừng chèn tiếp
     currentMonth: Date;
     lateWarnings?: Record<string, { level: 3 | 6; message: string }>; // Consecutive late warnings per userId
 }
@@ -150,9 +150,12 @@ export const BulkBonusModal: React.FC<Props> = ({ isOpen, onClose, employees, on
         }
 
         if (confirm(`Xác nhận ${idsToDeleteOnSave.length > 0 ? 'CẬP NHẬT' : 'LƯU'} danh sách?`)) {
-            // Delete old if editing
+            // Sửa lô = xoá lô cũ rồi chèn lô mới. Xoá KHÔNG thành công mà vẫn chèn tiếp
+            // thì lô cũ còn nguyên bên cạnh lô mới ⇒ thưởng nhân đôi, lương sai.
+            // Dừng lại và giữ modal mở để anh/chị thấy cảnh báo rồi thử lại.
             if (idsToDeleteOnSave.length > 0) {
-                await onDeleteBatch(idsToDeleteOnSave);
+                const daXoa = await onDeleteBatch(idsToDeleteOnSave);
+                if (!daXoa) return;
             }
             await onSave(toSave);
             onClose();

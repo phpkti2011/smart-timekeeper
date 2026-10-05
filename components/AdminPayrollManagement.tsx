@@ -22,7 +22,7 @@ interface Props {
     leaveRequests: LeaveRequest[];
     swapRequests?: SwapRequest[];
     onBulkSaveBonus: (items: Omit<BonusFine, 'id'>[]) => Promise<void>;
-    onDeleteBonusBatch: (ids: string[]) => Promise<void>;
+    onDeleteBonusBatch: (ids: string[]) => Promise<boolean>; // false = CSDL không xoá được
     lockedMonths: string[];
     onFetchMonthData?: (month: Date) => Promise<void>;
 }
@@ -845,10 +845,14 @@ export const AdminPayrollManagement: React.FC<Props> = ({
                 message="Hành động này sẽ hủy trạng thái 'Đã chốt' của nhân viên. Bạn sẽ cần phải chốt lại sau khi hoàn tất chỉnh sửa."
                 confirmText="Hoàn chốt ngay"
                 cancelText="Hủy bỏ"
-                onConfirm={() => {
+                onConfirm={async () => {
                     if (revertConfirmId) {
-                        onDeleteBonusBatch([revertConfirmId]);
+                        // Chỉ báo thành công khi CSDL thật sự xoá được dòng xác nhận.
+                        // Trước đây báo vô điều kiện: RLS chặn xoá thì Admin vẫn thấy
+                        // "Đã hoàn chốt thành công!" nhưng F5 là nhãn "Đã chốt" quay lại.
+                        const daHoanChot = await onDeleteBonusBatch([revertConfirmId]);
                         setRevertConfirmId(null);
+                        if (!daHoanChot) return;
                         setSuccessMsg("Đã hoàn chốt thành công!");
                         setTimeout(() => setSuccessMsg(""), 3000);
                     }

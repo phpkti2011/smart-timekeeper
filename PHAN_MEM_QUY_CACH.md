@@ -106,10 +106,32 @@ Trước 4.2 mọi nhân viên đăng nhập đều tải về `profiles.select(
 | Ghi `profiles` (UPDATE) | ❌ | ✅ | ❌ |
 | `settings` (GPS/IP, lịch nhóm làm CN) — đọc | ✅ | ✅ | ✅ |
 | `settings` — ghi (từ 4.3, `add_weekend_groups.sql`) | ❌ | ✅ | ❌ |
+| Ghi `bonuses` — thêm/sửa/xoá thưởng, phạt (`fix_bonuses_write_policies.sql`) | ❌ | ✅ | ❌ |
+| Ghi `bonuses` — dòng xác nhận chốt lương của chính mình | ✅ (ép `amount = 0`, `type = 'BONUS'`, `reason LIKE 'CONFIRMATION:%'`) | ✅ | ❌ |
 
 - Policy dùng hàm `public.is_admin()` (`SECURITY DEFINER`) thay vì SELECT `profiles` trực
   tiếp: policy đặt trên `profiles` mà tự đọc `profiles` sẽ gây lỗi `42P17 infinite
   recursion` và khoá cứng app.
+- ⚠️ **GỠ POLICY `FOR ALL` LÀ GỠ LUÔN QUYỀN GHI.** Policy `ALL` gộp cả đọc lẫn ghi, nên
+  vòng lặp "xoá policy đọc cũ" trong `restrict_profile_salary_access.sql` (lọc
+  `polcmd IN ('r','*')`) lấy đi cả quyền ghi. Mỗi lần siết RLS một bảng **phải cấp lại**
+  `GRANT` + policy ghi, nếu không: `INSERT` báo `42501`, còn `UPDATE`/`DELETE` hỏng **im
+  lặng** (PostgREST trả về "thành công, 0 dòng"). Bẫy này đã vấp **3 lần**:
+  `salary_changes` và `requests` (vá 02/10/2026), rồi `bonuses` (vá 05/10/2026 bằng
+  `fix_bonuses_write_policies.sql`). BƯỚC 9 của file đó có truy vấn quét mọi bảng đang bật
+  RLS — bảng nào "có đọc, trống ghi" là ứng viên hỏng tiếp theo.
+- Trong 8 vai trò ở `types.ts`, **chỉ `'Admin'`** là đặc quyền (`is_admin()` so chuỗi chính
+  xác). `'Quản Lý Sản Xuất'` và `'Nhân Viên Kế Toán'` nghe như cấp quản lý nhưng với CSDL
+  vẫn là nhân viên thường. Cần thêm người nhập thưởng thì **đặt role `'Admin'`** cho họ —
+  mở policy theo vai trò khác là vô ích vì giao diện cũng khoá tab Nhân sự và tab Lương sau
+  `isAdmin`.
+- Hoàn chốt lương (nhãn "Đã chốt" → nút xoay ngược ở tab Lương) **chỉ Admin** làm được, vì
+  nó xoá dòng `CONFIRMATION`. Nhân viên đã xác nhận thì không tự huỷ được — cố ý không cấp
+  `DELETE` cho họ.
+- Mọi lệnh xoá `bonuses` đều phải `.select()` rồi **đếm số dòng trả về** (`handleDeleteBonus`,
+  `handleDeleteBonusBatch` trả `Promise<boolean>`). Lý do: nút "Cập nhật thay đổi" ở Nhập
+  Thưởng Hàng Loạt xoá lô cũ rồi chèn lô mới — xoá hụt mà vẫn chèn tiếp là **thưởng nhân đôi,
+  lương sai**. Nút "Hoàn chốt lương" cũng chỉ được báo thành công khi hàm trả `true`.
 - VIEW `employee_directory` **cố ý không** đặt `security_invoker = true` (view phải bỏ qua
   RLS của bảng gốc). Supabase Advisor sẽ cảnh báo `security_definer_view` — **đừng "sửa cho
   hết warning"**, làm vậy danh bạ trống với mọi nhân viên và Admin ngừng nhận thông báo.
@@ -869,6 +891,18 @@ insuranceDeduction = insuranceSalary × 10.5%
 ### Thưởng/Phạt hàng loạt (Bulk)
 - Admin có thể thêm thưởng/phạt cho nhiều nhân viên cùng lúc.
 - Hỗ trợ nhóm theo `createdAt` để hiển thị lịch sử bulk.
+- **Sửa lô = xoá lô cũ + chèn lô mới.** Vì vậy `handleDeleteBonusBatch` phải xoá **đủ** số
+  dòng mới được chèn tiếp (trả `Promise<boolean>`, modal `return` ngay khi gặp `false`).
+  Bỏ qua bước này thì lô cũ còn nguyên bên cạnh lô mới ⇒ **thưởng nhân đôi, lương sai** mà
+  không ai được báo.
+
+### Quyền ghi (từ 4.4, `fix_bonuses_write_policies.sql`)
+- Thêm / sửa / xoá thưởng, phạt: **chỉ Admin** (`profiles.role = 'Admin'`). Giao diện cũng
+  đã khoá: tab Nhân sự và tab Lương chỉ hiện với `isAdmin`.
+- Ngoại lệ duy nhất của nhân viên thường: tự chèn dòng **xác nhận chốt lương** của chính
+  mình — policy ép `user_id = auth.uid()`, `amount = 0`, `type = 'BONUS'`,
+  `reason LIKE 'CONFIRMATION:%'` nên không lách thành thưởng tiền được.
+- Nhân viên **không** xoá được dòng xác nhận của mình: đã chốt là chốt, chỉ Admin hoàn tác.
 
 ---
 
@@ -925,6 +959,11 @@ insuranceDeduction = insuranceSalary × 10.5%
 ### Xác nhận cá nhân
 - Nhân viên có thể **"Xác nhận lương"** trên bảng lương của mình.
 - Xác nhận được lưu dưới dạng `BonusFine` với type `BONUS`, amount = 0, reason chứa `"CONFIRMATION"`.
+- **Hoàn chốt** (nhãn "Đã chốt" → nút xoay ngược ở tab Lương) = **xoá** dòng `CONFIRMATION`
+  đó, nên **chỉ Admin** làm được. Nhân viên đã xác nhận thì không tự huỷ được.
+- Chỉ báo *"Đã hoàn chốt thành công!"* khi lệnh xoá trả về `true`. Từ 23/09 đến 05/10/2026
+  nút này báo thành công vô điều kiện trong khi RLS đang chặn xoá, nên Admin bấm xong F5 là
+  nhãn "Đã chốt" quay lại — xem `fix_bonuses_write_policies.sql`.
 
 ---
 

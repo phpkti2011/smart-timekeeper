@@ -224,6 +224,14 @@ CREATE POLICY "Own bonuses or admin"
   ON public.bonuses FOR SELECT TO authenticated
   USING (user_id = auth.uid() OR public.is_admin());
 
+-- ⚠️ BƯỚC 7b: QUYỀN GHI bonuses NẰM Ở FILE RIÊNG: fix_bonuses_write_policies.sql
+-- Vòng lặp ở BƯỚC 7 gỡ cả polcmd '*' (FOR ALL) nên đã gỡ luôn quyền ghi bonuses,
+-- mà ở đây chỉ tạo lại policy ĐỌC — đúng cái bẫy đã nêu ở dòng 211-212, lần này
+-- rơi vào bonuses. Hậu quả: Admin nhập thưởng báo 42501, còn sửa/xoá thưởng và nút
+-- "Hoàn chốt lương" hỏng IM LẶNG. Chạy fix_bonuses_write_policies.sql để cấp lại
+-- GRANT + 3 policy ghi cho Admin + 1 policy cho nhân viên tự xác nhận chốt lương.
+-- Bốn policy đó có polcmd 'a'/'w'/'d' nên chạy lại file này KHÔNG gỡ mất chúng.
+
 -- BƯỚC 7c: requests — giấu số tiền ứng lương của đồng nghiệp.
 -- Lịch công ty VẪN thấy đơn nghỉ / đổi ngày nghỉ của mọi người (cố ý).
 DO $$

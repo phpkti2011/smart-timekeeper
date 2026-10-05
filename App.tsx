@@ -95,6 +95,13 @@ const isMonthLocked = (date: Date, lockedMonths: string[]): boolean => {
 
 const LOCKED_MONTH_MSG = '🔒 THÁNG ĐÃ CHỐT LƯƠNG!\n\nKhông thể thực hiện thao tác này vì tháng đã được chốt.\nVui lòng liên hệ Admin để hoàn chốt lương trước khi sửa đổi.';
 
+/**
+ * CSDL nhận lệnh xoá nhưng không xoá dòng nào — RLS chặn im lặng (không báo lỗi,
+ * chỉ trả về 0 dòng). Phải báo ra màn hình: nếu im luôn thì nút "Cập nhật thay đổi"
+ * ở Nhập Thưởng Hàng Loạt sẽ xoá hụt lô cũ rồi chèn lô mới ⇒ thưởng NHÂN ĐÔI, lương sai.
+ */
+const BONUS_DELETE_BLOCKED_MSG = '⚠️ KHÔNG XOÁ ĐƯỢC THƯỞNG/PHẠT.\n\nCơ sở dữ liệu từ chối quyền xoá (RLS).\nCần chạy file fix_bonuses_write_policies.sql trên Supabase → SQL Editor, rồi thử lại.';
+
 const App: React.FC = () => {
   // Authentication State
   const [currentUser, setCurrentUser] = useState<UserProfile | null>(null);
@@ -1960,16 +1967,36 @@ const App: React.FC = () => {
         setTimeout(() => setIsSuccessModalOpen(false), 3000);
       }
     }
-  }; const handleDeleteBonus = async (id: string) => {
+  };
+
+  /**
+   * Xoá một dòng thưởng/phạt. Trả về true chỉ khi CSDL thật sự xoá được dòng đó —
+   * nơi gọi phải dựa vào giá trị này, đừng báo thành công trước.
+   */
+  const handleDeleteBonus = async (id: string): Promise<boolean> => {
     // Guard: Tháng đã chốt lương
     const bonus = bonuses.find(b => b.id === id);
     if (bonus && isMonthLocked(bonus.date, lockedMonths)) {
       alert(LOCKED_MONTH_MSG);
-      return;
+      return false;
     }
 
     setBonuses(prev => prev.filter(b => b.id !== id));
-    await supabase.from('bonuses').delete().eq('id', id);
+    const { data, error } = await supabase.from('bonuses').delete().eq('id', id).select();
+
+    if (error) {
+      if (bonus) setBonuses(prev => [...prev, bonus]);
+      console.error('Lỗi xoá thưởng/phạt:', error);
+      alert(`⚠️ Không xoá được thưởng/phạt.\n\n${error.message}`);
+      return false;
+    }
+    // RLS chặn im lặng: không báo lỗi nhưng cũng không xoá dòng nào.
+    if (!data || data.length === 0) {
+      if (bonus) setBonuses(prev => [...prev, bonus]);
+      alert(BONUS_DELETE_BLOCKED_MSG);
+      return false;
+    }
+    return true;
   };
 
   /**
@@ -2044,16 +2071,37 @@ const App: React.FC = () => {
     triggerNotification('Đã xoá đơn', `Đã xoá ${nhan[type]} của ${req.userName} ngày ${khoang}.`);
   };
 
-  const handleDeleteBonusBatch = async (ids: string[]) => {
+  /**
+   * Xoá cả lô thưởng/phạt. Dùng cho nút "Cập nhật thay đổi" (xoá lô cũ rồi chèn lô
+   * mới) và nút "Hoàn chốt lương" của Admin (hoàn chốt = xoá dòng CONFIRMATION).
+   * Trả về true chỉ khi xoá ĐỦ số dòng yêu cầu: xoá thiếu cũng dẫn tới nhân đôi.
+   */
+  const handleDeleteBonusBatch = async (ids: string[]): Promise<boolean> => {
     // Guard: Tháng đã chốt lương
     const lockedBonus = bonuses.find(b => ids.includes(b.id) && isMonthLocked(b.date, lockedMonths));
     if (lockedBonus) {
       alert(LOCKED_MONTH_MSG);
-      return;
+      return false;
     }
 
+    const removed = bonuses.filter(b => ids.includes(b.id));
     setBonuses(prev => prev.filter(b => !ids.includes(b.id)));
-    await supabase.from('bonuses').delete().in('id', ids);
+    const { data, error } = await supabase.from('bonuses').delete().in('id', ids).select();
+
+    if (error) {
+      setBonuses(prev => [...prev, ...removed]);
+      console.error('Lỗi xoá lô thưởng/phạt:', error);
+      alert(`⚠️ Không xoá được lô thưởng/phạt.\n\n${error.message}`);
+      return false;
+    }
+    // Xoá hụt (RLS chặn im lặng, hoặc chỉ xoá được một phần) — khôi phục hết rồi báo,
+    // để nơi gọi dừng lại thay vì chèn tiếp lên dữ liệu cũ còn nguyên.
+    if (!data || data.length !== ids.length) {
+      setBonuses(prev => [...prev, ...removed]);
+      alert(BONUS_DELETE_BLOCKED_MSG);
+      return false;
+    }
+    return true;
   };
 
   const handleConfirmSalary = async () => {

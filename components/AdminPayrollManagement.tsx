@@ -4,7 +4,9 @@ import { supabase } from '../utils/supabaseClient';
 import { UserProfile, AttendanceLog, OTRequest, LateRequest, SalaryAdvanceRequest, BonusFine, MonthlySalaryReport, Holiday, PayrollPeriod, PayrollDetail, OverrideLog, SalaryChange, LeaveRequest, SwapRequest } from '../types';
 import { calculateMonthlySalary } from '../utils/salaryCalculator';
 import { isPayrollEmployee } from '../utils/employeeFilters';
-import { Download, Lock, CheckCircle, AlertTriangle, FileText, X, Gift, Users, Unlock, RotateCcw, Search, Clock } from 'lucide-react';
+import { Download, Lock, CheckCircle, AlertTriangle, FileText, X, Gift, Users, Unlock, RotateCcw, Search, Clock, Bell } from 'lucide-react';
+import { sendPushToUser } from '../utils/pushNotifications';
+import { reminderBlockReason, buildSalaryReminder, classifyPushResult, summarizeReminder } from '../utils/salaryReminder';
 import { BulkBonusModal } from './BulkBonusModal';
 import { ConfirmDialog } from './ConfirmDialog';
 import { LateReport } from './LateReport';
@@ -53,6 +55,7 @@ export const AdminPayrollManagement: React.FC<Props> = ({
     const [isProcessing, setIsProcessing] = useState(false);
     const [successMsg, setSuccessMsg] = useState('');
 
+    const [isReminding, setIsReminding] = useState(false); // Đang gửi nhắc xác nhận lương — chặn bấm đúp gửi trùng
     const [revertConfirmId, setRevertConfirmId] = useState<string | null>(null); // State for Revert Confirmation
     const [searchTerm, setSearchTerm] = useState(''); // Search State
 
@@ -300,6 +303,43 @@ export const AdminPayrollManagement: React.FC<Props> = ({
 
     const isLocked = lockedMonths.includes(format(selectedMonth, 'MM-yyyy'));
 
+    // Lý do KHÔNG nhắc được (null = được). Nhân viên chỉ xác nhận được tháng đã qua,
+    // chưa chốt — xem reminderBlockReason.
+    const reminderBlock = reminderBlockReason(selectedMonth, new Date(), isLocked, confirmationStatus.unconfirmed.length);
+
+    /**
+     * Gửi push nhắc xác nhận lương. Báo ĐÚNG người nào nhận / không nhận: push chỉ tới
+     * người đã bật thông báo, và Admin không đọc được push_subscriptions của họ (RLS),
+     * nên phản hồi của API là nguồn duy nhất. Hỏi xác nhận trước vì đây là thông báo THẬT
+     * tới điện thoại nhân viên (local cũng trỏ Supabase thật).
+     */
+    const handleRemind = async (targets: UserProfile[]) => {
+        if (isReminding || targets.length === 0) return;
+        const monthLabel = format(selectedMonth, 'MM/yyyy');
+        const cauHoi = targets.length === 1
+            ? `Gửi nhắc xác nhận lương tháng ${monthLabel} cho ${targets[0].name}?`
+            : `Gửi nhắc xác nhận lương tháng ${monthLabel} cho ${targets.length} nhân viên chưa xác nhận?`;
+        if (!confirm(cauHoi)) return;
+
+        setIsReminding(true);
+        try {
+            const { title, body } = buildSalaryReminder(selectedMonth);
+            const lines = await Promise.all(targets.map(async t => ({
+                name: t.name,
+                outcome: classifyPushResult(await sendPushToUser(t.id, title, body))
+            })));
+            const sum = summarizeReminder(selectedMonth, lines);
+            if (sum.allOk) {
+                setSuccessMsg(sum.message);
+                setTimeout(() => setSuccessMsg(''), 4000);
+            } else {
+                alert(sum.message);
+            }
+        } finally {
+            setIsReminding(false);
+        }
+    };
+
     return (
         <div className="space-y-6 pb-20">
             {/* Header Area */}
@@ -419,6 +459,23 @@ export const AdminPayrollManagement: React.FC<Props> = ({
                                         <CheckCircle size={10} />
                                         {confirmationStatus.total - confirmationStatus.unconfirmed.length}/{confirmationStatus.total} NV đã xác nhận
                                     </div>
+                                    {confirmationStatus.unconfirmed.length > 0 && (
+                                        <>
+                                            <button
+                                                onClick={() => handleRemind(confirmationStatus.unconfirmed)}
+                                                disabled={isReminding || !!reminderBlock}
+                                                title={reminderBlock || 'Gửi thông báo nhắc các nhân viên chưa xác nhận lương'}
+                                                className="text-[10px] font-bold px-2 py-0.5 rounded-full flex items-center gap-1 border bg-white text-indigo-600 border-indigo-200 hover:bg-indigo-50 disabled:opacity-50 disabled:cursor-not-allowed transition"
+                                            >
+                                                <Bell size={10} />
+                                                {isReminding ? 'Đang gửi...' : `Nhắc ${confirmationStatus.unconfirmed.length} NV xác nhận`}
+                                            </button>
+                                            {/* Điện thoại không có tooltip — nói thẳng lý do nút đang tắt */}
+                                            {reminderBlock && (
+                                                <div className="text-[10px] text-gray-400 text-right max-w-[220px] leading-tight">{reminderBlock}</div>
+                                            )}
+                                        </>
+                                    )}
                                 </div>
                             </div>
                         )}
@@ -482,7 +539,21 @@ export const AdminPayrollManagement: React.FC<Props> = ({
                                                 <div className="text-xs text-gray-400 font-medium uppercase tracking-wider mt-1">{emp.role}</div>
                                                 {(() => {
                                                     const confirmBonus = empBonuses.find(b => b.reason?.startsWith('CONFIRMATION:'));
-                                                    if (!confirmBonus) return null;
+                                                    if (!confirmBonus) {
+                                                        // Chưa xác nhận: cho nhắc riêng từng người (cũng là đường thử an toàn
+                                                        // trên chính tài khoản mình trước khi nhắc cả lô). Tháng hiện tại /
+                                                        // đã chốt thì ẩn hẳn cho thẻ khỏi rối.
+                                                        if (reminderBlockReason(selectedMonth, new Date(), isLocked, 1)) return null;
+                                                        return (
+                                                            <button
+                                                                onClick={(e) => { e.stopPropagation(); handleRemind([emp]); }}
+                                                                disabled={isReminding}
+                                                                className="text-[10px] sm:text-xs font-bold text-indigo-600 bg-indigo-50 px-2 py-0.5 rounded-full border border-indigo-100 flex items-center gap-1 w-fit mt-1 hover:bg-indigo-100 disabled:opacity-50 transition"
+                                                            >
+                                                                <Bell size={10} /> <span>Nhắc xác nhận</span>
+                                                            </button>
+                                                        );
+                                                    }
                                                     return (
                                                         <div className="text-[10px] sm:text-xs font-bold text-teal-600 bg-teal-50 px-2 py-0.5 rounded-full border border-teal-100 flex items-center gap-1 w-fit mt-1 animate-fade-in cursor-pointer"
                                                             onClick={(e) => {

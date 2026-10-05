@@ -1,4 +1,5 @@
 import { supabase } from './supabaseClient';
+import type { PushResult } from './salaryReminder';
 
 const VAPID_PUBLIC_KEY = import.meta.env.VITE_VAPID_PUBLIC_KEY || '';
 
@@ -64,15 +65,21 @@ export async function registerPushSubscription(userId: string): Promise<boolean>
   }
 }
 
+/**
+ * Gửi push cho một người. Trả về kết quả của API, hoặc null nếu gọi lỗi (sai khoá
+ * → 401, mạng, máy chủ). Hầu hết nơi gọi bỏ qua giá trị trả về nên không đổi hành vi;
+ * chỉ nút "Nhắc xác nhận lương" cần biết ai thực sự nhận được — Admin không đọc được
+ * push_subscriptions của người khác (RLS), nên phản hồi của API là tín hiệu duy nhất.
+ */
 export async function sendPushToUser(
   userId: string,
   title: string,
   body: string,
   url: string = '/'
-): Promise<void> {
+): Promise<PushResult | null> {
   try {
     const apiSecret = import.meta.env.VITE_PUSH_API_SECRET || '';
-    await fetch('/api/send-push-notification', {
+    const res = await fetch('/api/send-push-notification', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -80,8 +87,18 @@ export async function sendPushToUser(
       },
       body: JSON.stringify({ userId, title, body, url })
     });
+    if (!res.ok) {
+      console.error('[PUSH] API trả lỗi', res.status);
+      return null;
+    }
+    const json = await res.json();
+    return {
+      sent: Number(json.sent) || 0,
+      total: typeof json.total === 'number' ? json.total : undefined
+    };
   } catch (err) {
     console.error('Failed to send push notification:', err);
+    return null;
   }
 }
 

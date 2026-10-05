@@ -32,6 +32,7 @@ import {
   computeCoverCrop, PROFILE_DEFAULT_REASON
 } from '../utils/profileChange';
 import { mapDirectoryRow, mapFullProfileRow } from '../utils/employeeFilters';
+import { reminderBlockReason, buildSalaryReminder, classifyPushResult, summarizeReminder } from '../utils/salaryReminder';
 import { AttendanceLog, AttendanceType, Holiday, LeaveRequest, SwapRequest, UserProfile, ProfileChangeRequest, ProfileChangeSet, WeekendSchedule } from '../types';
 
 // calculateMonthlySalary in ra console.log debug — tắt cho gọn
@@ -887,4 +888,48 @@ test('weekendGroup đi qua cả hai mapper; view cũ thiếu cột → null', ()
   assert.equal(mapFullProfileRow({ id: 'u1', name: 'A', role: 'Admin' }).weekendGroup, null);
   assert.equal(mapDirectoryRow({ id: 'u1', name: 'A', role: 'Admin', weekend_group: 'A' }).weekendGroup, 'A');
   assert.equal(mapDirectoryRow({ id: 'u1', name: 'A', role: 'Admin' }).weekendGroup, null);
+});
+
+test('reminderBlockReason: chỉ nhắc tháng đã qua, chưa chốt, còn người chưa xác nhận', () => {
+  const NOW = D('2025-10-15');
+  assert.equal(reminderBlockReason(D('2025-09-01'), NOW, false, 3), null);
+  assert.match(reminderBlockReason(D('2025-10-01'), NOW, false, 3)!, /tháng đã qua/);
+  assert.match(reminderBlockReason(D('2025-11-01'), NOW, false, 3)!, /tháng đã qua/);
+  assert.match(reminderBlockReason(D('2025-09-01'), NOW, true, 3)!, /đã chốt/);
+  assert.match(reminderBlockReason(D('2025-09-01'), NOW, false, 0)!, /đã xác nhận/);
+});
+
+test('buildSalaryReminder: ghi rõ tháng và đường đi vì app không đọc URL', () => {
+  const m = buildSalaryReminder(D('2025-09-01'));
+  assert.equal(m.title, '💰 Xác nhận lương tháng 09/2025');
+  assert.match(m.body, /tab Lương/);
+  assert.equal(m.body.split('09/2025').length - 1, 2);
+  assert.match(m.body, /Xác nhận lương/);
+});
+
+test('classifyPushResult: null/lỗi ≠ chưa bật thông báo ≠ gửi được', () => {
+  assert.equal(classifyPushResult(null), 'FAILED');
+  assert.equal(classifyPushResult({ sent: 2, total: 2 }), 'OK');
+  assert.equal(classifyPushResult({ sent: 1, total: 2 }), 'OK');
+  assert.equal(classifyPushResult({ sent: 0 }), 'NO_DEVICE');
+  assert.equal(classifyPushResult({ sent: 0, total: 0 }), 'NO_DEVICE');
+  assert.equal(classifyPushResult({ sent: 0, total: 2 }), 'FAILED');
+});
+
+test('summarizeReminder: liệt kê đúng người chưa bật thông báo và người gửi lỗi', () => {
+  const M = D('2025-09-01');
+  const ok = summarizeReminder(M, [{ name: 'An', outcome: 'OK' }, { name: 'Bình', outcome: 'OK' }]);
+  assert.equal(ok.allOk, true);
+  assert.match(ok.message, /tới 2 người/);
+
+  const mixed = summarizeReminder(M, [
+    { name: 'An', outcome: 'OK' },
+    { name: 'Bình', outcome: 'NO_DEVICE' },
+    { name: 'Chi', outcome: 'FAILED' }
+  ]);
+  assert.equal(mixed.allOk, false);
+  assert.match(mixed.message, /1\/3 người/);
+  assert.match(mixed.message, /Chưa bật thông báo \(1\)[^]*• Bình/);
+  assert.match(mixed.message, /Gửi lỗi \(1\)[^]*• Chi/);
+  assert.doesNotMatch(mixed.message, /• An/);
 });

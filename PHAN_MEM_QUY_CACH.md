@@ -962,6 +962,21 @@ insuranceDeduction = insuranceSalary × 10.5%
 ### Xác nhận cá nhân
 - Nhân viên có thể **"Xác nhận lương"** trên bảng lương của mình.
 - Xác nhận được lưu dưới dạng `BonusFine` với type `BONUS`, amount = 0, reason chứa `"CONFIRMATION"`.
+- **Nhắc xác nhận lương** (Admin, tab Lương): nút "Nhắc N NV xác nhận" cạnh badge `x/y NV đã
+  xác nhận` (nhắc cả lô) và nút "Nhắc xác nhận" trên thẻ từng nhân viên chưa xác nhận. Gửi
+  push qua `sendPushToUser` — không cần SQL hay backend mới. Logic thuần ở
+  `utils/salaryReminder.ts` (có test).
+  - **Chỉ bật cho tháng đã qua và chưa chốt** — đúng điều kiện nút "Xác nhận lương" bên nhân
+    viên mới hiện (`SalaryView.isPastMonth`). Tháng hiện tại: nút tắt kèm dòng giải thích.
+    Admin không nằm trong danh sách nhắc (`payrollEmployees` loại role `'Admin'`).
+  - Có hộp thoại xác nhận trước khi gửi (thông báo THẬT tới điện thoại nhân viên).
+  - Thông báo ghi rõ **tháng** và đường đi ("Lương → chọn tháng MM/yyyy → Xác nhận lương"),
+    vì bấm vào thông báo chỉ mở trang chủ, tháng mặc định là tháng hiện tại; app chưa đọc URL
+    để chọn tab/tháng.
+  - Push chỉ tới người **đã bật thông báo**. Admin không đọc được `push_subscriptions` của
+    người khác (RLS) nên dựa vào phản hồi của API: `sendPushToUser` trả `PushResult | null`
+    và hộp thoại tổng kết liệt kê tên **người chưa bật thông báo** (cần nhắc trực tiếp) và
+    **người gửi lỗi** (sai khoá API/mạng).
 - **Hoàn chốt** (nhãn "Đã chốt" → nút xoay ngược ở tab Lương) = **xoá** dòng `CONFIRMATION`
   đó, nên **chỉ Admin** làm được. Nhân viên đã xác nhận thì không tự huỷ được.
 - Chỉ báo *"Đã hoàn chốt thành công!"* khi lệnh xoá trả về `true`. Từ 23/09 đến 05/10/2026

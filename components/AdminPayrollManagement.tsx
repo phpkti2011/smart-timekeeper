@@ -540,9 +540,10 @@ export const AdminPayrollManagement: React.FC<Props> = ({
                                                 {(() => {
                                                     const confirmBonus = empBonuses.find(b => b.reason?.startsWith('CONFIRMATION:'));
                                                     if (!confirmBonus) {
-                                                        // Chưa xác nhận: cho nhắc riêng từng người (cũng là đường thử an toàn
-                                                        // trên chính tài khoản mình trước khi nhắc cả lô). Tháng hiện tại /
-                                                        // đã chốt thì ẩn hẳn cho thẻ khỏi rối.
+                                                        // Chưa xác nhận: cho nhắc riêng từng người — cũng là đường thử an toàn,
+                                                        // nhắc MỘT người biết trước rồi mới nhắc cả lô. (Admin không tự thử trên
+                                                        // mình được: payrollEmployees loại role 'Admin' nên thẻ Admin không hiện.)
+                                                        // Tháng hiện tại / đã chốt thì ẩn hẳn cho thẻ khỏi rối.
                                                         if (reminderBlockReason(selectedMonth, new Date(), isLocked, 1)) return null;
                                                         return (
                                                             <button

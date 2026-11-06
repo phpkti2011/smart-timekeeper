@@ -855,6 +855,18 @@ totalActualWorkDays = totalRealWorkDays + totalPaidLeaveDays
 ```
 insuranceDeduction = insuranceSalary × 10.5%
 ```
+- `insuranceSalary` ở đây là mức **hiệu lực của tháng đang tính** (`effectiveInsuranceSalary`,
+  tra lịch sử `salary_changes`, xem §13), không phải giá trị hiện tại trên hồ sơ.
+
+#### Xuất Excel Tổng (tab Lương, Admin)
+File CSV `Bang_Luong_Thang_MM_yyyy.csv` (UTF-8 có BOM, Excel mở được). Các cột theo thứ tự:
+`Mã NV, Họ Tên, Chức Vụ, Công Chuẩn, Công Thực Tế, Công Quy Đổi OT, Lương Theo Công, Phụ Cấp,
+Thưởng, Phạt, Lương Đóng BH, Bảo Hiểm, Ứng Lương, Thực Lãnh`.
+- **Lương Đóng BH** = `effectiveInsuranceSalary` của tháng đang xem; **để trống** nếu nhân viên
+  không có mức đóng BH (không ghi 0). **Bảo Hiểm** = mức này × 10,5% (làm tròn nghìn), nên dòng
+  nào Lương Đóng BH trống thì Bảo Hiểm bằng 0.
+- Đừng "sửa" thành `emp.insuranceSalary`: giá trị trên hồ sơ là mức hiện tại, xuất bảng lương
+  tháng cũ sẽ ra số sai nếu mức BH đã đổi giữa chừng.
 
 #### Rounding (Làm tròn)
 - **Tất cả** các khoản tiền → Làm tròn về **1.000đ** gần nhất (`roundToThousands`).

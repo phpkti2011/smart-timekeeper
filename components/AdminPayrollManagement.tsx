@@ -244,7 +244,7 @@ export const AdminPayrollManagement: React.FC<Props> = ({
         const headers = [
             "Mã NV", "Họ Tên", "Chức Vụ",
             "Công Chuẩn", "Công Thực Tế", "Công Quy Đổi OT",
-            "Lương Theo Công", "Phụ Cấp", "Thưởng", "Phạt", "Bảo Hiểm", "Ứng Lương", "Thực Lãnh"
+            "Lương Theo Công", "Phụ Cấp", "Thưởng", "Phạt", "Lương Đóng BH", "Bảo Hiểm", "Ứng Lương", "Thực Lãnh"
         ];
 
         const rows = report.details.map(d => {
@@ -263,6 +263,11 @@ export const AdminPayrollManagement: React.FC<Props> = ({
                 r.grossAllowance,
                 r.totalBonus,
                 deductions,
+                // Mức lương làm căn cứ đóng BH của THÁNG ĐANG XEM (tra lịch sử lương), cùng
+                // nguồn với cột "Bảo Hiểm" ngay sau (= mức này × 10,5%). Cố ý KHÔNG đọc
+                // emp.insuranceSalary: đó là giá trị hiện tại trên hồ sơ, xuất tháng cũ sẽ sai
+                // nếu mức BH đã đổi giữa chừng. Người không có mức đóng BH để ô trống.
+                r.effectiveInsuranceSalary > 0 ? r.effectiveInsuranceSalary : '',
                 r.insuranceDeduction,
                 r.totalAdvances,
                 r.netSalary
